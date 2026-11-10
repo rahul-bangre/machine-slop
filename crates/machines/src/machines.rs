@@ -3,11 +3,14 @@ use std::{
     io,
     ops::ControlFlow,
     path::PathBuf,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
-use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::{
     contract::{CreateMachine, MachineInfo, UpdateMachine},
@@ -24,6 +27,22 @@ const MAX_VCPUS: u8 = 32;
 const MEMORY_MIB_RANGE: std::ops::RangeInclusive<u32> = 128..=32768;
 const IDLE_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u32> = 1..=86400;
 const OPEN_FILES_OUTSIDE_EGRESS: u64 = 4096;
+const MACHINE_OVERHEAD_MIB: u32 = 64;
+const HOST_RESERVE_MIB: u32 = 512;
+
+pub(crate) struct Admission {
+    _slot: OwnedSemaphorePermit,
+    _memory: OwnedSemaphorePermit,
+}
+
+impl std::error::Error for MachineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Boot(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum MachineError {
@@ -49,6 +68,11 @@ pub struct Machines {
     image: Image,
     machines_dir: PathBuf,
     slots: Arc<Semaphore>,
+    memory: Arc<Semaphore>,
+    memory_budget_mib: u32,
+    capacity: u32,
+    create_successes: AtomicU64,
+    create_failures: AtomicU64,
     state: Mutex<State>,
 }
 
@@ -60,6 +84,7 @@ struct State {
 
 impl Machines {
     pub async fn open(image_dir: PathBuf, state_dir: PathBuf, capacity: usize) -> io::Result<Self> {
+        let capacity = u32::try_from(capacity).map_err(io::Error::other)?;
         let image = Image::in_dir(&image_dir)?;
         ensure_open_file_limit(
             capacity as u64 * MAX_MACHINE_TUNNEL_FILES + OPEN_FILES_OUTSIDE_EGRESS,
@@ -76,11 +101,26 @@ impl Machines {
         tokio::fs::create_dir_all(&machines_dir).await?;
         let machines_dir = tokio::fs::canonicalize(machines_dir).await?;
         remove_stale_machines(&machines_dir).await?;
+        let available = available_memory_mib()?;
+        let default_budget = available.saturating_sub(HOST_RESERVE_MIB.max(available / 10));
+        let memory_budget_mib = match std::env::var("SLOP_MEMORY_MIB") {
+            Ok(value) => value
+                .parse::<u32>()
+                .map_err(io::Error::other)?
+                .min(default_budget),
+            Err(std::env::VarError::NotPresent) => default_budget,
+            Err(error) => return Err(io::Error::other(error)),
+        };
         Ok(Self {
             _state_lock: state_lock,
             image,
             machines_dir,
-            slots: Arc::new(Semaphore::new(capacity)),
+            slots: Arc::new(Semaphore::new(capacity as usize)),
+            memory: Arc::new(Semaphore::new(memory_budget_mib as usize)),
+            memory_budget_mib,
+            capacity,
+            create_successes: AtomicU64::new(0),
+            create_failures: AtomicU64::new(0),
             state: Mutex::default(),
         })
     }
@@ -120,25 +160,46 @@ impl Machines {
             egress: EgressPolicy::parse(&request.allowed_hosts).map_err(MachineError::Invalid)?,
         };
         let machines = self.clone();
-        run_to_completion(async move { machines.boot(spec).await }).await
+        run_to_completion(async move {
+            match machines.clone().boot(spec).await {
+                Ok(machine) => {
+                    machines.create_successes.fetch_add(1, Ordering::Relaxed);
+                    let info = machine.info();
+                    tracing::info!(machine_id = %info.id, vcpus = info.vcpus, memory_mib = info.memory_mib, boot_ms = info.boot_ms, "machine created");
+                    Ok(machine)
+                }
+                Err(error) => {
+                    machines.create_failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(%error, "machine create failed");
+                    Err(error)
+                }
+            }
+        }).await
     }
 
     async fn boot(self: Arc<Self>, spec: MachineSpec) -> Result<Arc<Machine>, MachineError> {
-        if self.state.lock().await.shutting_down {
-            return Err(MachineError::ShuttingDown);
-        }
-        let slot = self
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| MachineError::Capacity)?;
+        let admission = {
+            let state = self.state.lock().await;
+            if state.shutting_down {
+                return Err(MachineError::ShuttingDown);
+            }
+            let required = spec.memory_mib + MACHINE_OVERHEAD_MIB;
+            if available_memory_mib()
+                .map_err(|error| MachineError::Boot(BootError::Io(error)))?
+                .saturating_sub(HOST_RESERVE_MIB)
+                < required
+            {
+                return Err(MachineError::Capacity);
+            }
+            reserve(&self.slots, &self.memory, required)?
+        };
         let id = uuid::Uuid::new_v4().simple().to_string();
         let machine = Machine::boot(
             id.clone(),
             self.machines_dir.join(&id),
             &self.image,
             spec,
-            slot,
+            admission,
         )
         .await
         .map_err(MachineError::Boot)?;
@@ -158,6 +219,21 @@ impl Machines {
             machine.idle_timeout(),
         ));
         Ok(machine)
+    }
+
+    pub fn create_counts(&self) -> (u64, u64) {
+        (
+            self.create_successes.load(Ordering::Relaxed),
+            self.create_failures.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn resource_usage(&self) -> (usize, u32, u32) {
+        (
+            self.capacity as usize - self.slots.available_permits(),
+            self.memory_budget_mib - self.memory.available_permits() as u32,
+            self.memory_budget_mib,
+        )
     }
 
     pub async fn update(
@@ -224,9 +300,19 @@ impl Machines {
             state.shutting_down = true;
             state.running.drain().map(|(_, machine)| machine).collect()
         };
-        for machine in &machines {
-            machine.destroy().await;
+        let cleanup: Vec<_> = machines
+            .into_iter()
+            .map(|machine| tokio::spawn(async move { machine.destroy().await }))
+            .collect();
+        for task in cleanup {
+            task.await.expect("machine cleanup task panicked");
         }
+        let _all_slots = self
+            .slots
+            .clone()
+            .acquire_many_owned(self.capacity)
+            .await
+            .expect("machine admission stays open for shutdown accounting");
     }
 }
 
@@ -301,4 +387,215 @@ async fn remove_stale_machines(machines_dir: &std::path::Path) -> io::Result<()>
         tokio::fs::remove_dir_all(entry.path()).await?;
     }
     Ok(())
+}
+
+fn reserve(
+    slots: &Arc<Semaphore>,
+    memory: &Arc<Semaphore>,
+    required: u32,
+) -> Result<Admission, MachineError> {
+    let slot = slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| MachineError::Capacity)?;
+    let memory = memory
+        .clone()
+        .try_acquire_many_owned(required)
+        .map_err(|_| MachineError::Capacity)?;
+    Ok(Admission {
+        _slot: slot,
+        _memory: memory,
+    })
+}
+
+fn available_memory_mib() -> io::Result<u32> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo")?;
+    parse_available_memory(&meminfo)
+}
+
+fn parse_available_memory(meminfo: &str) -> io::Result<u32> {
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|kib| u32::try_from(kib / 1024).ok())
+        .ok_or_else(|| io::Error::other("/proc/meminfo has no valid MemAvailable"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(dir: &std::path::Path) -> Arc<Machines> {
+        for name in ["firecracker", "vmlinux", "rootfs.ext4"] {
+            std::fs::write(dir.join(name), []).unwrap();
+        }
+        Arc::new(Machines {
+            _state_lock: std::fs::File::create(dir.join("lock")).unwrap(),
+            image: Image::in_dir(dir).unwrap(),
+            machines_dir: dir.into(),
+            slots: Arc::new(Semaphore::new(2)),
+            memory: Arc::new(Semaphore::new(1024)),
+            memory_budget_mib: 1024,
+            capacity: 2,
+            create_successes: AtomicU64::new(0),
+            create_failures: AtomicU64::new(0),
+            state: Mutex::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn shutdown_signals_all_vms_before_waiting_and_releases_retained_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path());
+        let mut retained = Vec::new();
+        let mut exits = Vec::new();
+        let mut kills = Vec::new();
+        for id in ["first", "second"] {
+            let machine_dir = dir.path().join(id);
+            std::fs::create_dir(&machine_dir).unwrap();
+            let (machine, killed, exit) = crate::machine::controlled_machine(
+                id,
+                machine_dir,
+                reserve(&host.slots, &host.memory, 512).unwrap(),
+            );
+            host.state
+                .lock()
+                .await
+                .running
+                .insert(id.into(), machine.clone());
+            retained.push(machine);
+            exits.push(exit);
+            kills.push(killed);
+        }
+        let shutdown_host = host.clone();
+        let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+        for killed in kills {
+            tokio::time::timeout(Duration::from_secs(2), killed)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(!shutdown.is_finished());
+        assert_eq!(host.resource_usage(), (2, 1024, 1024));
+        for exit in exits {
+            exit.send_replace(Some("killed".into()));
+        }
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(host.resource_usage(), (0, 0, 1024));
+        for machine in retained {
+            assert!(!dir.path().join(machine.id()).exists());
+            machine.destroy().await;
+        }
+        assert!(matches!(
+            host.create(serde_json::from_str("{}").unwrap()).await,
+            Err(MachineError::ShuttingDown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_shutdown_leaves_cleanup_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path());
+        let machine_dir = dir.path().join("cancelled");
+        std::fs::create_dir(&machine_dir).unwrap();
+        let (retained, killed, exit) = crate::machine::controlled_machine(
+            "cancelled",
+            machine_dir.clone(),
+            reserve(&host.slots, &host.memory, 512).unwrap(),
+        );
+        host.state
+            .lock()
+            .await
+            .running
+            .insert("cancelled".into(), retained.clone());
+        let shutdown_host = host.clone();
+        let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(2), killed)
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.abort();
+        assert!(shutdown.await.unwrap_err().is_cancelled());
+        exit.send_replace(Some("killed".into()));
+        tokio::time::timeout(Duration::from_secs(2), host.shutdown())
+            .await
+            .unwrap();
+        assert!(!machine_dir.exists());
+        assert_eq!(host.resource_usage(), (0, 0, 1024));
+        retained.destroy().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_unpublished_admission_to_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path());
+        let admission = reserve(&host.slots, &host.memory, 512).unwrap();
+        let shutdown_host = host.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        drop(admission);
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(host.resource_usage(), (0, 0, 1024));
+    }
+
+    #[tokio::test]
+    async fn failed_boot_cleans_files_and_releases_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path());
+        let machine_dir = dir.path().join("failed");
+        let result = Machine::boot(
+            "failed".into(),
+            machine_dir.clone(),
+            &host.image,
+            MachineSpec {
+                vcpus: 1,
+                memory_mib: 128,
+                idle_timeout_secs: 600,
+                egress: EgressPolicy::parse(&[]).unwrap(),
+            },
+            reserve(&host.slots, &host.memory, 192).unwrap(),
+        )
+        .await;
+        assert!(matches!(result, Err(BootError::Io(_))));
+        assert!(!machine_dir.exists());
+        assert_eq!(host.resource_usage(), (0, 0, 1024));
+    }
+
+    #[test]
+    fn admission_reserves_memory_atomically_and_releases_failed_attempts() {
+        let slots = Arc::new(Semaphore::new(2));
+        let memory = Arc::new(Semaphore::new(1024));
+        let first = reserve(&slots, &memory, 768).unwrap();
+        assert!(matches!(
+            reserve(&slots, &memory, 512),
+            Err(MachineError::Capacity)
+        ));
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(memory.available_permits(), 256);
+        drop(first);
+        let _second = reserve(&slots, &memory, 1024).unwrap();
+        assert_eq!(memory.available_permits(), 0);
+    }
+
+    #[test]
+    fn available_memory_requires_the_available_field_and_converts_kib() {
+        assert_eq!(
+            parse_available_memory("MemTotal: 999999 kB\nMemAvailable: 2097152 kB\n").unwrap(),
+            2048
+        );
+        assert!(parse_available_memory("MemFree: 100 kB").is_err());
+        assert!(parse_available_memory("MemAvailable: invalid kB").is_err());
+    }
 }

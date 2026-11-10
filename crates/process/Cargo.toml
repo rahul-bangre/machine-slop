@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+tracing.workspace = true
 base64 = "0.22"
 bytes = "1"
 pty-process = { version = "0.5.4", features = ["async"] }

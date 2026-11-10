@@ -24,3 +24,43 @@ jobs:
       - run: deno task bench:chromium
       - run: deno task test:browser-agent
       - run: make build
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version-file: .tool-versions
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+      - run: make setup
+      - run: make check
+      - run: make test
+      - run: make build
+
+  vm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install image tools and enable KVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mmdebstrap e2fsprogs debian-archive-keyring
+          test -c /dev/kvm
+          sudo usermod -aG kvm "$(id -un)"
+          sg kvm -c 'test -r /dev/kvm && test -w /dev/kvm'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/machine-slop
+          key: vm-image-${{ runner.arch }}-${{ hashFiles('vm/image/build.sh') }}
+      - run: cargo build --locked --release -p agentd
+      - name: Build guest image
+        run: vm/image/build.sh "$RUNNER_TEMP/image" target/release/agentd
+      - name: Run live machine contracts
+        env:
+          SLOP_IMAGE_DIR: ${{ runner.temp }}/image
+        run: sg kvm -c 'cargo test --locked -p machined --test machines -- --ignored --test-threads=1'

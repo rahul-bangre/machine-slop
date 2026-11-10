@@ -14,10 +14,12 @@ export async function withMachine(
         stdout: "null",
         stderr: "piped",
     }).spawn();
+    let drained: Promise<void> | undefined;
     const shutdown = { requested: false };
     const deadline = setTimeout(() => daemon.kill("SIGKILL"), 20_000);
     try {
         const url = await listenAddress(daemon.stderr);
+        drained = daemon.stderr.pipeTo(new WritableStream());
         await run(new Machine(url), () => {
             shutdown.requested = true;
             daemon.kill("SIGTERM");
@@ -25,7 +27,8 @@ export async function withMachine(
     } finally {
         if (!shutdown.requested) daemon.kill("SIGINT");
         const status = await daemon.status;
-        await daemon.stderr.cancel();
+        if (drained) await drained;
+        else await daemon.stderr.cancel();
         clearTimeout(deadline);
         assert.equal(status.code, 0, "daemon shuts down cleanly");
     }

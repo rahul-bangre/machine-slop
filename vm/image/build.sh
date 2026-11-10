@@ -77,8 +77,10 @@ base_rootfs() {
   tarball="$CACHE/rootfs-$key.tar"
   if [ ! -f "$tarball" ]; then
     echo "image: building Debian base rootfs (snapshot $DEBIAN_SNAPSHOT)" >&2
-    sudo mmdebstrap --quiet --variant=minbase --format=tar \
-      --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+    keyring=/usr/share/keyrings/debian-archive-keyring.gpg
+    [ -r "$keyring" ] || die "install debian-archive-keyring to verify the Debian snapshot"
+    sudo mmdebstrap --variant=minbase --format=tar \
+      --keyring="$keyring" \
       --aptopt='Acquire::Check-Valid-Until "false"' \
       --include="$(echo $PACKAGES | tr ' ' ',')" \
       trixie "$tarball.part" "$DEBIAN_SOURCES"

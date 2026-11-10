@@ -62,6 +62,10 @@ or report that would contain one is not written.
 
 ## machined
 
+The smoke requests a 4 GiB guest. Its memory and 64 MiB overhead must fit the
+host admission budget while leaving room for the host. The default 4 GiB Lima VM
+is too small for this smoke; increase its memory before running it.
+
 Machines carry no owner labels, so the smoke test refuses a `machined` that
 already runs machines, and afterwards destroys every machine it finds there. A
 machine whose create response is lost is still found that way, and otherwise

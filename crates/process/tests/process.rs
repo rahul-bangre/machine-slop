@@ -282,12 +282,23 @@ async fn a_terminal_process_owns_a_sized_controlling_terminal() {
     let process = processes
         .start(in_terminal(
             "test -t 0 && test -t 1 && test -t 2 && echo \"$TERM\" && stty size && \
-             read line && echo \"got $line\" && stty size && echo \"leader $$ $(ps -o sid= -p $$ | tr -d ' ')\"",
+             echo \"leader $$ ready\" && read line && echo \"got $line\" && stty size",
             24,
             80,
         ))
         .unwrap();
-    stdout_until(&process, "24 80").await;
+    let output = stdout_until(&process, " ready").await;
+    let pid = output
+        .split("leader ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let pid = Pid::from_raw(pid).unwrap();
+    assert_eq!(rustix::process::getsid(Some(pid)).unwrap(), pid);
     process.resize_terminal(size(40, 120)).unwrap();
     assert_eq!(process.info().terminal, Some(size(40, 120)));
     process
@@ -304,13 +315,12 @@ async fn a_terminal_process_owns_a_sized_controlling_terminal() {
         }
     ));
     let output = stdout(&process).replace("\r\n", "\n");
-    let (expected, leader) = output.rsplit_once("leader ").unwrap();
-    assert_eq!(
-        expected,
-        "xterm-256color\n24 80\ntyped\ngot typed\n40 120\n"
-    );
-    let (pid, session) = leader.trim().split_once(' ').unwrap();
-    assert_eq!(pid, session, "the program leads its own session");
+    let expected = output
+        .lines()
+        .filter(|line| !line.starts_with("leader "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(expected, "xterm-256color\n24 80\ntyped\ngot typed\n40 120");
     assert!(matches!(
         process.resize_terminal(size(1, 1)),
         Err(ProcessError::Finished)

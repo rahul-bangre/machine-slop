@@ -193,7 +193,7 @@ pub async fn serve(listener: UnixListener, policy: watch::Receiver<EgressPolicy>
                 }
                 Ok(_over_bound) => {}
                 Err(error) => {
-                    eprintln!("egress accept failed: {error}");
+                    tracing::error!(%error, "egress accept failed");
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },

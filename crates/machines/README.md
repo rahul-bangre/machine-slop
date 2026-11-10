@@ -41,7 +41,19 @@ against a local `agentd`. `GET /health` returns `ok`.
 
 An invalid request returns 422, a full host or a shutting-down `machined` 503, a
 failed boot 500 with the console tail, an unknown machine 404, and an
-unreachable `agentd` 502. A host runs at most 16 machines.
+unreachable `agentd` 502. A host runs at most 16 machines. Admission also
+reserves requested guest memory plus 64 MiB per VM for host overhead, before
+launching. The default memory budget is Linux `MemAvailable` at daemon startup
+minus the greater of 512 MiB or 10%. Set `SLOP_MEMORY_MIB` to a smaller total
+budget for machines and their overhead. Each create also checks current
+`MemAvailable`, leaving 512 MiB for the host. Memory exhaustion returns 503
+before creating VM files. Reservations include boots and exited VMs and release
+after destruction or failed-boot cleanup, even if a caller retains the machine
+handle.
+
+This is admission control for a dedicated Linux host, not an operating-system
+memory limit. Other workloads, cgroup limits and growing host-side buffers need
+room outside the budget; use a smaller explicit budget when sharing the host.
 
 `boot_ms` runs from the start of launch until `agentd` is healthy. A create or
 delete finishes even if its client disconnects. Creates are not idempotent:
@@ -143,11 +155,30 @@ The image dir holds `firecracker`, `vmlinux` and `rootfs.ext4`, built by
 the guest kernel, Chrome for Testing and Deno by hash and Debian by snapshot
 date, installing from its `trixie`, `trixie-updates` and `trixie-security`
 suites, and rebuilds the root filesystem only when its inputs change. It needs
-`mmdebstrap`, `debian-archive-keyring` and `python3` on the host.
+`mmdebstrap`, `e2fsprogs`, `debian-archive-keyring` and `python3` on the host.
+The Debian keyring verifies the pinned snapshot.
 
 `machined` holds a lock on its state dir. On start it kills Firecracker
 processes left by an earlier `machined` that died and removes their files. On
-SIGTERM or SIGINT it destroys every machine before exiting.
+SIGTERM or SIGINT it closes admission, destroys machines concurrently, and waits
+for admitted boots and deletions to finish before exiting.
+
+Both daemons emit JSON logs to stderr, with `RUST_LOG` controlling filtering
+(default `info`). Machine lifecycle events include machine IDs, boot duration
+and requested resources; cleanup and egress listener failures include errors.
+`agentd` process-start events are available at `debug`.
+
+`GET /metrics` exposes Prometheus text. `machined_machines_active` and
+`machined_memory_reserved_mib` include boots and pending cleanup, while
+`machined_memory_budget_mib` reports the admission budget.
+`machined_creates_total{result="success"|"failure"}` counts validated create
+attempts through their terminal outcome, including capacity rejection, even if
+the client disconnects. These counters reset at daemon restart. `agentd` exposes
+`agentd_processes_running` and `agentd_processes_retained`; the latter includes
+finished records kept for replay.
+
+CI runs the live machine contracts on a Linux KVM runner, serially to bound
+memory use, and runs the ordinary checks on Linux and macOS.
 
 Firecracker runs without its jailer, and the API has no authentication. The host
 is trusted.

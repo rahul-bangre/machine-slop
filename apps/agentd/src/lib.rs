@@ -7,13 +7,16 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, State},
+    http::header,
+    response::IntoResponse,
     routing::{get, post},
 };
 use slop_process::Processes;
 
 pub fn app(processes: Arc<Processes>) -> Router {
     let process_routes = Router::new()
+        .route("/metrics", get(metrics))
         .route("/processes", post(routes::start))
         .route("/processes/{id}", get(routes::info))
         .route("/processes/{id}/wait", get(routes::wait))
@@ -35,4 +38,16 @@ pub fn app(processes: Arc<Processes>) -> Router {
         )
         .route("/ports/{port}", get(ports::tunnel))
         .merge(process_routes)
+}
+
+async fn metrics(State(processes): State<Arc<Processes>>) -> impl IntoResponse {
+    let (running, retained) = tokio::task::spawn_blocking(move || processes.counts())
+        .await
+        .expect("process metrics task panicked");
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        format!(
+            "# TYPE agentd_processes_running gauge\nagentd_processes_running {running}\n# TYPE agentd_processes_retained gauge\nagentd_processes_retained {retained}\n"
+        ),
+    )
 }

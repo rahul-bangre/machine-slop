@@ -15,29 +15,42 @@ struct Host {
 
 impl Host {
     async fn start(name: &str) -> Self {
+        Self::start_with_budget(name, None).await
+    }
+
+    async fn start_with_budget(name: &str, budget: Option<&str>) -> Self {
         let image_dir = std::env::var("SLOP_IMAGE_DIR")
             .expect("SLOP_IMAGE_DIR names a directory built by vm/image/build.sh");
         let state_dir =
             std::env::temp_dir().join(format!("machined-test-{}-{name}", std::process::id()));
-        let mut child = Command::new(env!("CARGO_BIN_EXE_machined"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_machined"));
+        command
             .arg("127.0.0.1:0")
             .arg(image_dir)
             .arg(&state_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn machined");
+            .kill_on_drop(true);
+        if let Some(budget) = budget {
+            command.env("SLOP_MEMORY_MIB", budget);
+        }
+        let mut child = command.spawn().expect("spawn machined");
         let mut lines = BufReader::new(child.stderr.take().expect("stderr")).lines();
-        let line = lines
-            .next_line()
+        let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
             .await
+            .expect("machined starts within 10 seconds")
             .expect("read machined output")
             .expect("machined reports its address");
-        let address = line
-            .strip_prefix("machined listening on http://")
-            .unwrap_or_else(|| panic!("unexpected machined output: {line}"))
+        let log: Value = serde_json::from_str(&line).expect("structured startup log");
+        let address = log["fields"]["address"]
+            .as_str()
+            .expect("listen address")
+            .strip_prefix("http://")
+            .expect("HTTP address")
             .to_owned();
+        tokio::spawn(
+            async move { while lines.next_line().await.is_ok_and(|line| line.is_some()) {} },
+        );
         Self {
             child,
             address,
@@ -45,7 +58,32 @@ impl Host {
         }
     }
 
+    async fn stop(mut self) {
+        if let Some(pid) = self.child.id() {
+            Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status()
+                .await
+                .expect("signal machined");
+            let status = tokio::time::timeout(Duration::from_secs(10), self.child.wait())
+                .await
+                .expect("machined shuts down within 10 seconds")
+                .expect("reap machined");
+            assert!(status.success(), "machined shuts down cleanly");
+        }
+        std::fs::remove_dir_all(&self.state_dir).expect("remove state dir");
+    }
+
     async fn request(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            self.request_inner(method, path, body),
+        )
+        .await
+        .expect("request completes within 60 seconds")
+    }
+
+    async fn request_inner(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let mut stream = TcpStream::connect(&self.address).await.expect("connect");
         let body = body.map(|body| body.to_string()).unwrap_or_default();
         let request = format!(
@@ -121,15 +159,20 @@ impl Host {
     }
 
     async fn exchange(&self, head: &str, body: &[u8]) -> Vec<u8> {
-        let mut stream = TcpStream::connect(&self.address).await.expect("connect");
-        stream.write_all(head.as_bytes()).await.expect("write head");
-        stream.write_all(body).await.expect("write body");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.expect("read");
-        response
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let mut stream = TcpStream::connect(&self.address).await.expect("connect");
+            stream.write_all(head.as_bytes()).await.expect("write head");
+            stream.write_all(body).await.expect("write body");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read");
+            response
+        })
+        .await
+        .expect("exchange completes within 60 seconds")
     }
 
     async fn tunnel(&self, machine: &str, port: u16) -> Option<TcpStream> {
+        tokio::time::timeout(Duration::from_secs(10), async {
         let mut stream = TcpStream::connect(&self.address).await.expect("connect");
         stream
             .write_all(
@@ -145,6 +188,7 @@ impl Host {
             head.push(stream.read_u8().await.expect("read upgrade response"));
         }
         head.starts_with(b"HTTP/1.1 101 ").then_some(stream)
+        }).await.expect("tunnel upgrade completes within 10 seconds")
     }
 
     fn firecracker_pid(&self, machine: &str) -> String {
@@ -155,6 +199,26 @@ impl Host {
                 .join("firecracker.pid"),
         )
         .expect("firecracker pid file")
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        if let Ok(entries) = std::fs::read_dir(self.state_dir.join("machines")) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if let Ok(pid) = std::fs::read_to_string(dir.join("firecracker.pid"))
+                    && std::fs::read_link(format!("/proc/{}/cwd", pid.trim()))
+                        .is_ok_and(|cwd| cwd == dir)
+                {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-KILL", pid.trim()])
+                        .status();
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.state_dir);
     }
 }
 
@@ -228,7 +292,7 @@ async fn machines_are_isolated_and_destroyed_with_their_vm() {
         !running(&second_pid),
         "remaining machines are destroyed on shutdown"
     );
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
 }
 
 #[tokio::test]
@@ -250,7 +314,7 @@ async fn invalid_requests_are_rejected_without_booting() {
     }
     let (_, machines) = host.request("GET", "/machines", None).await;
     assert_eq!(machines, json!([]));
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
 }
 
 #[tokio::test]
@@ -283,7 +347,7 @@ async fn a_create_abandoned_by_its_client_still_produces_a_listed_machine() {
         .request("DELETE", &format!("/machines/{id}"), None)
         .await;
     assert_eq!(status, 204);
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
 }
 
 #[tokio::test]
@@ -326,7 +390,7 @@ async fn a_machine_unused_for_its_idle_timeout_is_destroyed() {
         .request("DELETE", &format!("/machines/{id}"), None)
         .await;
     assert_eq!(status, 204);
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
 }
 
 #[tokio::test]
@@ -367,7 +431,7 @@ async fn an_open_agent_request_keeps_a_machine_from_expiring() {
     drop(events);
     host.wait_until_gone(&machine, Duration::from_secs(10))
         .await;
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
 }
 
 fn proxy_status_for(url: &str) -> String {
@@ -424,7 +488,7 @@ async fn egress_reaches_only_allowed_public_hosts() {
             .await;
         assert_eq!(status, 204);
     }
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
 }
 
 const HOLD_TUNNEL_UNTIL_CLOSED: &str = r#"
@@ -520,7 +584,7 @@ async fn allowed_hosts_change_while_a_machine_runs_and_revocation_closes_tunnels
 
     let (status, _) = host.request("DELETE", &path, None).await;
     assert_eq!(status, 204);
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
 }
 
 fn body_of(response: &[u8]) -> &[u8] {
@@ -600,7 +664,7 @@ async fn files_and_ports_reach_the_machine_through_the_host() {
         .request("DELETE", &format!("/machines/{machine}"), None)
         .await;
     assert_eq!(status, 204);
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
 }
 
 #[tokio::test]
@@ -639,7 +703,46 @@ async fn an_open_port_tunnel_keeps_a_machine_from_expiring() {
 
     drop(tunnel);
     host.wait_until_gone(machine, Duration::from_secs(10)).await;
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn memory_admission_rejects_before_boot_and_recovers_after_destroy() {
+    let host = Host::start_with_budget("memory", Some("700")).await;
+    let first = host.create().await;
+    let (status, _) = host.request("POST", "/machines", None).await;
+    assert_eq!(status, 503);
+    let machine_dirs = std::fs::read_dir(host.state_dir.join("machines"))
+        .unwrap()
+        .count();
+    assert_eq!(machine_dirs, 1);
+    let (status, metrics) = host.request("GET", "/metrics", None).await;
+    assert_eq!(status, 200);
+    let metrics = metrics.as_str().unwrap();
+    assert!(metrics.contains("machined_memory_reserved_mib 576\n"));
+    assert!(metrics.contains("machined_memory_budget_mib 700\n"));
+    assert!(metrics.contains("machined_creates_total{result=\"failure\"} 1\n"));
+    assert_eq!(
+        host.request("DELETE", &format!("/machines/{first}"), None)
+            .await
+            .0,
+        204
+    );
+    let second = host.create().await;
+    assert_ne!(first, second);
+    assert_eq!(
+        host.request("DELETE", &format!("/machines/{second}"), None)
+            .await
+            .0,
+        204
+    );
+    let (_, metrics) = host.request("GET", "/metrics", None).await;
+    let metrics = metrics.as_str().unwrap();
+    assert!(metrics.contains("machined_machines_active 0\n"));
+    assert!(metrics.contains("machined_memory_reserved_mib 0\n"));
+    assert!(metrics.contains("machined_creates_total{result=\"success\"} 2\n"));
+    host.stop().await;
 }
 
 const CHROMIUM_MACHINE_MIB: u32 = 1024;
@@ -696,7 +799,7 @@ async fn chromium_runs_headless_in_a_machine_without_network() {
         .request("DELETE", &format!("/machines/{machine}"), None)
         .await;
     assert_eq!(status, 204);
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
 }
 
 #[tokio::test]
@@ -719,5 +822,5 @@ async fn chromium_reaches_https_sites_through_the_allowlist_without_flags() {
         .request("DELETE", &format!("/machines/{machine}"), None)
         .await;
     assert_eq!(status, 204);
-    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+    host.stop().await;
 }

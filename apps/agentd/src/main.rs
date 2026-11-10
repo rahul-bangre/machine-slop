@@ -6,6 +6,13 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .json()
+        .with_writer(std::io::stderr)
+        .init();
     let address = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:3000".into());
@@ -16,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(port) => serve_vsock(port.parse()?, app, processes).await,
         None => {
             let listener = TcpListener::bind(&address).await?;
-            eprintln!("agentd listening on http://{}", listener.local_addr()?);
+            tracing::info!(address = %format!("http://{}", listener.local_addr()?), "agentd listening");
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown(processes))
                 .await?;
@@ -32,7 +39,7 @@ async fn serve_vsock(
     processes: Arc<Processes>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = vsock::Listener::bind(port)?;
-    eprintln!("agentd listening on vsock port {port}");
+    tracing::info!(port, "agentd listening on vsock");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown(processes))
         .await?;
@@ -71,7 +78,7 @@ mod vsock {
                 match self.0.accept().await {
                     Ok(connection) => return connection,
                     Err(error) => {
-                        eprintln!("vsock accept failed: {error}");
+                        tracing::error!(%error, "vsock accept failed");
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
@@ -91,14 +98,16 @@ async fn shutdown(processes: Arc<Processes>) {
         let mut terminate = signal(SignalKind::terminate()).expect("register SIGTERM handler");
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result { eprintln!("failed to listen for shutdown: {error}"); }
+                if let Err(error) = result { tracing::error!(%error, "failed to listen for shutdown"); }
             }
             _ = terminate.recv() => {}
         }
     }
     #[cfg(not(unix))]
     if let Err(error) = tokio::signal::ctrl_c().await {
-        eprintln!("failed to listen for shutdown: {error}");
+        tracing::error!(%error, "failed to listen for shutdown");
     }
+    tracing::info!("shutdown started");
     processes.shutdown().await;
+    tracing::info!("shutdown completed");
 }
