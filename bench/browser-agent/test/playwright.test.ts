@@ -70,6 +70,17 @@ Deno.test("Playwright captures canonical visible state and requested subtrees wi
         });
         assert.match(scope.text, /Express delivery/);
         assert.doesNotMatch(scope.text, /Other section|Item 219/);
+        await assert.rejects(
+            driver.act({
+                kind: "click",
+                target: {
+                    role: "checkbox",
+                    name: "Express delivery",
+                    scope: "",
+                },
+            }, 1_000),
+            /unknown or stale reference/,
+        );
         await driver.act({
             kind: "click",
             target: {

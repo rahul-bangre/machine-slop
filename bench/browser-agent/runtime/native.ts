@@ -545,34 +545,33 @@ class Native implements Driver {
             return;
         }
         const backend = await this.target(action.target);
-        const point = await this.call(
+        const point = await this.pointerPoint(
             backend,
-            `function(fill) {
-            if (!this.isConnected) throw new Error('target detached');
-            if (this.matches(':disabled') || this.closest('[aria-disabled="true"]')) throw new Error('target disabled');
-            this.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
-            const box = this.getBoundingClientRect();
-            if (!box.width || !box.height) throw new Error('target has no visible area');
-            const x = Math.max(0, box.left) + (Math.min(innerWidth, box.right) - Math.max(0, box.left)) / 2;
-            const y = Math.max(0, box.top) + (Math.min(innerHeight, box.bottom) - Math.max(0, box.top)) / 2;
-            const hit = document.elementFromPoint(x,y);
-            if (!hit || !this.contains(hit)) throw new Error('target obscured');
-            if (fill && ((!this.matches('input,textarea') && !this.isContentEditable) || this.readOnly)) throw new Error('target is not editable');
-            return {x,y};
-        }`,
-            [action.kind === "fill"],
+            action.kind === "fill",
             operation,
-        ) as { x: number; y: number };
+        );
         await this.input(operation, "Input.dispatchMouseEvent", {
             type: "mouseMoved",
             ...point,
         });
+        await this.pointerPoint(
+            backend,
+            action.kind === "fill",
+            operation,
+            point,
+        );
         await this.input(operation, "Input.dispatchMouseEvent", {
             type: "mousePressed",
             ...point,
             button: "left",
             clickCount: 1,
         });
+        await this.pointerPoint(
+            backend,
+            action.kind === "fill",
+            operation,
+            point,
+        );
         await this.input(operation, "Input.dispatchMouseEvent", {
             type: "mouseReleased",
             ...point,
@@ -594,6 +593,32 @@ class Native implements Driver {
                 text: action.text,
             });
         }
+    }
+
+    private async pointerPoint(
+        backend: number,
+        fill: boolean,
+        operation: Operation,
+        point?: { x: number; y: number },
+    ): Promise<{ x: number; y: number }> {
+        return await this.call(
+            backend,
+            `function(fill, point) {
+            if (!this.isConnected) throw new Error('target detached');
+            if (this.matches(':disabled') || this.closest('[aria-disabled="true"]')) throw new Error('target disabled');
+            if (!point) this.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
+            const box = this.getBoundingClientRect();
+            if (!box.width || !box.height) throw new Error('target has no visible area');
+            const x = point ? point.x : Math.max(0, box.left) + (Math.min(innerWidth, box.right) - Math.max(0, box.left)) / 2;
+            const y = point ? point.y : Math.max(0, box.top) + (Math.min(innerHeight, box.bottom) - Math.max(0, box.top)) / 2;
+            const hit = document.elementFromPoint(x,y);
+            if (!hit || !this.contains(hit)) throw new Error('target obscured');
+            if (fill && ((!this.matches('input,textarea') && !this.isContentEditable) || this.readOnly)) throw new Error('target is not editable');
+            return {x,y};
+        }`,
+            [fill, point ?? null],
+            operation,
+        ) as { x: number; y: number };
     }
 }
 

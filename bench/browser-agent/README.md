@@ -30,11 +30,16 @@ cross-provider comparisons. machined requires an exclusive host and destroys
 every machine it finds; its stock image currently has no network or browser
 runtime. Local agentd runs without host resource limits.
 
+E2B and Daytona default to the committed `bench/env/images/` records (2 CPUs, 4
+GiB). Use `--browser-executable=/usr/local/bin/chromium` with those images;
+`--daytona-snapshot=...` selects another prepared snapshot. Both providers allow
+network access for dependency setup; tasks stay on guest loopback.
+
 Raw attempts, observations, CLI transcripts and configuration go to
 `bench-results/`. Failed attempts and cleanup errors remain visible. Success is
 checked from server outcomes, separately from the model's stop reason. Setup,
 model calls, tool transport, action/wait/capture phases, report collection and
 cleanup are recorded separately. Token proxies use `o200k_base`; actual CLI
 usage includes scaffolding and possible side calls. Sampled runtime/browser CPU
-and summed RSS are approximate; shared memory is counted repeatedly. No billed
-cost is inferred from these measurements.
+and summed RSS include measurement buffers and are approximate; shared memory is
+counted repeatedly. No billed cost is inferred from these measurements.

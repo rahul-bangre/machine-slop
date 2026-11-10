@@ -360,29 +360,42 @@ Deno.test("native driver delivers fresh scoped accessibility and actual UI input
                 "<style>button{position:fixed;left:50px;top:50px;width:200px;height:80px}</style>";
             const replacement =
                 `${style}<button onclick="document.body.dataset.clicked='wrong'">After</button>`;
-            await navigate(
-                browser,
-                driver,
-                `${style}<button>Before</button><script>document.querySelector('button').onmouseover=()=>{document.open();document.write(${
-                    JSON.stringify(replacement)
-                });document.close()}</script>`,
-                "Before",
-            );
-            await assert.rejects(
-                driver.act({
-                    kind: "click",
-                    target: { role: "button", name: "Before" },
-                }, 1000),
-                /document changed/,
-            );
-            const { result } = await browser.page.send<
-                { result: { value: { text: string; clicked: string | null } } }
-            >("Runtime.evaluate", {
-                expression:
-                    "({text:document.body.innerText,clicked:document.body.dataset.clicked??null})",
-                returnByValue: true,
-            });
-            assert.deepEqual(result.value, { text: "After", clicked: null });
+            for (
+                const replace of [
+                    `document.open();document.write(${
+                        JSON.stringify(replacement)
+                    });document.close()`,
+                    `document.body.innerHTML=${JSON.stringify(replacement)}`,
+                ]
+            ) {
+                await navigate(
+                    browser,
+                    driver,
+                    `${style}<button>Before</button><script>document.querySelector('button').onmouseover=()=>{${replace}}</script>`,
+                    "Before",
+                );
+                await assert.rejects(
+                    driver.act({
+                        kind: "click",
+                        target: { role: "button", name: "Before" },
+                    }, 1000),
+                );
+                const { result } = await browser.page.send<
+                    {
+                        result: {
+                            value: { text: string; clicked: string | null };
+                        };
+                    }
+                >("Runtime.evaluate", {
+                    expression:
+                        "({text:document.body.innerText,clicked:document.body.dataset.clicked??null})",
+                    returnByValue: true,
+                });
+                assert.deepEqual(result.value, {
+                    text: "After",
+                    clicked: null,
+                });
+            }
         });
     } finally {
         await driver.close();

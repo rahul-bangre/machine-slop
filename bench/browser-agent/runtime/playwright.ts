@@ -31,9 +31,9 @@ class PlaywrightDriver implements Driver {
             }
             return this.page.getByRef(ref);
         }
-        const root = target.scope
-            ? this.target({ ref: target.scope })
-            : this.page;
+        const root = target.scope === undefined
+            ? this.page
+            : this.target({ ref: target.scope });
         return root.getByRole(
             target.role as Parameters<Page["getByRole"]>[0],
             { name: target.name, exact: true },

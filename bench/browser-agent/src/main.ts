@@ -18,6 +18,8 @@ import { browser_tasks, browserTask } from "../runtime/tasks.ts";
 import { type Attempt, runBrowserAttempt } from "./attempt.ts";
 import { deno_version, payload, RemoteRuntime } from "./deploy.ts";
 import { browser_system_prompt } from "./prompt.ts";
+import e2b_image from "../../env/images/e2b.json" with { type: "json" };
+import daytona_image from "../../env/images/daytona.json" with { type: "json" };
 
 const { values: flags } = parseArgs({
     options: {
@@ -30,7 +32,11 @@ const { values: flags } = parseArgs({
         "agentd-binary": { type: "string", default: "./target/debug/agentd" },
         "agentd-url": { type: "string" },
         "machined-url": { type: "string", default: "http://127.0.0.1:4001" },
-        "e2b-template": { type: "string", default: "base" },
+        "e2b-template": { type: "string", default: e2b_image.image.ref },
+        "daytona-snapshot": {
+            type: "string",
+            default: daytona_image.image.ref,
+        },
         "browser-executable": { type: "string" },
         deno: { type: "string", default: "deno" },
         out: { type: "string" },
@@ -48,9 +54,12 @@ function provider(name: string): SandboxProvider {
         case "machined":
             return machinedProvider(flags["machined-url"]);
         case "e2b":
-            return e2bProvider(flags["e2b-template"]);
+            return e2bProvider(flags["e2b-template"], {
+                cpu_count: 2,
+                memory_mb: 4096,
+            });
         case "daytona":
-            return daytonaProvider();
+            return daytonaProvider(undefined, flags["daytona-snapshot"]);
         default:
             throw new Error(`unknown sandbox: ${name}`);
     }
@@ -118,6 +127,16 @@ await Deno.writeTextFile(
                 name: provider.name,
                 ...provider.describe(),
             })),
+            image_records: {
+                e2b: flags["e2b-template"] === e2b_image.image.ref
+                    ? e2b_image
+                    : null,
+                daytona: flags["daytona-snapshot"] === daytona_image.image.ref
+                    ? daytona_image
+                    : null,
+            },
+            network:
+                "enabled for dependency setup and task; all task sites are served on guest loopback",
             tasks: tasks.map(({ id, seeds, partition }) => ({
                 id,
                 seeds,
