@@ -29,7 +29,10 @@ use tokio::{
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream};
 
-use crate::egress::{EgressPolicy, Host, REQUEST_HEAD_TIMEOUT};
+use crate::{
+    egress::{EgressPolicy, Host, REQUEST_HEAD_TIMEOUT},
+    files,
+};
 
 const CA_KEY: &str = "egress-ca.key";
 const CA_CERTIFICATE: &str = "egress-ca.pem";
@@ -69,8 +72,8 @@ impl Gateway {
                     .self_signed(&key)
                     .map_err(io::Error::other)?
                     .pem();
-                write_private(&key_path, &key.serialize_pem()).await?;
-                write_private(&certificate_path, &certificate).await?;
+                files::write_private(&key_path, key.serialize_pem().as_bytes()).await?;
+                files::write_private(&certificate_path, certificate.as_bytes()).await?;
                 (key, certificate)
             }
         };
@@ -237,6 +240,7 @@ async fn forward(
             ));
         }
     }
+    let guest_version = request.version();
     let guest_upgrade = hyper::upgrade::on(&mut request);
     let mut sender = sender.lock().await;
     if sender.ready().await.is_err() {
@@ -254,6 +258,7 @@ async fn forward(
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some((guest_upgrade, upstream_upgrade));
             }
+            *response.version_mut() = guest_version;
             Ok(response.map(Either::Left))
         }
         Err(error) => Ok(plain(
@@ -306,25 +311,6 @@ fn authority_params() -> CertificateParams {
 fn set_validity(params: &mut CertificateParams) {
     params.not_before = date_time_ymd(2000, 1, 1);
     params.not_after = date_time_ymd(2100, 1, 1);
-}
-
-async fn write_private(path: &Path, contents: &str) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let staged = path.with_extension("tmp");
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&staged)?;
-    let mut file = tokio::fs::File::from_std(file);
-    tokio::io::AsyncWriteExt::write_all(&mut file, contents.as_bytes()).await?;
-    file.sync_all().await?;
-    tokio::fs::rename(&staged, path).await?;
-    match path.parent() {
-        Some(dir) => crate::files::sync(dir).await,
-        None => Ok(()),
-    }
 }
 
 pub struct Prefixed<S> {

@@ -11,6 +11,7 @@ const HOST_CID: u32 = 2;
 const MAX_DATAGRAM_BYTES: usize = 4096;
 const MAX_QUERIES_IN_FLIGHT: usize = 64;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 
 pub struct Relay {
     udp: Arc<UdpSocket>,
@@ -33,7 +34,10 @@ impl Relay {
         loop {
             tokio::select! {
                 received = self.udp.recv_from(&mut datagram) => {
-                    let Ok((length, client)) = received else { continue };
+                    let Ok((length, client)) = received else {
+                        tokio::time::sleep(ACCEPT_RETRY).await;
+                        continue;
+                    };
                     let Ok(permit) = in_flight.clone().try_acquire_owned() else { continue };
                     let (udp, host, query) = (self.udp.clone(), self.host, datagram[..length].to_vec());
                     tokio::spawn(async move {
@@ -44,7 +48,10 @@ impl Relay {
                     });
                 }
                 accepted = self.tcp.accept() => {
-                    let Ok((mut client, _)) = accepted else { continue };
+                    let Ok((mut client, _)) = accepted else {
+                        tokio::time::sleep(ACCEPT_RETRY).await;
+                        continue;
+                    };
                     let Ok(permit) = in_flight.clone().try_acquire_owned() else { continue };
                     let host = self.host;
                     tokio::spawn(async move {

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -7,17 +7,63 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use hyper::upgrade::Upgraded;
-use hyper_util::rt::TokioIo;
-use slop_machines::{Machine, MachineState, Machines, PreviewUse};
+use hyper::{body::Incoming, service::service_fn, upgrade::Upgraded};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use slop_machines::{MAX_PREVIEW_CONNECTIONS, Machine, MachineState, Machines, PreviewUse};
+use tokio::{
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
+use tower::ServiceExt;
 
-use crate::{ApiError, agentd, relay_until_either_side_ends, unreachable_agentd};
+use crate::{ApiError, agentd, relay_until_either_side_ends, relay_upgrades, unreachable_agentd};
 
 const TCP: &str = "tcp";
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub fn preview_app(machines: Arc<Machines>) -> Router {
-    Router::new().fallback(serve).with_state(machines)
+#[derive(Clone)]
+struct ConnectionSlot {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+struct Lease {
+    preview: PreviewUse,
+    _slot: Option<ConnectionSlot>,
+}
+
+pub async fn serve_previews(listener: TcpListener, machines: Arc<Machines>) {
+    let app = Router::new().fallback(serve).with_state(machines);
+    let slots = Arc::new(Semaphore::new(MAX_PREVIEW_CONNECTIONS));
+    loop {
+        let Ok(slot) = slots.clone().acquire_owned().await else {
+            return;
+        };
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                tracing::error!(%error, "preview accept failed");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let slot = ConnectionSlot {
+            _permit: Arc::new(slot),
+        };
+        let app = app.clone();
+        let service = service_fn(move |mut request: hyper::Request<Incoming>| {
+            request.extensions_mut().insert(slot.clone());
+            app.clone().oneshot(request.map(Body::new))
+        });
+        tokio::spawn(async move {
+            let _ = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT)
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
+                .await;
+        });
+    }
 }
 
 async fn serve(State(machines): State<Arc<Machines>>, request: Request) -> Response {
@@ -54,8 +100,16 @@ async fn forward(machines: &Machines, mut request: Request) -> Result<Response, 
             ));
         }
     }
-    let preview = Arc::new(preview);
-    let tunnel = port_tunnel(&preview.machine, preview.port, preview.clone()).await?;
+    let preview = Arc::new(Lease {
+        preview,
+        _slot: request.extensions_mut().remove::<ConnectionSlot>(),
+    });
+    let tunnel = port_tunnel(
+        &preview.preview.machine,
+        preview.preview.port,
+        preview.clone(),
+    )
+    .await?;
     if requests_tcp_upgrade(request.headers()) {
         let client = hyper::upgrade::on(&mut request);
         spawn_until_ended(preview, async move {
@@ -84,23 +138,21 @@ async fn forward(machines: &Machines, mut request: Request) -> Result<Response, 
         .parse()
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "malformed request target".into()))?;
     *request.uri_mut() = origin_form;
+    let client_version = request.version();
     let mut response = sender
         .send_request(request)
         .await
         .map_err(unreachable_port)?;
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         let app_upgrade = hyper::upgrade::on(&mut response);
-        spawn_until_ended(preview, async move {
-            if let (Ok(client), Ok(app)) = tokio::join!(client_upgrade, app_upgrade) {
-                relay_until_either_side_ends(TokioIo::new(client), TokioIo::new(app)).await;
-            }
-        });
+        spawn_until_ended(preview, relay_upgrades(client_upgrade, app_upgrade));
     }
+    *response.version_mut() = client_version;
     Ok(response.map(Body::new))
 }
 
-fn spawn_until_ended(preview: Arc<PreviewUse>, work: impl Future<Output = ()> + Send + 'static) {
-    let ended = preview.ended();
+fn spawn_until_ended(preview: Arc<Lease>, work: impl Future<Output = ()> + Send + 'static) {
+    let ended = preview.preview.ended();
     tokio::spawn(async move {
         let _machine_in_use_until_the_work_ends = preview;
         tokio::select! {

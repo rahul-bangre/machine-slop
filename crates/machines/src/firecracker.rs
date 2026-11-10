@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use crate::{
-    egress::{self, DNS_PORT, EGRESS_PORT, EgressRoute},
+    egress::{self, DNS_PORT, EGRESS_PORT, MachineEgress},
     machines::Admission,
 };
 
@@ -32,7 +32,7 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn boot(dir: &Path, admission: Admission, egress: EgressRoute) -> io::Result<Self> {
+    pub fn boot(dir: &Path, admission: Admission, egress: MachineEgress) -> io::Result<Self> {
         let console = std::fs::File::create(dir.join("console.log"))?;
         Self::spawn(
             dir,
@@ -43,7 +43,11 @@ impl Vm {
         )
     }
 
-    pub fn unconfigured(dir: &Path, admission: Admission, egress: EgressRoute) -> io::Result<Self> {
+    pub fn unconfigured(
+        dir: &Path,
+        admission: Admission,
+        egress: MachineEgress,
+    ) -> io::Result<Self> {
         for socket in [
             "api.sock",
             "vsock.sock",
@@ -64,7 +68,7 @@ impl Vm {
         console: std::fs::File,
         args: &[&str],
         admission: Admission,
-        egress: EgressRoute,
+        egress: MachineEgress,
     ) -> io::Result<Self> {
         let egress_listener = UnixListener::bind(dir.join(host_socket_name(EGRESS_PORT)))?;
         let dns_listener = UnixListener::bind(dir.join(host_socket_name(DNS_PORT)))?;
@@ -100,7 +104,7 @@ impl Vm {
         let mut exited = exit.clone();
         tokio::spawn(async move {
             tokio::select! {
-                () = egress::serve(egress_listener, dns_listener, egress.policy, egress.gateway) => {}
+                () = egress::serve_machine(egress_listener, dns_listener, egress) => {}
                 _ = exited.wait_for(Option::is_some) => {}
             }
         });

@@ -19,7 +19,7 @@ use tokio::{
 
 use crate::{
     contract::{EgressCredential, MachineInfo, MachineState},
-    egress::{Egress, EgressPolicy, EgressRoute},
+    egress::{Egress, EgressPolicy, MachineEgress},
     files,
     firecracker::Vm,
     gateway::Gateway,
@@ -383,6 +383,10 @@ impl Machine {
         Ok(Some(machine))
     }
 
+    pub(crate) fn egress_source(&self) -> Option<IpAddr> {
+        self.egress.policy().source()
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -730,7 +734,7 @@ async fn restore(
     dir: &Path,
     saved: &str,
     admission: Admission,
-    egress: EgressRoute,
+    egress: MachineEgress,
 ) -> io::Result<Vm> {
     let vm = Vm::unconfigured(dir, admission, egress)?;
     if let Err(error) = vm.load(saved).await {

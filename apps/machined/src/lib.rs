@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
-use hyper::client::conn::http1::SendRequest;
+use hyper::{client::conn::http1::SendRequest, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use slop_machines::{
@@ -19,7 +19,7 @@ use slop_machines::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-pub use preview::preview_app;
+pub use preview::serve_previews;
 
 pub fn app(machines: Arc<Machines>) -> Router {
     Router::new()
@@ -218,9 +218,7 @@ async fn proxy(
         let agentd_upgrade = hyper::upgrade::on(&mut response);
         tokio::spawn(async move {
             let _machine_in_use_until_the_tunnel_ends = machine;
-            if let (Ok(client), Ok(agentd)) = tokio::join!(client_upgrade, agentd_upgrade) {
-                relay_until_either_side_ends(TokioIo::new(client), TokioIo::new(agentd)).await;
-            }
+            relay_upgrades(client_upgrade, agentd_upgrade).await;
         });
     }
     Ok(response.map(Body::new))
@@ -239,6 +237,12 @@ async fn agentd(
         connection.with_upgrades().await
     });
     Ok(sender)
+}
+
+async fn relay_upgrades(client: OnUpgrade, upstream: OnUpgrade) {
+    if let (Ok(client), Ok(upstream)) = tokio::join!(client, upstream) {
+        relay_until_either_side_ends(TokioIo::new(client), TokioIo::new(upstream)).await;
+    }
 }
 
 async fn relay_until_either_side_ends(

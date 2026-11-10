@@ -6,7 +6,9 @@ use tokio::{
     time::timeout,
 };
 
-use crate::egress::{Host, MachineEgress, OPEN_TIMEOUT, REQUEST_HEAD_TIMEOUT, public_addresses};
+use crate::egress::{
+    Host, MachineEgress, NoAddress, OPEN_TIMEOUT, REQUEST_HEAD_TIMEOUT, public_addresses,
+};
 
 const HEADER_BYTES: usize = 12;
 const MAX_NAME_BYTES: usize = 255;
@@ -109,10 +111,10 @@ async fn answer(message: &[u8], machine: &MachineEgress) -> Option<Vec<u8>> {
     .await;
     let addresses = match resolved {
         Ok(Ok(addresses)) => addresses,
-        Ok(Err(crate::egress::Refusal::Unresolvable(_))) | Err(_) => {
+        Ok(Err(NoAddress::Unresolvable)) | Err(_) => {
             return Some(respond_with(Rcode::ServerFailure, &[]));
         }
-        Ok(Err(_)) => Vec::new(),
+        Ok(Err(NoAddress::NotPublic | NoAddress::NoneFromSource(_))) => Vec::new(),
     };
     let mut matching: Vec<IpAddr> = addresses
         .into_iter()

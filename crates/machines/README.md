@@ -298,10 +298,10 @@ A refusal is an HTTP response to the `CONNECT` with a plain-text reason:
   is not trusted
 - 504: resolving and connecting take longer than 10 seconds
 
-Each machine may hold 256 open proxy connections, 16 DNS connections and 4
-concurrent name lookups, so one machine cannot starve another. `machined` raises
-its soft open-file limit to cover every machine's budget at start and refuses to
-start if the hard limit is too low.
+Each machine may hold 256 open proxy connections, 16 DNS connections (more wait
+for a place) and 4 concurrent name lookups, so one machine cannot starve
+another. `machined` raises its soft open-file limit to cover every machine's
+budget at start and refuses to start if the hard limit is too low.
 
 Egress leaves from the host's own address, so under `*` a machine reaches
 anything the host can reach at a public address, including services that trust
@@ -343,9 +343,13 @@ certificate against the Mozilla roots in `webpki-roots`, then completes the
 machine's TLS itself with a certificate for that host signed by the host's
 gateway authority, and relays HTTP/1.1 requests, WebSocket and other upgrades
 included. A request whose `Host` is not the tunnelled host gets 421, so a
-machine cannot route the headers elsewhere through a shared front end. Changes
-apply to the next request on an open connection. Every other host is relayed end
-to end and its traffic is never decrypted.
+machine cannot route the headers elsewhere through a shared front end. Whether a
+tunnel is intercepted is decided when it opens: new or removed credentials
+change the headers on the next request of an intercepted connection, but a
+tunnel opened before its host had credentials stays end to end until it closes.
+The gateway speaks HTTP/1.1 to both sides, so a client that offers only HTTP/2
+fails to connect to a credentialed host, as does a host that refuses HTTP/1.1.
+Every other host is relayed end to end and its traffic is never decrypted.
 
 The authority is created in the state dir as `egress-ca.pem` and `egress-ca.key`
 (mode 0600) on first start and kept, so paused machines and snapshots stay
@@ -358,8 +362,9 @@ the system bundle and does not trust it. Certificates are valid from 2000 to
 
 The machine never holds the key, but it can use it: anything it sends to the
 host goes out with the headers, and a response that echoes request headers shows
-them. Credentials are kept in the machine's record on the host so that they
-survive a restart; the state dir is as sensitive as the keys.
+them. Credentials are kept in the machine's record on the host, readable only by
+`machined`'s user, so that they survive a restart; the state dir is as sensitive
+as the keys.
 
 ### DNS
 
@@ -407,6 +412,19 @@ servers, server-sent events and WebSockets work. A request with
 itself and then carries raw bytes to the port, as with `machine.connect`;
 `connectPreview(url)` opens one. An unknown, deleted or expired preview returns
 404, a paused machine 503, an exited one 502, and a port with no listener 502.
+
+A preview is a way in that the machine controls. An offline machine can serve
+anything through it, and a program in the machine could relay preview traffic to
+its own egress proxy, handing the preview's users its allowed hosts, credentials
+and egress address. Treat a preview URL as access to whatever the machine
+chooses to expose. Every preview is a subdomain of the same domain, so browsers
+treat them as one site: one machine's pages can set cookies that other previews
+receive. Use a domain listed on the Public Suffix List, or one per tenant, when
+previews belong to different people.
+
+`machined` serves at most 1024 preview connections at once, counting open
+upgrades, and closes a connection that does not send a request head within 10
+seconds.
 
 A preview lasts `ttl_secs` (default 3600, at most 604800) for one machine and
 port. When it expires or is deleted, it stops accepting requests and its open

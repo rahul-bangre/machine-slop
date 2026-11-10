@@ -1514,6 +1514,9 @@ async fn a_preview_serves_a_port_publicly_until_it_is_deleted_or_expires() {
         assert!(tokio::time::Instant::now() < deadline, "{response}");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    let address = host.preview_address.as_ref().expect("previews are on");
+    let mut idle = TcpStream::connect(address).await.expect("connect");
+    ends_within(&mut idle, Duration::from_secs(20)).await;
     let unknown = host
         .preview_get("0123456789abcdef0123456789abcdef", "/")
         .await;
@@ -1580,8 +1583,23 @@ async fn machine_tools_resolve_names_and_reach_credentialed_hosts_without_holdin
     assert_eq!(info["credential_hosts"], json!(["postman-echo.com"]));
     assert!(!info.to_string().contains(secret), "{info}");
     let machine = info["id"].as_str().expect("machine id");
+    let record = host.machine_dir(machine).join("machine.json");
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&record)
+            .expect("machine record")
+            .permissions(),
+    );
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "the record holding credentials is private"
+    );
 
     let checks = [
+        (
+            "the key is nowhere in the machine",
+            format!("! env | grep -q {secret} && ! grep -rqs {secret} /etc /root /workspace /tmp"),
+        ),
         ("allowed names resolve", "getent hosts example.com".to_owned()),
         ("other names are refused", "! getent hosts example.org".to_owned()),
         (
@@ -1595,7 +1613,7 @@ async fn machine_tools_resolve_names_and_reach_credentialed_hosts_without_holdin
         ("curl", format!("curl -fsS https://postman-echo.com/headers | grep -q {secret}")),
         (
             "python",
-            format!(r#"python3 -c 'import urllib.request; assert b"{secret}" in urllib.request.urlopen("https://postman-echo.com/headers").read()'"#),
+            format!(r#"python3 -c 'import urllib.request; r = urllib.request.Request("https://postman-echo.com/headers", headers={{"User-Agent": "machine-test"}}); assert b"{secret}" in urllib.request.urlopen(r).read()'"#),
         ),
         (
             "node",
@@ -1604,10 +1622,6 @@ async fn machine_tools_resolve_names_and_reach_credentialed_hosts_without_holdin
         (
             "deno",
             format!(r#"deno eval 'Deno.exit((await (await fetch("https://postman-echo.com/headers")).text()).includes("{secret}") ? 0 : 1)'"#),
-        ),
-        (
-            "the key is nowhere in the machine",
-            format!("! env | grep -q {secret} && ! grep -rqs {secret} /etc /root /workspace /tmp"),
         ),
     ];
     for (check, script) in &checks {

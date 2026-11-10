@@ -10,6 +10,8 @@ use crate::{contract::PreviewInfo, machine::MachineUse};
 pub const DEFAULT_PREVIEW_TTL_SECS: u32 = 3600;
 pub const MAX_PREVIEW_TTL_SECS: u32 = 7 * 24 * 3600;
 pub const MAX_PREVIEWS_PER_MACHINE: usize = 64;
+pub const MAX_PREVIEW_CONNECTIONS: usize = 1024;
+pub const PREVIEW_FILES_PER_CONNECTION: u64 = 2;
 
 #[derive(Clone, Debug)]
 pub struct PreviewOrigin {

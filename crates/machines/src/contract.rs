@@ -35,11 +35,20 @@ fn listed<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     Vec::deserialize(deserializer).map(Some)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, TS)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct EgressCredential {
     pub host: String,
     pub headers: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for EgressCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EgressCredential")
+            .field("host", &self.host)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, TS)]

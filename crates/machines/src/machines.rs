@@ -24,8 +24,8 @@ use crate::{
     gateway::Gateway,
     machine::{Activity, BootError, Booted, Disk, Image, Machine, MachineSpec, MachineUse},
     previews::{
-        DEFAULT_PREVIEW_TTL_SECS, MAX_PREVIEW_TTL_SECS, MAX_PREVIEWS_PER_MACHINE, Preview,
-        PreviewOrigin, PreviewUse,
+        DEFAULT_PREVIEW_TTL_SECS, MAX_PREVIEW_CONNECTIONS, MAX_PREVIEW_TTL_SECS,
+        MAX_PREVIEWS_PER_MACHINE, PREVIEW_FILES_PER_CONNECTION, Preview, PreviewOrigin, PreviewUse,
     },
 };
 
@@ -169,8 +169,14 @@ impl Machines {
         network: Network,
     ) -> io::Result<Arc<Self>> {
         let image = Image::in_dir(&image_dir)?;
+        let preview_files = match network.previews {
+            Some(_) => MAX_PREVIEW_CONNECTIONS as u64 * PREVIEW_FILES_PER_CONNECTION,
+            None => 0,
+        };
         ensure_open_file_limit(
-            limits.running_vms as u64 * MAX_MACHINE_EGRESS_FILES + OPEN_FILES_OUTSIDE_EGRESS,
+            limits.running_vms as u64 * MAX_MACHINE_EGRESS_FILES
+                + preview_files
+                + OPEN_FILES_OUTSIDE_EGRESS,
         )?;
         for address in &network.egress_addresses {
             can_send_from(*address).map_err(|error| {
@@ -226,6 +232,13 @@ impl Machines {
                 Err(error) => {
                     tracing::error!(path = %dir.display(), %error, "ignoring unreadable snapshot");
                 }
+            }
+        }
+        for machine in state.machines.values() {
+            if let Some(source) = machine.egress_source()
+                && !network.egress_addresses.contains(&source)
+            {
+                tracing::error!(machine_id = %machine.id(), egress_address = %source, "machine's egress address is no longer in SLOP_EGRESS_ADDRESSES; its egress will fail");
             }
         }
         let paused = state
@@ -617,6 +630,11 @@ impl Machines {
         id: &str,
         request: UpdateMachine,
     ) -> Result<MachineInfo, MachineError> {
+        if request.allowed_hosts.is_none() && request.egress_credentials.is_none() {
+            return Err(MachineError::Invalid(
+                "an update sets allowed_hosts, egress_credentials or both".into(),
+            ));
+        }
         let machine = self.get(id).await.ok_or(MachineError::UnknownMachine)?;
         run_to_completion(async move {
             let machine = machine.exclusive().await;

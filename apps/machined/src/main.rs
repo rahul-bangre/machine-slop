@@ -71,12 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = machined::app(machines.clone());
     if let Some(preview_listener) = preview_listener {
         tracing::info!(address = %format!("http://{}", preview_listener.local_addr()?), "previews listening");
-        let previews = machined::preview_app(machines.clone());
-        tokio::spawn(async move {
-            if let Err(error) = axum::serve(preview_listener, previews).await {
-                tracing::error!(%error, "preview server failed");
-            }
-        });
+        tokio::spawn(machined::serve_previews(preview_listener, machines.clone()));
     }
 
     tracing::info!(address = %format!("http://{}", listener.local_addr()?), "machined listening");

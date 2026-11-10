@@ -266,7 +266,7 @@ fn parse_credential(credential: &EgressCredential) -> Result<Credential, String>
                 "egress credential header {name} is managed by the connection and cannot be set"
             ));
         }
-        let value = Some(value.as_str())
+        let mut value = Some(value.as_str())
             .filter(|value| value.is_ascii() && value.len() <= MAX_CREDENTIAL_VALUE_BYTES)
             .and_then(|value| HeaderValue::from_str(value).ok())
             .ok_or_else(|| {
@@ -274,6 +274,7 @@ fn parse_credential(credential: &EgressCredential) -> Result<Credential, String>
                     "egress credential header {name} must be printable ASCII of at most {MAX_CREDENTIAL_VALUE_BYTES} bytes"
                 )
             })?;
+        value.set_sensitive(true);
         if headers.insert(name.clone(), value).is_some() {
             return Err(format!(
                 "egress credential header {name} is listed twice for {host}"
@@ -345,12 +346,6 @@ pub(crate) struct Egress {
     gateway: Arc<Gateway>,
 }
 
-#[derive(Clone)]
-pub(crate) struct EgressRoute {
-    pub(crate) policy: watch::Receiver<EgressPolicy>,
-    pub(crate) gateway: Arc<Gateway>,
-}
-
 impl Egress {
     pub(crate) fn new(policy: EgressPolicy, gateway: Arc<Gateway>) -> Self {
         Self {
@@ -367,11 +362,8 @@ impl Egress {
         self.policy.send_replace(policy);
     }
 
-    pub(crate) fn route(&self) -> EgressRoute {
-        EgressRoute {
-            policy: self.policy.subscribe(),
-            gateway: self.gateway.clone(),
-        }
+    pub(crate) fn route(&self) -> MachineEgress {
+        MachineEgress::new(self.policy.subscribe(), self.gateway.clone())
     }
 }
 
@@ -381,17 +373,27 @@ pub(crate) struct MachineEgress {
     pub(crate) gateway: Arc<Gateway>,
 }
 
+impl MachineEgress {
+    fn new(policy: watch::Receiver<EgressPolicy>, gateway: Arc<Gateway>) -> Self {
+        Self {
+            policy,
+            resolutions: Arc::new(Semaphore::new(MAX_MACHINE_RESOLUTIONS)),
+            gateway,
+        }
+    }
+}
+
 pub async fn serve(
     proxy: UnixListener,
     dns: UnixListener,
     policy: watch::Receiver<EgressPolicy>,
     gateway: Arc<Gateway>,
 ) {
-    let machine = Arc::new(MachineEgress {
-        policy,
-        resolutions: Arc::new(Semaphore::new(MAX_MACHINE_RESOLUTIONS)),
-        gateway,
-    });
+    serve_machine(proxy, dns, MachineEgress::new(policy, gateway)).await;
+}
+
+pub(crate) async fn serve_machine(proxy: UnixListener, dns: UnixListener, machine: MachineEgress) {
+    let machine = Arc::new(machine);
     let mut tunnels = JoinSet::new();
     let mut lookups = JoinSet::new();
     loop {
@@ -409,12 +411,11 @@ pub async fn serve(
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
-            accepted = dns.accept() => match accepted {
-                Ok((guest, _)) if lookups.len() < MAX_MACHINE_DNS_CONNECTIONS => {
+            accepted = dns.accept(), if lookups.len() < MAX_MACHINE_DNS_CONNECTIONS => match accepted {
+                Ok((guest, _)) => {
                     let machine = machine.clone();
                     lookups.spawn(async move { dns::serve_connection(guest, &machine).await });
                 }
-                Ok(_over_bound) => {}
                 Err(error) => {
                     tracing::error!(%error, "dns accept failed");
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -669,31 +670,48 @@ fn parse_authority(authority: &str) -> Option<Target> {
     Some(Target { host, port })
 }
 
+pub(crate) enum NoAddress {
+    Unresolvable,
+    NotPublic,
+    NoneFromSource(IpAddr),
+}
+
+impl NoAddress {
+    fn refusal(self, host: &Host) -> Refusal {
+        let host = host.clone();
+        match self {
+            Self::Unresolvable => Refusal::Unresolvable(host),
+            Self::NotPublic => Refusal::NoPublicAddress(host),
+            Self::NoneFromSource(source) => Refusal::NoAddressFromSource(host, source),
+        }
+    }
+}
+
 pub(crate) async fn public_addresses(
     host: &Host,
     port: u16,
     source: Option<IpAddr>,
     resolutions: &Arc<Semaphore>,
-) -> Result<Vec<SocketAddr>, Refusal> {
+) -> Result<Vec<SocketAddr>, NoAddress> {
     let addresses = match host {
         Host::Ip(ip) => vec![SocketAddr::new(*ip, port)],
         Host::Name(name) => resolve(name, port, resolutions)
             .await
-            .map_err(|_| Refusal::Unresolvable(host.clone()))?,
+            .map_err(|_| NoAddress::Unresolvable)?,
     };
     let mut public: Vec<_> = addresses
         .into_iter()
         .filter(|address| is_public(address.ip()))
         .collect();
     if public.is_empty() {
-        return Err(Refusal::NoPublicAddress(host.clone()));
+        return Err(NoAddress::NotPublic);
     }
     let Some(source) = source else {
         return Ok(public);
     };
     public.retain(|address| address.is_ipv4() == source.is_ipv4());
     if public.is_empty() {
-        return Err(Refusal::NoAddressFromSource(host.clone(), source));
+        return Err(NoAddress::NoneFromSource(source));
     }
     Ok(public)
 }
@@ -704,7 +722,10 @@ async fn connect_to_public_address(
     resolutions: &Arc<Semaphore>,
 ) -> Result<TcpStream, Refusal> {
     let host = &target.host;
-    for address in public_addresses(host, target.port, source, resolutions).await? {
+    let addresses = public_addresses(host, target.port, source, resolutions)
+        .await
+        .map_err(|no_address| no_address.refusal(host))?;
+    for address in addresses {
         if let Ok(Ok(remote)) =
             timeout(CONNECT_ATTEMPT_TIMEOUT, connect_from(source, address)).await
         {
@@ -799,22 +820,27 @@ mod tests {
                 .map(|headers| {
                     headers
                         .iter()
-                        .map(|(n, v)| format!("{n}={v:?}"))
+                        .map(|(n, v)| format!("{n}={}", v.to_str().unwrap_or_default()))
                         .collect::<Vec<_>>()
                 })
         };
         assert_eq!(
             headers("api.example.com"),
-            Some(vec!["authorization=\"Bearer one\"".to_owned()])
+            Some(vec!["authorization=Bearer one".to_owned()])
         );
         assert_eq!(
             headers("other.example.com"),
-            Some(vec!["x-api-key=\"two\"".to_owned()])
+            Some(vec!["x-api-key=two".to_owned()])
         );
         assert_eq!(headers("example.com"), None);
         assert_eq!(
             policy.credential_hosts(),
             vec!["api.example.com", "*.example.com"]
+        );
+        let printed = format!("{policy:?} {:?}", policy.credentials());
+        assert!(
+            !printed.contains("Bearer one") && !printed.contains("two\""),
+            "debug output hides credential values: {printed}"
         );
         let restored = EgressPolicy::new(&policy.allowed_hosts(), &policy.credentials(), None)
             .expect("recorded credentials parse");

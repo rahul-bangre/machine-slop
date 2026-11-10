@@ -18,4 +18,4 @@ pub use firecracker::{AGENTD_PORT, connect_vsock};
 pub use gateway::Gateway;
 pub use machine::{BootError, Machine, MachineUse};
 pub use machines::{Limits, MachineError, Machines, Network, default_memory_budget_mib};
-pub use previews::{PreviewOrigin, PreviewUse};
+pub use previews::{MAX_PREVIEW_CONNECTIONS, PreviewOrigin, PreviewUse};

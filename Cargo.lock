@@ -537,6 +537,7 @@ dependencies = [
  "serde_json",
  "slop-machines",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

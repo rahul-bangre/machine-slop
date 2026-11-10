@@ -43,6 +43,7 @@ until ss -Hltn 'sport = :3128' | grep -q .; do
   sleep 0.01
 done
 curl -fsS -o "$egress_ca" http://127.0.0.1:3128/egress-ca.pem
+cp "$egress_ca" /usr/local/share/ca-certificates/egress-gateway.crt
 cat "$egress_ca" >> /etc/ssl/certs/ca-certificates.crt
 mkdir -p /workspace
 cd /workspace
