@@ -5,6 +5,7 @@ import { wholeNumber } from "../../common/stats.ts";
 import type { Limits } from "./agent.ts";
 import { agentdProvider, machinedProvider } from "./agentd-sandbox.ts";
 import { type AttemptRecord, runAttempt } from "./attempt.ts";
+import { daytonaProvider } from "./daytona-sandbox.ts";
 import { e2bProvider } from "./e2b-sandbox.ts";
 import { claudeCliModel } from "./claude-cli-model.ts";
 import { claudeModel, default_claude_model } from "./claude-model.ts";
@@ -51,8 +52,9 @@ function provider(name: string): SandboxProvider {
         );
     }
     if (name === "machined") return machinedProvider(flags["machined-url"]);
+    if (name === "daytona") return daytonaProvider();
     if (name === "e2b") return e2bProvider(flags["e2b-template"]);
-    fail(`unknown sandbox "${name}"; choose agentd, machined or e2b`);
+    fail(`unknown sandbox "${name}"; choose agentd, machined, e2b or daytona`);
 }
 
 function pinnedModel(spec: string): Model {
