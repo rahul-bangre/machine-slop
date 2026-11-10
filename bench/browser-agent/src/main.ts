@@ -43,6 +43,9 @@ const { values: flags } = parseArgs({
     },
 });
 
+const sandbox_resources = { vcpus: 2, memory_mib: 4096 };
+const dependency_registry = "registry.npmjs.org";
+
 function provider(name: string): SandboxProvider {
     switch (name) {
         case "agentd":
@@ -52,11 +55,14 @@ function provider(name: string): SandboxProvider {
                     : { binary: flags["agentd-binary"] },
             );
         case "machined":
-            return machinedProvider(flags["machined-url"]);
+            return machinedProvider(flags["machined-url"], {
+                ...sandbox_resources,
+                allowed_hosts: [dependency_registry],
+            });
         case "e2b":
             return e2bProvider(flags["e2b-template"], {
-                cpu_count: 2,
-                memory_mb: 4096,
+                cpu_count: sandbox_resources.vcpus,
+                memory_mb: sandbox_resources.memory_mib,
             });
         case "daytona":
             return daytonaProvider(undefined, flags["daytona-snapshot"]);

@@ -3,19 +3,25 @@ import { parseArgs } from "node:util";
 import { writeArtifact } from "./artifacts.ts";
 import { daytonaProvider } from "./daytona.ts";
 import { e2bProvider } from "./e2b.ts";
-import { browserEnvironment } from "./environment.ts";
+import { browserEnvironment, type Environment } from "./environment.ts";
+import { machinedSandboxes } from "./machined.ts";
 import {
+    type ImageBuilder,
     type ImageRecord,
     inputSha256,
-    type Provider,
     ProviderNotReady,
+    type Sandboxes,
 } from "./provider.ts";
-import { guestFiles, smoke, StaleImage } from "./smoke.ts";
+import { guestFiles, recordedSandboxes, smoke, StaleImage } from "./smoke.ts";
 
-const usage = "usage: env <build|smoke> <e2b|daytona> [--out <dir>]";
+const usage =
+    "usage: env build <e2b|daytona> | env smoke <e2b|daytona|machined> [--out <dir>] [--machined-url <url>]";
 const { positionals, values: flags } = parseArgs({
     allowPositionals: true,
-    options: { out: { type: "string" } },
+    options: {
+        out: { type: "string" },
+        "machined-url": { type: "string", default: "http://127.0.0.1:4001" },
+    },
 });
 
 function fail(message: string): never {
@@ -23,14 +29,18 @@ function fail(message: string): never {
     Deno.exit(2);
 }
 
-function provider(name: string | undefined): Provider {
+async function ready<T>(start: () => T | Promise<T>): Promise<T> {
     try {
-        if (name === "e2b") return e2bProvider();
-        if (name === "daytona") return daytonaProvider();
+        return await start();
     } catch (error) {
         if (error instanceof ProviderNotReady) fail(error.message);
         throw error;
     }
+}
+
+function builder(name: string | undefined): Promise<ImageBuilder> {
+    if (name === "e2b") return ready(e2bProvider);
+    if (name === "daytona") return ready(daytonaProvider);
     fail(usage);
 }
 
@@ -53,8 +63,33 @@ const [command, name] = positionals;
 if (positionals.length !== 2) fail(usage);
 const environment = await browserEnvironment();
 
+async function smokeTarget(
+    name: string | undefined,
+    environment: Environment,
+): Promise<{ sandboxes: Sandboxes; image: ImageRecord | null }> {
+    if (name === "machined") {
+        return {
+            sandboxes: await ready(() =>
+                machinedSandboxes(flags["machined-url"], environment.resources)
+            ),
+            image: null,
+        };
+    }
+    const target = await builder(name);
+    const image = await readRecord(target.name);
+    try {
+        return {
+            sandboxes: await recordedSandboxes(target, environment, image),
+            image,
+        };
+    } catch (error) {
+        if (error instanceof StaleImage) fail(error.message);
+        throw error;
+    }
+}
+
 if (command === "build") {
-    const target = provider(name);
+    const target = await builder(name);
     await Deno.mkdir(new URL("../images/", import.meta.url), {
         recursive: true,
     });
@@ -71,30 +106,25 @@ if (command === "build") {
     await writeArtifact(recordPath(target.name), record);
     console.log(`${target.name}: built ${image.ref} (${image.id})`);
 } else if (command === "smoke") {
-    const target = provider(name);
-    const record = await readRecord(target.name);
-    const run_id = crypto.randomUUID();
+    const { sandboxes, image } = await smokeTarget(name, environment);
     const report = await smoke(
-        target,
+        sandboxes,
+        image,
         environment,
-        record,
         await guestFiles(),
-        run_id,
-    ).catch((error) => {
-        if (error instanceof StaleImage) fail(error.message);
-        throw error;
-    });
+        crypto.randomUUID(),
+    );
     const directory = flags.out ??
         `bench-results/env-${new Date().toISOString().replaceAll(":", "-")}`;
     await Deno.mkdir(directory, { recursive: true });
-    await writeArtifact(`${directory}/${target.name}.json`, report);
+    await writeArtifact(`${directory}/${sandboxes.name}.json`, report);
     for (const check of report.checks) {
         console.log(
             `${check.ok ? "ok  " : "FAIL"} ${check.name}: ${check.observed}`,
         );
     }
     if (report.failure) console.log(`FAIL ${report.failure}`);
-    console.log(`report written to ${directory}/${target.name}.json`);
+    console.log(`report written to ${directory}/${sandboxes.name}.json`);
     if (!report.passed) Deno.exit(1);
 } else {
     fail(usage);

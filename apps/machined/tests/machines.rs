@@ -641,3 +641,83 @@ async fn an_open_port_tunnel_keeps_a_machine_from_expiring() {
     host.wait_until_gone(machine, Duration::from_secs(10)).await;
     std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
 }
+
+const CHROMIUM_MACHINE_MIB: u32 = 1024;
+
+const CHROMIUM_LOADS_A_PAGE_SERVED_IN_THE_MACHINE: &str = r#"
+cd "$(mktemp -d)"
+printf '%s' '<p id="status">static</p><script>document.getElementById("status").textContent = "script ran"</script>' > index.html
+python3 -m http.server 8000 --bind 127.0.0.1 > /dev/null 2>&1 < /dev/null &
+server=$!
+tries=0
+until curl -fsS -o /dev/null http://127.0.0.1:8000/; do
+  tries=$((tries + 1))
+  [ "$tries" -lt 100 ] || exit 2
+  sleep 0.1
+done
+dom=$(timeout 90 chromium --headless=new --no-sandbox --dump-dom http://127.0.0.1:8000/ 2> /dev/null)
+kill "$server"
+case $dom in
+  *'<p id="status">script ran</p>'*) exit 0 ;;
+  *) exit 1 ;;
+esac
+"#;
+
+const CHROMIUM_LOADS_ONLY_ALLOWED_HTTPS_SITES: &str = r#"
+dump() {
+  timeout 90 chromium --headless=new --no-sandbox --dump-dom "$1" 2> /dev/null
+}
+case $(dump https://example.com/) in
+  *'<title>Example Domain</title>'*) ;;
+  *) exit 1 ;;
+esac
+case $(dump https://example.org/) in
+  *'Example Domain'*) exit 2 ;;
+esac
+"#;
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn chromium_runs_headless_in_a_machine_without_network() {
+    let host = Host::start("chromium").await;
+    let info = host
+        .create_with(Some(json!({
+            "memory_mib": CHROMIUM_MACHINE_MIB,
+            "allowed_hosts": [],
+        })))
+        .await;
+    let machine = info["id"].as_str().expect("machine id");
+    assert_eq!(
+        host.exit_code(machine, CHROMIUM_LOADS_A_PAGE_SERVED_IN_THE_MACHINE)
+            .await,
+        json!(0)
+    );
+    let (status, _) = host
+        .request("DELETE", &format!("/machines/{machine}"), None)
+        .await;
+    assert_eq!(status, 204);
+    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, SLOP_IMAGE_DIR and internet access; run with make vm-test"]
+async fn chromium_reaches_https_sites_through_the_allowlist_without_flags() {
+    let host = Host::start("chromium-egress").await;
+    let info = host
+        .create_with(Some(json!({
+            "memory_mib": CHROMIUM_MACHINE_MIB,
+            "allowed_hosts": ["example.com"],
+        })))
+        .await;
+    let machine = info["id"].as_str().expect("machine id");
+    assert_eq!(
+        host.exit_code(machine, CHROMIUM_LOADS_ONLY_ALLOWED_HTTPS_SITES)
+            .await,
+        json!(0)
+    );
+    let (status, _) = host
+        .request("DELETE", &format!("/machines/{machine}"), None)
+        .await;
+    assert_eq!(status, 204);
+    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+}

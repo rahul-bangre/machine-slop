@@ -109,6 +109,21 @@ Deno.test("a machined sandbox runs commands in its own machine, reports the host
         assert.equal(host.running.size, 0);
     }));
 
+Deno.test("a machined sandbox is created with the machine settings it was given", () =>
+    withStubHost(async (host) => {
+        const machine = {
+            vcpus: 2,
+            memory_mib: 4096,
+            allowed_hosts: ["registry.npmjs.org"],
+        };
+        const provider = machinedProvider(host.url, machine);
+
+        const sandbox = await provider.create();
+        assert.deepEqual(host.create_requests, [machine]);
+        assert.deepEqual(provider.describe().machine, machine);
+        await sandbox.close();
+    }));
+
 Deno.test("machines the bench lost track of are destroyed before the next create, when setup fails, and when the run ends", () =>
     withStubHost(async (host) => {
         const provider = machinedProvider(host.url);
