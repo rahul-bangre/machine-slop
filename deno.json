@@ -1,6 +1,6 @@
 {
   "workspace": ["./packages/sdk"],
-  "exclude": ["target", "node_modules", "**/dist"],
+  "exclude": ["target", "node_modules"],
   "compilerOptions": {
     "strict": true,
     "noUncheckedIndexedAccess": true,
