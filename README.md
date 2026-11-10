@@ -11,7 +11,8 @@ make test
 make dev
 ```
 
-`agentd` listens on `127.0.0.1:3000`.
+`agentd` listens on `127.0.0.1:3000`; see [apps/agentd](apps/agentd/README.md)
+for files, archives and ports.
 
 For Linux development on macOS, install [Lima](https://lima-vm.io) 1.1+. The VM
 needs an Apple M3 or later for nested virtualization.

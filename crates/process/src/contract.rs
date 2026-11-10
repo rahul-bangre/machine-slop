@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroU16};
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -22,6 +22,18 @@ pub struct StartProcess {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub keep_stdin_open: Option<bool>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub terminal: Option<TerminalSize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalSize {
+    #[ts(type = "number")]
+    pub rows: NonZeroU16,
+    #[ts(type = "number")]
+    pub cols: NonZeroU16,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]
@@ -56,6 +68,7 @@ pub struct ProcessInfo {
     #[ts(type = "number")]
     pub stdin_offset: u64,
     pub stdin_open: bool,
+    pub terminal: Option<TerminalSize>,
 }
 
 #[derive(Debug, Serialize, TS)]

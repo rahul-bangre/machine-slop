@@ -1,11 +1,14 @@
 use std::{fs, path::Path};
 
-use slop_process::{ProcessEvent, ProcessInfo, ProcessResult, ProcessStatus, StartProcess};
+use slop_process::{
+    ProcessEvent, ProcessInfo, ProcessResult, ProcessStatus, StartProcess, TerminalSize,
+};
 use ts_rs::TS;
 
 fn main() -> std::io::Result<()> {
     let config = ts_rs::Config::default();
     let declarations = [
+        TerminalSize::decl(&config),
         StartProcess::decl(&config),
         ProcessResult::decl(&config),
         ProcessStatus::decl(&config),

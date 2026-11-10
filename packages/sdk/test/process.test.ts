@@ -2,53 +2,7 @@ import assert from "node:assert/strict";
 
 import { HttpError, Machine } from "../src/mod.ts";
 import type { OutputEvent, Process } from "../src/mod.ts";
-
-async function withMachine(
-    run: (machine: Machine, terminate: () => void) => Promise<void>,
-) {
-    const daemon = new Deno.Command("./target/debug/agentd", {
-        args: ["127.0.0.1:0"],
-        stdout: "null",
-        stderr: "piped",
-    }).spawn();
-    const shutdown = { requested: false };
-    const deadline = setTimeout(() => daemon.kill("SIGKILL"), 20_000);
-    try {
-        const url = await listenAddress(daemon.stderr);
-        await run(new Machine(url), () => {
-            shutdown.requested = true;
-            daemon.kill("SIGTERM");
-        });
-    } finally {
-        if (!shutdown.requested) daemon.kill("SIGINT");
-        const status = await daemon.status;
-        await daemon.stderr.cancel();
-        clearTimeout(deadline);
-        assert.equal(status.code, 0, "daemon shuts down cleanly");
-    }
-}
-
-async function listenAddress(
-    stderr: ReadableStream<Uint8Array>,
-): Promise<string> {
-    const reader = stderr.getReader();
-    const decoder = new TextDecoder();
-    const chunks: string[] = [];
-    try {
-        while (true) {
-            const { value, done } = await reader.read();
-            assert.ok(!done, "daemon exited before reporting its address");
-            chunks.push(decoder.decode(value, { stream: true }));
-            const text = chunks.join("");
-            if (!text.includes("\n")) continue;
-            const url = text.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0];
-            assert.ok(url, `unexpected daemon output: ${text}`);
-            return url;
-        }
-    } finally {
-        reader.releaseLock();
-    }
-}
+import { withMachine } from "./agentd.ts";
 
 function decode(
     events: OutputEvent[],
@@ -206,6 +160,34 @@ Deno.test("interactive stdin streams in order and retried writes are not repeate
         }
     }));
 
+Deno.test("a terminal process reports and applies its size", () =>
+    withMachine(async (machine) => {
+        const process = await machine.startProcess({
+            program: "/bin/sh",
+            args: ["-c", "stty size; read _; stty size"],
+            terminal: { rows: 24, cols: 80 },
+        });
+        await process.resize({ rows: 50, cols: 132 });
+        assert.deepEqual((await process.info()).terminal, {
+            rows: 50,
+            cols: 132,
+        });
+        await process.writeStdin(0, "\n");
+        await assert.rejects(
+            process.closeStdin(1),
+            (error) => error instanceof HttpError && error.status === 409,
+        );
+        const output = new TextDecoder().decode(
+            decode(await collect(process), "stdout"),
+        );
+        assert.match(output, /50 132\r\n$/);
+        assert.equal((await process.wait()).kind, "exited");
+        await assert.rejects(
+            process.resize({ rows: 10, cols: 10 }),
+            (error) => error instanceof HttpError && error.status === 409,
+        );
+    }));
+
 Deno.test("immediate and repeated kill requests terminate the process group", () =>
     withMachine(async (machine) => {
         const process = await machine.startProcess({
@@ -259,6 +241,21 @@ Deno.test("invalid starts, oversized bodies, and unknown process IDs are explici
             {
                 command: { program: "/bin/true", stdin: "x".repeat(65536) },
                 status: 413,
+            },
+            {
+                command: {
+                    program: "/bin/true",
+                    terminal: { rows: 0, cols: 80 },
+                },
+                status: 422,
+            },
+            {
+                command: {
+                    program: "/bin/true",
+                    terminal: { rows: 24, cols: 80 },
+                    keep_stdin_open: false,
+                },
+                status: 422,
             },
         ];
         for (const test_case of cases) {

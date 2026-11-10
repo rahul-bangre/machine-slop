@@ -47,7 +47,7 @@ async function collect(process: Process): Promise<CommandResult> {
     };
 }
 
-type ShellOptions = { cwd?: string; stdin?: string; arguments?: string[] };
+type ShellOptions = { cwd?: string };
 
 async function shellWithin(
     timeout_ms: number,
@@ -57,9 +57,8 @@ async function shellWithin(
 ): Promise<CommandResult> {
     const process = await machine.startProcess({
         program: "/bin/sh",
-        args: ["-c", script, "sh", ...options.arguments ?? []],
+        args: ["-c", script],
         ...(options.cwd ? { cwd: options.cwd } : {}),
-        ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
     }, AbortSignal.timeout(request_timeout_ms));
     const finished = collect(process);
     finished.catch(() => {});
@@ -112,7 +111,10 @@ async function removeDirectory(
     directory: string | null,
 ): Promise<void> {
     if (directory) {
-        await shell(machine, 'rm -rf "$1"', { arguments: [directory] });
+        await machine.remove(
+            directory,
+            AbortSignal.timeout(request_timeout_ms),
+        );
     }
 }
 
@@ -142,19 +144,16 @@ class AgentdSandbox implements Sandbox {
     }
 
     async writeFile(relative_path: string, content: string): Promise<void> {
-        const written = await shell(
-            this.lease.machine,
-            'mkdir -p "$(dirname "$1")" && cat > "$1"',
-            {
-                cwd: this.work_directory,
-                stdin: content,
-                arguments: [relative_path],
-            },
-        );
-        if (written.exit_code !== 0) {
-            throw new SandboxError(
-                `cannot write ${relative_path}: ${written.stderr}`,
+        try {
+            await this.lease.machine.writeFile(
+                `${this.work_directory}/${relative_path}`,
+                content,
+                { signal: AbortSignal.timeout(request_timeout_ms) },
             );
+        } catch (error) {
+            throw new SandboxError(`cannot write ${relative_path}`, {
+                cause: error,
+            });
         }
     }
 
