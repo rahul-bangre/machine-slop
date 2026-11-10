@@ -20,7 +20,7 @@ use tokio::{
 };
 
 use crate::{
-    egress::{self, EGRESS_PORT, EgressPolicy},
+    egress::{self, DNS_PORT, EGRESS_PORT, MachineEgress},
     files::{self, link_immutable},
     machines::{Admission, MACHINE_OVERHEAD_MIB, lock},
     tenants::TenantCharge,
@@ -109,7 +109,7 @@ pub(crate) struct Launch<'a> {
     pub dir: &'a Path,
     pub jail: &'a Jail,
     pub admission: Admission,
-    pub egress: watch::Receiver<EgressPolicy>,
+    pub egress: MachineEgress,
     pub vcpus: u8,
     pub memory_mib: u32,
 }
@@ -168,9 +168,12 @@ impl Vm {
         let seat_dir = jail.seat_dir(admission.uid());
         let cgroup = jail.cgroup().join(&uid);
         remove_cgroup(&cgroup)?;
-        let egress_socket = root.join(egress_socket_name());
+        let egress_socket = root.join(host_socket_name(EGRESS_PORT));
         let egress_listener = UnixListener::bind(&egress_socket)?;
         std::fs::set_permissions(&egress_socket, Permissions::from_mode(0o777))?;
+        let dns_socket = root.join(host_socket_name(DNS_PORT));
+        let dns_listener = UnixListener::bind(&dns_socket)?;
+        std::fs::set_permissions(&dns_socket, Permissions::from_mode(0o777))?;
         let reserved_bytes = (u64::from(memory_mib) + u64::from(MACHINE_OVERHEAD_MIB)) << 20;
         let mut child = Command::new(&jail.jailer)
             .args(["--id", &uid, "--exec-file"])
@@ -233,7 +236,7 @@ impl Vm {
         let mut exited = exit.clone();
         tokio::spawn(async move {
             tokio::select! {
-                () = egress::serve(egress_listener, egress) => {}
+                () = egress::serve_machine(egress_listener, dns_listener, egress) => {}
                 _ = exited.wait_for(Option::is_some) => {}
             }
         });
@@ -443,8 +446,8 @@ impl Vm {
     }
 }
 
-fn egress_socket_name() -> String {
-    format!("vsock.sock_{EGRESS_PORT}")
+fn host_socket_name(port: u32) -> String {
+    format!("vsock.sock_{port}")
 }
 
 async fn vsock_handshake(mut stream: UnixStream, port: u32) -> io::Result<UnixStream> {

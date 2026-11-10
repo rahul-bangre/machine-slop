@@ -8,6 +8,8 @@ deb https://snapshot.debian.org/archive/debian/$DEBIAN_SNAPSHOT trixie-updates m
 deb https://snapshot.debian.org/archive/debian-security/$DEBIAN_SNAPSHOT trixie-security main"
 CHROMIUM_PIN=$ROOT/bench/browser/chromium.json
 DENO_PINS=$ROOT/bench/env/deno-release.json
+NODE_PINS=$ROOT/vm/image/node-release.json
+NODE_VERSION=24.22.2
 FIRECRACKER_VERSION=v1.17.0
 KERNEL_PATH=firecracker-ci/v1.15/ARCH/vmlinux-6.1.155
 
@@ -52,7 +54,9 @@ esac
 DENO_VERSION=$(sed -n 's/^deno //p' "$ROOT/.tool-versions")
 DENO_URL=$(pinned "$DENO_PINS" "$DENO_VERSION" "linux-$ARCH" url)
 DENO_SHA256=$(pinned "$DENO_PINS" "$DENO_VERSION" "linux-$ARCH" sha256)
-PACKAGES="build-essential ca-certificates curl git iproute2 nodejs procps python3 python3-pip python3-venv socat tini unzip
+NODE_URL=$(pinned "$NODE_PINS" "$NODE_VERSION" "linux-$ARCH" url)
+NODE_SHA256=$(pinned "$NODE_PINS" "$NODE_VERSION" "linux-$ARCH" sha256)
+PACKAGES="build-essential ca-certificates curl git iproute2 procps python3 python3-pip python3-venv socat tini unzip
 $(pinned "$CHROMIUM_PIN" debian_trixie_packages) ${DEBIAN_CHROMIUM:-}"
 
 sha256() {
@@ -108,11 +112,15 @@ build_rootfs() {
   sudo install -m 0755 "$AGENTD" "$staging/root/usr/local/bin/agentd"
   sudo install -m 0755 "$ROOT/vm/image/slop-init" "$staging/root/sbin/slop-init"
   unzip_into_rootfs "$CACHE/deno-$DENO_VERSION-$ARCH.zip" /usr/local/bin
+  node_dir=$(basename "$NODE_URL" .tar.xz)
+  sudo tar -C "$staging/root/usr/local" --strip-components=1 --no-same-owner \
+    -xJf "$CACHE/node-$NODE_SHA256.tar.xz" "$node_dir/bin" "$node_dir/lib" "$node_dir/include" "$node_dir/share"
   if [ -n "${CHROMIUM_URL:-}" ]; then
     unzip_into_rootfs "$CACHE/chromium-$CHROMIUM_SHA256.zip" /opt/chromium
   fi
   sudo ln -s "$CHROMIUM_EXECUTABLE" "$staging/root/usr/local/bin/chromium"
   sudo chroot "$staging/root" /usr/local/bin/deno --version >&2
+  sudo chroot "$staging/root" /usr/local/bin/node --version >&2
   sudo chroot "$staging/root" /usr/local/bin/chromium --version >&2
   sudo mkdir -p "$staging/root/mnt/scratch" "$staging/root/mnt/root"
   used_mib=$(sudo du -sm "$staging/root" | cut -f1)
@@ -137,13 +145,14 @@ for program in firecracker jailer; do
 done
 
 fetch "$DENO_URL" "$DENO_SHA256" "$CACHE/deno-$DENO_VERSION-$ARCH.zip"
+fetch "$NODE_URL" "$NODE_SHA256" "$CACHE/node-$NODE_SHA256.tar.xz"
 if [ -n "${CHROMIUM_URL:-}" ]; then
   fetch "$CHROMIUM_URL" "$CHROMIUM_SHA256" "$CACHE/chromium-$CHROMIUM_SHA256.zip"
 fi
 
 tarball=$(base_rootfs)
 stamp=$(printf '%s\n' "$tarball" "$(sha256 "$AGENTD")" "$(sha256 "$ROOT/vm/image/slop-init")" \
-  "$DENO_SHA256" "${CHROMIUM_SHA256:-}" "$CHROMIUM_EXECUTABLE" | sha256sum | cut -d' ' -f1)
+  "$DENO_SHA256" "$NODE_SHA256" "${CHROMIUM_SHA256:-}" "$CHROMIUM_EXECUTABLE" | sha256sum | cut -d' ' -f1)
 if [ -f "$OUT/rootfs.ext4" ] && [ "$(cat "$OUT/rootfs.stamp" 2>/dev/null)" = "$stamp" ]; then
   echo "image: rootfs is current" >&2
 else

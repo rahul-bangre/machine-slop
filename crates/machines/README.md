@@ -45,6 +45,7 @@ original machine's shell is still waiting after the pause and resume.
 | `GET /machines`              | `host.machines()`                     | Lists machines by id                                           |
 | `GET /machines/{id}`         | `machine.info()`                      | `MachineInfo`                                                  |
 | `PATCH /machines/{id}`       | `machine.setAllowedHosts(list)`       | Replaces the machine's `allowed_hosts`; `MachineInfo`          |
+| `PATCH /machines/{id}`       | `machine.setEgressCredentials(list)`  | Replaces the machine's `egress_credentials`; `MachineInfo`     |
 | `POST /machines/{id}/pause`  | `machine.pause()`                     | Saves the machine and stops its VM; `MachineInfo`              |
 | `POST /machines/{id}/resume` | `machine.resume()`                    | Restores the machine once `agentd` answers; `MachineInfo`      |
 | `POST /machines/{id}/fork`   | `machine.fork()`                      | A new machine from this one's current state; 201 with its info |
@@ -55,19 +56,25 @@ original machine's shell is still waiting after the pause and resume.
 | `GET /snapshots/{id}`        | `host.snapshot(id)`                   | `SnapshotInfo`                                                 |
 | `DELETE /snapshots/{id}`     | `host.deleteSnapshot(id)`             | Removes the snapshot's files; 204                              |
 | `POST /machines`             | `host.createMachine({ snapshot_id })` | Starts a new machine from a snapshot; 201 with `MachineInfo`   |
+| `POST /previews`             | `machine.preview(port, { ttl_secs })` | A public URL for a port; 201 with `PreviewInfo`                |
+| `GET /previews`              | `host.previews()`                     | Lists previews that have not expired                           |
+| `GET /previews/{id}`         | none                                  | `PreviewInfo`                                                  |
+| `DELETE /previews/{id}`      | `host.deletePreview(id)`              | Ends the preview and its open connections; 204                 |
 | `GET /usage`                 | `host.usage()`                        | The tenant's quotas and recorded usage; `TenantUsage`          |
 
 `HostedMachine` is a `Machine`, so processes, files and ports work the same as
 against a local `agentd`. `GET /health` returns `ok`. Every other request needs
 an API key as `Authorization: Bearer <key>`, and acts as the key's tenant.
 
-| Field               | Default | Range     |
-| ------------------- | ------- | --------- |
-| `vcpus`             | 2       | 1–32      |
-| `memory_mib`        | 512     | 128–32768 |
-| `idle_timeout_secs` | 600     | 1–86400   |
-| `allowed_hosts`     | `["*"]` | see below |
-| `snapshot_id`       | none    | see below |
+| Field                | Default | Range     |
+| -------------------- | ------- | --------- |
+| `vcpus`              | 2       | 1–32      |
+| `memory_mib`         | 512     | 128–32768 |
+| `idle_timeout_secs`  | 600     | 1–86400   |
+| `allowed_hosts`      | `["*"]` | see below |
+| `egress_credentials` | `[]`    | see below |
+| `egress_address`     | none    | see below |
+| `snapshot_id`        | none    | see below |
 
 A machine is `running`, `paused` or `exited`. A missing or unknown API key
 returns 401, an invalid request 422, an unknown machine or snapshot 404, a
@@ -125,12 +132,13 @@ without a key is not retry-safe; after a lost response, find its result with
 
 A running or exited machine expires after `idle_timeout_secs` without an open
 request to its `agentd`, and is then destroyed as if deleted. The clock restarts
-when the last open request to `/machines/{id}/...` ends, so a long `wait()`, an
-event stream or an open port tunnel keeps the machine alive, and when a pause,
-resume, fork or snapshot of it ends. Other requests to `machined` itself, such
-as `GET /machines/{id}`, and egress traffic do not. A paused machine never
-expires, so pausing is how to keep a machine without keeping it busy; to keep a
-running machine unattended, call `machine.health()` within each timeout. After a
+when the last open request to `/machines/{id}/...` or to one of its previews
+ends, so a long `wait()`, an event stream, an open port tunnel or an open
+preview connection keeps the machine alive, and when a pause, resume, fork or
+snapshot of it ends. Other requests to `machined` itself, such as
+`GET /machines/{id}`, and egress traffic do not. A paused machine never expires,
+so pausing is how to keep a machine without keeping it busy; to keep a running
+machine unattended, call `machine.health()` within each timeout. After a
 `machined` restart an exited machine's clock starts again. An expiry that cannot
 remove the machine's record leaves it listed and tries again a timeout later.
 
@@ -232,8 +240,9 @@ The root filesystem is one read-only ext4 image shared by every machine. Writes
 go to an overlay on the machine's own sparse 8 GiB scratch disk, so a machine
 starts with the image's contents and nothing another machine wrote. `agentd`
 runs as root under `tini` in `/workspace` and listens on vsock port 3000. The
-image includes `curl`, `git`, `nodejs`, `python3` with `pip` and `venv`,
-`build-essential`, Deno, and a headless Chromium at `/usr/local/bin/chromium`.
+image includes `curl`, `git`, Node 24 with `npm`, `python3` with `pip` and
+`venv`, `build-essential`, Deno, and a headless Chromium at
+`/usr/local/bin/chromium`.
 
 On x86_64 the browser is the Chrome for Testing build pinned in
 `bench/browser/chromium.json`, the same one the E2B and Daytona benchmark images
@@ -275,12 +284,13 @@ flight, and a fork or snapshot that starts after it never carries the old list.
 
 A machine keeps its list while paused and across a `machined` restart, and
 `setAllowedHosts` works on a paused machine. A fork starts with its source's
-list and idle timeout. A snapshot records its source's list as
-`SnapshotInfo.allowed_hosts`, and a machine created from it gets that list
-unless the request gives its own; its idle timeout is the request's or the
-default. A spare has no egress until a create takes it and gives it that
-machine's list. Open tunnels are among the connections a pause, fork or snapshot
-resets.
+list, credentials, egress address and idle timeout. A snapshot records only its
+source's list, as `SnapshotInfo.allowed_hosts`, so it can be shared without the
+credentials or address of the machine it came from; a machine created from it
+gets that list unless the request gives its own, and the request's credentials,
+address and idle timeout. A spare has no egress until a create takes it and
+gives it that machine's settings. Open tunnels are among the connections a
+pause, fork or snapshot resets.
 
 Inside the machine, `HTTPS_PROXY` and `HTTP_PROXY` (and their lowercase forms)
 point at `127.0.0.1:3128`, where `socat` forwards each connection over vsock to
@@ -288,7 +298,17 @@ point at `127.0.0.1:3128`, where `socat` forwards each connection over vsock to
 the list, resolves it itself, and connects only to public unicast addresses, so
 even `*` cannot reach the host's loopback, private networks, link-local metadata
 endpoints or the host's own public address. curl, git over HTTPS, pip, Python's
-`urllib` and Chromium honour the proxy variables.
+`urllib`, Deno, Chromium and Node (built-in `fetch`, `http` and `https`, through
+`NODE_USE_ENV_PROXY=1`) honour the proxy variables. The image's Node is the
+official 24 LTS build pinned in `vm/image/node-release.json`, with `npm`.
+
+Once a tunnel is open, the first bytes the machine sends must be a TLS
+ClientHello whose server name is the host it asked to `CONNECT` to. A tunnel to
+an IP address accepts a hello with no server name, or one naming a host the list
+allows. Anything else, such as plain HTTP or a hello naming another host on the
+same CDN, gets a TLS `access_denied` alert and the tunnel closes before any byte
+reaches the remote host. This is checked once per tunnel, on the outer name of
+an encrypted ClientHello.
 
 A refusal is an HTTP response to the `CONNECT` with a plain-text reason:
 
@@ -296,24 +316,148 @@ A refusal is an HTTP response to the `CONNECT` with a plain-text reason:
   host itself
 - 405: anything but `CONNECT`, plain HTTP included
 - 400: a malformed request
-- 502: the name does not resolve, or no address accepts within 3 seconds
+- 502: the name does not resolve, no address accepts within 3 seconds, no
+  address has the egress address's family, or a credentialed host's certificate
+  is not trusted
 - 504: resolving and connecting take longer than 10 seconds
 
-Each machine may hold 256 open proxy connections and 4 concurrent name lookups,
-so one machine cannot starve another. `machined` raises its soft open-file limit
-to cover every machine's budget at start and refuses to start if the hard limit
-is too low.
+Each machine may hold 256 open proxy connections, 16 DNS connections (more wait
+for a place) and 4 concurrent name lookups, so one machine cannot starve
+another. `machined` raises its soft open-file limit to cover every machine's
+budget at start and refuses to start if the hard limit is too low.
 
-The list limits the name a machine asks for and the address `machined` connects
-to. It does not inspect the TLS server name or HTTP `Host` inside the tunnel.
 Egress leaves from the host's own address, so under `*` a machine reaches
 anything the host can reach at a public address, including services that trust
 the host, and can send anything it holds to any public HTTPS host. Give machines
-that hold secrets and run untrusted instructions a narrower list or `[]`.
+that hold secrets and run untrusted instructions a narrower list or `[]`, and
+keep the secrets on the host as credentials.
 
-Not supported: plain HTTP, ports other than 443, DNS from inside the machine,
-UDP, and tools that ignore the proxy variables, such as Node's built-in `fetch`
-and git over SSH.
+Not supported: plain HTTP, ports other than 443, UDP other than DNS, and tools
+that ignore the proxy variables, such as git over SSH.
+
+### Credentials
+
+A machine can use an API key it never sees. `machined` adds the headers to each
+HTTPS request the machine sends to the credential's host:
+
+```ts
+const { machine } = await host.createMachine({
+  allowed_hosts: ["api.openai.com"],
+  egress_credentials: [{
+    host: "api.openai.com",
+    headers: { authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")}` },
+  }],
+});
+await machine.setEgressCredentials([]);
+```
+
+`host` is a hostname or `*.` and a hostname; `*` and IP addresses are refused,
+because the headers must go only to a server proven to be that host. A request
+uses the first entry whose host matches. Each entry sets 1–16 headers of
+printable ASCII; names that frame the connection (`host`, `connection`,
+`content-length`, `transfer-encoding`, `te`, `trailer`, `upgrade`, `keep-alive`,
+`proxy-authorization`) return 422, as do more than 64 entries or one host listed
+twice. A header the machine sent with the same name is replaced, so a
+placeholder key in the machine is harmless. `MachineInfo.credential_hosts` lists
+the hosts; header values are never returned.
+
+For a credentialed host, and only for one, `machined` verifies the host's
+certificate against the Mozilla roots in `webpki-roots`, then completes the
+machine's TLS itself with a certificate for that host signed by the host's
+gateway authority, and relays HTTP/1.1 requests, WebSocket and other upgrades
+included. A request whose `Host` is not the tunnelled host gets 421, so a
+machine cannot route the headers elsewhere through a shared front end. Whether a
+tunnel is intercepted is decided when it opens: new or removed credentials
+change the headers on the next request of an intercepted connection, but a
+tunnel opened before its host had credentials stays end to end until it closes.
+The gateway speaks HTTP/1.1 to both sides, so a client that offers only HTTP/2
+fails to connect to a credentialed host, as does a host that refuses HTTP/1.1.
+Every other host is relayed end to end and its traffic is never decrypted.
+
+The authority is created in the state dir as `egress-ca.pem` and `egress-ca.key`
+(mode 0600) on first start and kept, so paused machines and snapshots stay
+valid. Each machine fetches the certificate from the proxy at
+`GET /egress-ca.pem` when it boots, adds it to the system bundle, and points
+`NODE_EXTRA_CA_CERTS`, `DENO_CERT` and `REQUESTS_CA_BUNDLE` at the trust it
+needs, so curl, git, pip, Python, Node and Deno accept it. Chromium does not use
+the system bundle and does not trust it. Certificates are valid from 2000 to
+2100 so a guest clock that stood still while paused never rejects them.
+
+The machine never holds the key, but it can use it: anything it sends to the
+host goes out with the headers, and a response that echoes request headers shows
+them. Credentials are kept in the machine's record on the host, readable only by
+`machined`'s user, so that they survive a restart; the state dir is as sensitive
+as the keys.
+
+### DNS
+
+`/etc/resolv.conf` points at `127.0.0.1`, where `agentd` relays UDP and TCP DNS
+over vsock to `machined`. A name outside the list is refused (`REFUSED`) without
+being resolved, so DNS cannot carry data the list would stop. For an allowed
+name, `A` and `AAAA` are answered with the public addresses `machined` would
+connect to, with a 30-second TTL; any other type, or a name with no public
+address, gets an empty answer, and a failed lookup `SERVFAIL`. The answers are
+for tools that resolve before connecting; traffic still goes through the proxy.
+
+### Egress addresses
+
+Start `machined` with `SLOP_EGRESS_ADDRESSES=203.0.113.5,2001:db8::5` to let
+machines leave from fixed addresses assigned to the host, for example so a
+customer can allowlist them. Each address must be bindable when `machined`
+starts. A create request picks one with `egress_address`, which
+`MachineInfo.egress_address` reports and a fork keeps; other machines leave from
+whatever address the host's routing chooses. A machine with an IPv4 egress
+address reaches only the IPv4 addresses of a host, and likewise for IPv6. An
+address outside the list returns 422.
+
+## Previews
+
+```ts
+const site = await machine.preview(3000, { ttl_secs: 3600 });
+console.log(site.url);
+const database = await machine.preview(5432);
+const tunnel = await connectPreview(database.url);
+```
+
+Start `machined` with `SLOP_PREVIEW_URL=https://preview.example.com` and
+`SLOP_PREVIEW_LISTEN=0.0.0.0:8080` to serve previews; without them creating one
+returns 409. Previews are served only on that second listener, never on the API
+listener, which has no authentication. `PreviewInfo.url` is
+`https://<id>.preview.example.com/`: point a wildcard DNS name and a TLS
+terminator for `*.preview.example.com` at the listener. The id is 128 random
+bits and is the only credential; anyone with the URL can use the preview until
+it ends.
+
+Creating, listing and deleting previews needs the API key of the tenant that
+owns the machine; another tenant's preview is a 404 there. Using a preview URL
+needs no API key, and the app receives each request as its client sent it.
+
+A request to a preview is forwarded to the port on the machine's loopback as it
+arrived, with its `Host`, and the response comes back the same way, so web
+servers, server-sent events and WebSockets work. A request with
+`Connection: upgrade` and `Upgrade: tcp` is answered with 101 by `machined`
+itself and then carries raw bytes to the port, as with `machine.connect`;
+`connectPreview(url)` opens one. An unknown, deleted or expired preview returns
+404, a paused machine 503, an exited one 502, and a port with no listener 502.
+
+A preview is a way in that the machine controls. An offline machine can serve
+anything through it, and a program in the machine could relay preview traffic to
+its own egress proxy, handing the preview's users its allowed hosts, credentials
+and egress address. Treat a preview URL as access to whatever the machine
+chooses to expose. Every preview is a subdomain of the same domain, so browsers
+treat them as one site: one machine's pages can set cookies that other previews
+receive. Use a domain listed on the Public Suffix List, or one per tenant, when
+previews belong to different people.
+
+`machined` serves at most 1024 preview connections at once, counting open
+upgrades, and closes a connection that does not send a request head within 10
+seconds; a request body or an open tunnel has no time limit.
+
+A preview lasts `ttl_secs` (default 3600, at most 604800) for one machine and
+port. When it expires or is deleted, it stops accepting requests and its open
+connections, upgrades included, are closed. Deleting the machine ends its
+previews. A machine may have 64 previews. Previews are held in memory: a
+`machined` restart ends them all, and forks and snapshots do not copy them.
 
 ## Tenants
 
@@ -410,17 +554,25 @@ forwards to a machine, so the key never enters a guest.
 
 `machined <listen address> <image dir> <state dir> <tenants file>`
 
+| Variable                | Effect                                            |
+| ----------------------- | ------------------------------------------------- |
+| `SLOP_MEMORY_MIB`       | A smaller memory budget; see above                |
+| `SLOP_SPARE_MACHINES`   | How many default-size machines to keep booted     |
+| `SLOP_PREVIEW_URL`      | Turns previews on, with `SLOP_PREVIEW_LISTEN`     |
+| `SLOP_PREVIEW_LISTEN`   | The public address previews are served on         |
+| `SLOP_EGRESS_ADDRESSES` | Comma-separated addresses machines may leave from |
+
 `machined` must run as root on cgroup v2 with the `cpu`, `memory` and `pids`
 controllers available. Machine and snapshot records written before tenants
 existed name no tenant; `machined` logs them as unreadable and leaves their
 directories in place, so remove the old state dir when upgrading. The image dir
 holds `jailer`, `firecracker`, `vmlinux` and `rootfs.ext4`, built by
 `vm/image/build.sh <image dir> <agentd binary>`. The script pins Firecracker,
-the guest kernel, Chrome for Testing and Deno by hash and Debian by snapshot
-date, installing from its `trixie`, `trixie-updates` and `trixie-security`
-suites, and rebuilds the root filesystem only when its inputs change. It needs
-`mmdebstrap`, `e2fsprogs`, `debian-archive-keyring` and `python3` on the host.
-The Debian keyring verifies the pinned snapshot.
+the guest kernel, Chrome for Testing, Node and Deno by hash and Debian by
+snapshot date, installing from its `trixie`, `trixie-updates` and
+`trixie-security` suites, and rebuilds the root filesystem only when its inputs
+change. It needs `mmdebstrap`, `e2fsprogs`, `debian-archive-keyring` and
+`python3` on the host. The Debian keyring verifies the pinned snapshot.
 
 Rebuilding the image affects new machines only. Each machine and snapshot keeps
 the root image and Firecracker binary it started with, as hard links when the
@@ -487,4 +639,5 @@ bound memory use, and runs the ordinary checks on Linux and macOS.
 A machine's own processes run as root inside its guest, and its `agentd` serves
 whoever reaches it; `machined` is that machine's only entrance. Egress leaves
 from the host's address, as described above. The host itself, its operator and
-`machined` are trusted.
+`machined` are trusted. The preview listener is the only one meant to face the
+internet without an API key.

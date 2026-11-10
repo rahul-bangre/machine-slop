@@ -8,7 +8,7 @@ use std::{
 
 use slop_machines::{
     CreateMachine, CreateSnapshot, IdempotencyKey, Limits, MachineError, MachineInfo, MachineState,
-    Machines, Quotas, SnapshotInfo, Tenant, TenantConfig, UpdateMachine,
+    Machines, Network, Quotas, SnapshotInfo, Tenant, TenantConfig, UpdateMachine,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -120,7 +120,15 @@ cd "$base/$(basename "$exec_file")/$id/root" && exec "$exec_file" "$@"
                     quotas: tenant.quotas.clone(),
                 })
                 .collect();
-            match Machines::open(image.clone(), state.clone(), limits, tenants).await {
+            match Machines::open(
+                image.clone(),
+                state.clone(),
+                limits,
+                tenants,
+                Network::default(),
+            )
+            .await
+            {
                 Ok(machines) => return machines,
                 Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1187,7 +1195,8 @@ async fn allowed_hosts_survive_pause_and_restart_and_pass_to_forks_and_snapshots
         .await
         .expect("pause");
     let narrowed = UpdateMachine {
-        allowed_hosts: vec!["example.com".into()],
+        allowed_hosts: Some(vec!["example.com".into()]),
+        egress_credentials: None,
     };
     let updated = machines
         .update(&owner(&machines), &source, narrowed)
@@ -1234,7 +1243,8 @@ async fn allowed_hosts_survive_pause_and_restart_and_pass_to_forks_and_snapshots
     let revoking = {
         let (machines, source) = (machines.clone(), source.clone());
         let none = UpdateMachine {
-            allowed_hosts: Vec::new(),
+            allowed_hosts: Some(Vec::new()),
+            egress_credentials: None,
         };
         tokio::spawn(async move { machines.update(&owner(&machines), &source, none).await })
     };
@@ -1264,7 +1274,8 @@ async fn allowed_hosts_survive_pause_and_restart_and_pass_to_forks_and_snapshots
     let after_revocation = snapshotting.await.expect("join").expect("snapshot");
     assert!(after_revocation.allowed_hosts.is_empty());
     let restored = UpdateMachine {
-        allowed_hosts: vec!["example.com".into()],
+        allowed_hosts: Some(vec!["example.com".into()]),
+        egress_credentials: None,
     };
     machines
         .update(&owner(&machines), &source, restored)
@@ -1509,9 +1520,15 @@ async fn memory_is_reserved_by_running_vms_and_given_up_by_spares() {
         spare_machines: 1,
         first_jail_uid: FIRST_JAIL_UID,
     };
-    let machines = Machines::open(image, state, limits, vec![roomy_tenant()])
-        .await
-        .expect("open");
+    let machines = Machines::open(
+        image,
+        state,
+        limits,
+        vec![roomy_tenant()],
+        Network::default(),
+    )
+    .await
+    .expect("open");
     eventually("booted a spare", || async { machines.spares().await == 1 }).await;
     assert_eq!(
         machines.resource_usage(),
@@ -1850,7 +1867,8 @@ async fn tenants_see_and_change_only_their_own_machines_and_snapshots() {
                 &b,
                 &machine,
                 UpdateMachine {
-                    allowed_hosts: vec![],
+                    allowed_hosts: Some(vec![]),
+                    egress_credentials: None,
                 },
             )
             .await

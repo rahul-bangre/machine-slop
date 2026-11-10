@@ -10,6 +10,16 @@ const machine_info = {
     boot_ms: 400,
     idle_timeout_secs: 600,
     allowed_hosts: [],
+    credential_hosts: [],
+    egress_address: null,
+};
+
+const preview_info = {
+    id: "v1",
+    machine_id: "m1",
+    port: 8000,
+    url: "https://v1.preview.example.com/",
+    expires_unix_ms: 1794294079990,
 };
 
 const snapshot_info = {
@@ -69,6 +79,9 @@ const routes: Record<string, () => Response> = {
     "PATCH /base/machines/m1": () =>
         Response.json({ ...machine_info, allowed_hosts: ["pypi.org"] }),
     "DELETE /base/machines/m1": () => new Response(null, { status: 204 }),
+    "POST /base/previews": () => Response.json(preview_info, { status: 201 }),
+    "GET /base/previews": () => Response.json([preview_info]),
+    "DELETE /base/previews/v1": () => new Response(null, { status: 204 }),
     "GET /base/usage": () => Response.json(usage),
 };
 
@@ -110,6 +123,16 @@ Deno.test("a hosted machine addresses its agent under the host's machine path", 
             (await machine.setAllowedHosts(["pypi.org"])).allowed_hosts,
             ["pypi.org"],
         );
+        await machine.setEgressCredentials([{
+            host: "api.example.com",
+            headers: { authorization: "Bearer key" },
+        }]);
+        assert.deepEqual(
+            await machine.preview(8000, { ttl_secs: 60 }),
+            preview_info,
+        );
+        assert.deepEqual(await host.previews(), [preview_info]);
+        await host.deletePreview("v1");
         assert.deepEqual(await machine.pause(), paused_info);
         assert.deepEqual(
             await machine.snapshot(undefined, "snapshot-1"),
@@ -132,6 +155,10 @@ Deno.test("a hosted machine addresses its agent under the host's machine path", 
             "GET /base/machines/m1/processes/p1/events?cursor=3",
             "GET /base/machines/m1",
             'PATCH /base/machines/m1 {"allowed_hosts":["pypi.org"]}',
+            'PATCH /base/machines/m1 {"egress_credentials":[{"host":"api.example.com","headers":{"authorization":"Bearer key"}}]}',
+            'POST /base/previews {"machine_id":"m1","port":8000,"ttl_secs":60}',
+            "GET /base/previews",
+            "DELETE /base/previews/v1",
             "POST /base/machines/m1/pause",
             'POST /base/snapshots {"machine_id":"m1"} key=snapshot-1',
             "POST /base/machines/m1/resume",

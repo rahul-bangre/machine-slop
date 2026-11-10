@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+mod dns;
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -33,11 +36,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "linux")]
+const DNS_ADDRESS: &str = "127.0.0.1:53";
+#[cfg(target_os = "linux")]
+const HOST_DNS_PORT: u32 = 1053;
+
+#[cfg(target_os = "linux")]
 async fn serve_vsock(
     port: u32,
     app: Router,
     processes: Arc<Processes>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    match dns::Relay::bind(DNS_ADDRESS.parse()?, HOST_DNS_PORT).await {
+        Ok(relay) => {
+            tracing::info!(address = DNS_ADDRESS, "agentd relaying dns to the host");
+            tokio::spawn(relay.run());
+        }
+        Err(error) => tracing::error!(%error, "dns relay failed to start"),
+    }
     let listener = vsock::Listener::bind(port)?;
     tracing::info!(port, "agentd listening on vsock");
     axum::serve(listener, app)

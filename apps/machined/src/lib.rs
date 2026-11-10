@@ -1,3 +1,4 @@
+mod preview;
 mod tenants;
 
 use std::sync::Arc;
@@ -10,14 +11,17 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
+use hyper::{client::conn::http1::SendRequest, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use slop_machines::{
-    CreateMachine, CreateSnapshot, IdempotencyKey, MachineError, MachineInfo, MachineState,
-    Machines, SnapshotInfo, Tenant, TenantUsage, UpdateMachine,
+    CreateMachine, CreatePreview, CreateSnapshot, IdempotencyKey, Machine, MachineError,
+    MachineInfo, MachineState, Machines, PreviewInfo, SnapshotInfo, Tenant, TenantUsage,
+    UpdateMachine,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+pub use preview::serve_previews;
 pub use tenants::{ApiKeys, parse as parse_tenants};
 
 pub struct Host {
@@ -41,6 +45,8 @@ pub fn app(host: Arc<Host>) -> Router {
             "/snapshots/{id}",
             get(snapshot_info).delete(delete_snapshot),
         )
+        .route("/previews", get(list_previews).post(create_preview))
+        .route("/previews/{id}", get(preview_info).delete(delete_preview))
         .with_state(host)
 }
 
@@ -220,6 +226,41 @@ async fn delete_snapshot(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn create_preview(
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
+    body: Bytes,
+) -> Result<(StatusCode, Json<PreviewInfo>), ApiError> {
+    let request: CreatePreview = json_body(&body)?;
+    let preview = host.machines.create_preview(&tenant, request).await?;
+    Ok((StatusCode::CREATED, Json(preview)))
+}
+
+async fn list_previews(
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
+) -> Json<Vec<PreviewInfo>> {
+    Json(host.machines.previews(&tenant).await)
+}
+
+async fn preview_info(
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
+    Path(id): Path<String>,
+) -> Result<Json<PreviewInfo>, ApiError> {
+    let preview = host.machines.preview(&tenant, &id).await;
+    Ok(Json(preview.ok_or(MachineError::UnknownPreview)?))
+}
+
+async fn delete_preview(
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    host.machines.delete_preview(&tenant, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn proxy(
     State(host): State<Arc<Host>>,
     Caller(tenant): Caller,
@@ -243,15 +284,7 @@ async fn proxy(
     let (mut parts, body) = request.into_parts();
     address_to_agentd(&mut parts, &id)?;
 
-    let stream = machine.connect().await.map_err(unreachable_agentd)?;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(unreachable_agentd)?;
-    let connection_use = machine.clone();
-    tokio::spawn(async move {
-        let _machine_in_use_until_agentd_disconnects = connection_use;
-        connection.with_upgrades().await
-    });
+    let mut sender = agentd(&machine, machine.clone()).await?;
     let mut response = sender
         .send_request(Request::from_parts(parts, body))
         .await
@@ -260,12 +293,31 @@ async fn proxy(
         let agentd_upgrade = hyper::upgrade::on(&mut response);
         tokio::spawn(async move {
             let _machine_in_use_until_the_tunnel_ends = machine;
-            if let (Ok(client), Ok(agentd)) = tokio::join!(client_upgrade, agentd_upgrade) {
-                relay_until_either_side_ends(TokioIo::new(client), TokioIo::new(agentd)).await;
-            }
+            relay_upgrades(client_upgrade, agentd_upgrade).await;
         });
     }
     Ok(response.map(Body::new))
+}
+
+async fn agentd(
+    machine: &Machine,
+    in_use: impl Send + 'static,
+) -> Result<SendRequest<Body>, ApiError> {
+    let stream = machine.connect().await.map_err(unreachable_agentd)?;
+    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(unreachable_agentd)?;
+    tokio::spawn(async move {
+        let _machine_in_use_until_agentd_disconnects = in_use;
+        connection.with_upgrades().await
+    });
+    Ok(sender)
+}
+
+async fn relay_upgrades(client: OnUpgrade, upstream: OnUpgrade) {
+    if let (Ok(client), Ok(upstream)) = tokio::join!(client, upstream) {
+        relay_until_either_side_ends(TokioIo::new(client), TokioIo::new(upstream)).await;
+    }
 }
 
 async fn relay_until_either_side_ends(
@@ -329,7 +381,9 @@ impl From<MachineError> for ApiError {
             MachineError::QuotaExceeded(_) | MachineError::RateLimited { .. } => {
                 StatusCode::TOO_MANY_REQUESTS
             }
-            MachineError::UnknownMachine | MachineError::UnknownSnapshot => StatusCode::NOT_FOUND,
+            MachineError::UnknownMachine
+            | MachineError::UnknownSnapshot
+            | MachineError::UnknownPreview => StatusCode::NOT_FOUND,
             MachineError::Conflict(_) => StatusCode::CONFLICT,
             MachineError::Capacity | MachineError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             MachineError::Boot(_) | MachineError::Failed { .. } | MachineError::Io(_) => {

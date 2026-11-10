@@ -18,6 +18,15 @@ export async function openTunnel(
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
         throw new RangeError(`port must be between 1 and 65535, got ${port}`);
     }
+    const path = `${endpoint.url.pathname.replace(/\/+$/, "")}/ports/${port}`;
+    return await openUpgrade(endpoint, path, signal);
+}
+
+export async function openUpgrade(
+    endpoint: Endpoint,
+    path: string,
+    signal?: AbortSignal,
+): Promise<Tunnel> {
     const base = endpoint.url;
     const conn = await connect(base);
     let closed = false;
@@ -29,7 +38,6 @@ export async function openTunnel(
     signal?.addEventListener("abort", closeConnection, { once: true });
     try {
         signal?.throwIfAborted();
-        const path = `${base.pathname.replace(/\/+$/, "")}/ports/${port}`;
         await writeAll(
             conn,
             new TextEncoder().encode(
@@ -53,6 +61,13 @@ export async function openTunnel(
     } finally {
         signal?.removeEventListener("abort", closeConnection);
     }
+}
+
+export function connectPreview(
+    url: string | URL,
+    signal?: AbortSignal,
+): Promise<Tunnel> {
+    return openUpgrade({ url: new URL(url), headers: {} }, "/", signal);
 }
 
 export function duplex(

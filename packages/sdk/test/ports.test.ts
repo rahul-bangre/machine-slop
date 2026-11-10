@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { HttpError } from "../src/mod.ts";
+import { connectPreview, HttpError } from "../src/mod.ts";
 import { withMachine } from "./agentd.ts";
 
 async function withServer(
@@ -163,3 +163,48 @@ Deno.test("a client's bytes reach a port that is writing when the client ends", 
             listener.close();
         }
     }));
+
+Deno.test("connectPreview asks the preview origin for a tcp upgrade at its root", async () => {
+    const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+    const served = (async () => {
+        const conn = await listener.accept();
+        try {
+            const decoder = new TextDecoder();
+            const buffer = new Uint8Array(1024);
+            let head = "";
+            while (!head.includes("\r\n\r\n")) {
+                const count = await conn.read(buffer);
+                if (count === null) break;
+                head += decoder.decode(buffer.subarray(0, count));
+            }
+            await conn.write(
+                new TextEncoder().encode(
+                    "HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: tcp\r\n\r\nraw bytes",
+                ),
+            );
+            return head;
+        } finally {
+            conn.close();
+        }
+    })();
+    try {
+        const origin = `http://127.0.0.1:${listener.addr.port}`;
+        const tunnel = await connectPreview(`${origin}/ignored/path`);
+        const reader = tunnel.readable.getReader();
+        let received = "";
+        for (let chunk; !(chunk = await reader.read()).done;) {
+            received += new TextDecoder().decode(chunk.value);
+        }
+        tunnel.close();
+        const head = await served;
+        assert.match(head, /^GET \/ HTTP\/1\.1\r\n/);
+        assert.match(
+            head,
+            new RegExp(`Host: 127\\.0\\.0\\.1:${listener.addr.port}\r\n`),
+        );
+        assert.match(head, /Upgrade: tcp\r\n/);
+        assert.equal(received, "raw bytes");
+    } finally {
+        listener.close();
+    }
+});

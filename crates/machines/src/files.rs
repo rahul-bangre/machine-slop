@@ -31,15 +31,30 @@ pub async fn replace_record(
     record_name: &str,
     record: &impl Serialize,
 ) -> io::Result<()> {
-    let staged = dir.join(format!("{record_name}.tmp"));
-    tokio::fs::write(
-        &staged,
-        serde_json::to_vec(record).map_err(io::Error::other)?,
-    )
-    .await?;
-    sync(&staged).await?;
-    tokio::fs::rename(&staged, dir.join(record_name)).await?;
-    sync(dir).await
+    let contents = serde_json::to_vec(record).map_err(io::Error::other)?;
+    write_private(&dir.join(record_name), &contents).await
+}
+
+pub async fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".tmp");
+    let staged = std::path::PathBuf::from(staged);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&staged)
+        .await?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, contents).await?;
+    file.sync_all().await?;
+    tokio::fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .await?;
+    tokio::fs::rename(&staged, path).await?;
+    match path.parent() {
+        Some(dir) => sync(dir).await,
+        None => Ok(()),
+    }
 }
 
 pub async fn read_record<T: DeserializeOwned>(dir: &Path, record_name: &str) -> io::Result<T> {

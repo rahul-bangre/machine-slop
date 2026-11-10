@@ -2,8 +2,10 @@
 
 `agentd` runs processes, moves files and reaches ports on the machine it runs
 on. It listens on `127.0.0.1:3000` unless given another address, or
-`vsock:<port>` inside a machine. `GET /health` returns `ok`. Process execution
-is described in [crates/process](../../crates/process/README.md).
+`vsock:<port>` inside a machine. `GET /health` returns `ok`. On vsock it also
+relays DNS from `127.0.0.1:53`, over UDP and TCP, to the host's vsock port 1053,
+where `machined` answers under the machine's allowlist. Process execution is
+described in [crates/process](../../crates/process/README.md).
 
 ```ts
 import { Machine, tar } from "@machine-slop/sdk";

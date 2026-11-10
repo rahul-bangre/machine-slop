@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use slop_machines::{
-    CreateMachine, CreateSnapshot, MachineInfo, MachineState, Quotas, SnapshotInfo, TenantUsage,
-    UpdateMachine,
+    CreateMachine, CreatePreview, CreateSnapshot, EgressCredential, MachineInfo, MachineState,
+    PreviewInfo, Quotas, SnapshotInfo, TenantUsage, UpdateMachine,
 };
 use ts_rs::TS;
 
@@ -10,11 +10,14 @@ fn main() -> std::io::Result<()> {
     let config = ts_rs::Config::default();
     let declarations = [
         CreateMachine::decl(&config),
+        EgressCredential::decl(&config),
         UpdateMachine::decl(&config),
         MachineState::decl(&config),
         MachineInfo::decl(&config),
         CreateSnapshot::decl(&config),
         SnapshotInfo::decl(&config),
+        CreatePreview::decl(&config),
+        PreviewInfo::decl(&config),
         Quotas::decl(&config),
         TenantUsage::decl(&config),
     ];
