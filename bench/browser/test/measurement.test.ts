@@ -8,8 +8,9 @@ import {
 import { renderAxTree } from "../src/ax.ts";
 import { applyDelta, diffLines } from "../src/delta.ts";
 import { observers } from "../src/observers.ts";
-import { armOrder } from "../src/schedule.ts";
-import { reliability, spread } from "../src/summary.ts";
+import { armOrder } from "../../common/schedule.ts";
+import { spread } from "../../common/stats.ts";
+import { reliability } from "../src/summary.ts";
 import { tasks } from "../src/tasks.ts";
 import {
     parseLinuxStat,
