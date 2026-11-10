@@ -10,7 +10,7 @@
   },
   "workspace": {
     "members": {
-      "packages/browser-bench": {
+      "bench/browser": {
         "dependencies": [
           "npm:gpt-tokenizer@4.1.0"
         ]
