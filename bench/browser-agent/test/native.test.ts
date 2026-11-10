@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { Browser } from "../../browser/src/browser.ts";
+import { withDeadline } from "../../browser/src/cdp.ts";
 import {
     pinned_product,
     pinnedExecutable,
@@ -25,18 +26,24 @@ const fixture = `<!doctype html><html><body>
 <button id="delayed">Delayed action</button><output id="events">0</output><output id="picked"></output><div id="literal">A [literal].*</div><p hidden>Invisible message</p>
 <script>
 const delayed = document.querySelector('#delayed');
+function hold(kind) {
+    const path = globalThis.holds?.[kind];
+    if (!path) return;
+    delete globalThis.holds[kind];
+    const request = new XMLHttpRequest();
+    request.open('GET', path, false);
+    request.send();
+}
 delayed.dataset.presses = '0';
 delayed.dataset.clicks = '0';
 delayed.onmousedown = () => {
     delayed.dataset.presses = String(Number(delayed.dataset.presses) + 1);
-    const until = performance.now() + 160;
-    while (performance.now() < until) {}
+    hold('press');
 };
 delayed.onclick = () => delayed.dataset.clicks = String(Number(delayed.dataset.clicks) + 1);
 document.querySelector('#slow').onclick = () => {
     document.querySelector('#slow').dataset.clicked = 'yes';
-    const until = performance.now() + 160;
-    while (performance.now() < until) {}
+    hold('fill');
 };
 const input = document.querySelector('input');
 input.addEventListener('input', () => { document.querySelector('#events').textContent = String(Number(document.querySelector('#events').textContent) + 1); });
@@ -51,6 +58,24 @@ function ref(text: string, pattern: RegExp): string {
     const match = /ref=(\d+\.\d+)/.exec(line);
     assert.ok(match);
     return match[1]!;
+}
+
+function gate() {
+    return {
+        entered: Promise.withResolvers<void>(),
+        released: Promise.withResolvers<void>(),
+    };
+}
+
+async function heldTimeout(
+    action: Promise<void>,
+    held: ReturnType<typeof gate>,
+): Promise<void> {
+    const rejected = assert.rejects(action, /exceeded/);
+    rejected.catch(() => {});
+    await withDeadline("input handler started", 5_000, held.entered.promise);
+    await rejected;
+    held.released.resolve();
 }
 
 async function navigate(
@@ -275,61 +300,105 @@ Deno.test("native driver delivers fresh scoped accessibility and actual UI input
             }, 1000);
         });
         await test.step("a timed out in-flight input cannot dispatch a later click or replay", async () => {
-            const full = await driver.observe({ mode: "full" });
-            const delayed = ref(full.text, /button "Delayed action"/);
-            await assert.rejects(
-                driver.act({ kind: "click", target: { ref: delayed } }, 60),
-                /exceeded/,
-            );
-            const { result } = await browser.page.send<
-                { result: { value: { presses: string; clicks: string } } }
-            >("Runtime.evaluate", {
-                expression:
-                    "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve({...document.querySelector('#delayed').dataset}))))",
-                awaitPromise: true,
-                returnByValue: true,
-            });
-            assert.deepEqual(result.value, { presses: "1", clicks: "0" });
-            await driver.act({ kind: "click", target: { ref: delayed } }, 1000);
-            const completed = await browser.page.send<
-                { result: { value: string } }
-            >("Runtime.evaluate", {
-                expression: "document.querySelector('#delayed').dataset.clicks",
-                returnByValue: true,
-            });
-            assert.equal(completed.result.value, "1");
-            const slow = ref(full.text, /textbox "Slow field"/);
-            await assert.rejects(
-                driver.act({
-                    kind: "fill",
-                    target: { ref: slow },
-                    text: "late",
-                }, 60),
-                /exceeded/,
-            );
-            const selected = await browser.page.send<
-                {
-                    result: {
-                        value: {
-                            clicked: string;
-                            start: number;
-                            end: number;
-                            value: string;
-                        };
-                    };
+            const press = gate();
+            const fill = gate();
+            const server = Deno.serve({
+                hostname: "127.0.0.1",
+                port: 0,
+                onListen() {},
+            }, async (request) => {
+                const path = new URL(request.url).pathname;
+                const held = path === "/press"
+                    ? press
+                    : path === "/fill"
+                    ? fill
+                    : null;
+                if (held) {
+                    held.entered.resolve();
+                    await held.released.promise;
+                    return new Response("released");
                 }
-            >("Runtime.evaluate", {
-                expression:
-                    "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => { const input = document.querySelector('#slow'); resolve({clicked:input.dataset.clicked,start:input.selectionStart,end:input.selectionEnd,value:input.value}); })))",
-                awaitPromise: true,
-                returnByValue: true,
+                return new Response(fixture, {
+                    headers: { "content-type": "text/html" },
+                });
             });
-            assert.equal(selected.result.value.clicked, "yes");
-            assert.equal(selected.result.value.value, "untouched");
-            assert.equal(
-                selected.result.value.start,
-                selected.result.value.end,
-            );
+            try {
+                await browser.page.send("Page.navigate", {
+                    url: `http://127.0.0.1:${server.addr.port}/`,
+                });
+                await driver.wait({ text: "Native fixture" }, 5_000);
+                await browser.page.send("Runtime.evaluate", {
+                    expression:
+                        "new Promise(resolve => { const ready = () => { globalThis.holds={press:'/press',fill:'/fill'}; resolve(); }; if(document.readyState==='complete') ready(); else addEventListener('load',ready,{once:true}); })",
+                    awaitPromise: true,
+                });
+                const full = await driver.observe({ mode: "full" });
+                const delayed = ref(full.text, /button "Delayed action"/);
+                await heldTimeout(
+                    driver.act(
+                        { kind: "click", target: { ref: delayed } },
+                        3_000,
+                    ),
+                    press,
+                );
+                const { result } = await browser.page.send<
+                    { result: { value: { presses: string; clicks: string } } }
+                >("Runtime.evaluate", {
+                    expression:
+                        "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve({...document.querySelector('#delayed').dataset}))))",
+                    awaitPromise: true,
+                    returnByValue: true,
+                });
+                assert.deepEqual(result.value, { presses: "1", clicks: "0" });
+                await driver.act(
+                    { kind: "click", target: { ref: delayed } },
+                    1000,
+                );
+                const completed = await browser.page.send<
+                    { result: { value: string } }
+                >("Runtime.evaluate", {
+                    expression:
+                        "document.querySelector('#delayed').dataset.clicks",
+                    returnByValue: true,
+                });
+                assert.equal(completed.result.value, "1");
+                const slow = ref(full.text, /textbox "Slow field"/);
+                await heldTimeout(
+                    driver.act({
+                        kind: "fill",
+                        target: { ref: slow },
+                        text: "late",
+                    }, 3_000),
+                    fill,
+                );
+                const selected = await browser.page.send<
+                    {
+                        result: {
+                            value: {
+                                clicked: string;
+                                start: number;
+                                end: number;
+                                value: string;
+                            };
+                        };
+                    }
+                >("Runtime.evaluate", {
+                    expression:
+                        "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => { const input = document.querySelector('#slow'); resolve({clicked:input.dataset.clicked,start:input.selectionStart,end:input.selectionEnd,value:input.value}); })))",
+                    awaitPromise: true,
+                    returnByValue: true,
+                });
+                assert.equal(selected.result.value.clicked, "yes");
+                assert.equal(selected.result.value.value, "untouched");
+                assert.equal(
+                    selected.result.value.start,
+                    selected.result.value.end,
+                );
+            } finally {
+                press.released.resolve();
+                fill.released.resolve();
+                await server.shutdown();
+            }
         });
         await test.step("navigation expires issued references", async () => {
             const before = await driver.observe({ mode: "full" });
