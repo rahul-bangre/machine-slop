@@ -282,11 +282,20 @@ export function agentdProvider(
     };
 }
 
+export function machinedApiKey(): string {
+    const key = Deno.env.get("SLOP_API_KEY");
+    if (!key) {
+        throw new Error("set SLOP_API_KEY to an API key machined accepts");
+    }
+    return key;
+}
+
 export function machinedProvider(
     url: string,
+    apiKey: string,
     machine: CreateMachine = { allowed_hosts: [] },
 ): SandboxProvider {
-    const host = new Host(url);
+    const host = new Host(url, { apiKey });
     const open = new OpenSandboxes();
 
     async function destroyEveryMachine(): Promise<void> {

@@ -136,16 +136,17 @@ json_string_field() {
 }
 
 require_machine_runs_a_process() {
-  machine=$(curl -fsS --max-time 60 -X POST "$MACHINED_URL/machines") ||
+  authorization="Authorization: Bearer $(guest sh -c 'cat "$HOME/machine-slop/api-key"')"
+  machine=$(curl -fsS --max-time 60 -H "$authorization" -X POST "$MACHINED_URL/machines") ||
     die "POST $MACHINED_URL/machines failed"
   machine_id=$(echo "$machine" | json_string_field id)
   [ -n "$machine_id" ] || die "unexpected machine: $machine"
   boot_ms=$(echo "$machine" | sed -n 's/.*"boot_ms":\([0-9]*\).*/\1/p')
   machine_url="$MACHINED_URL/machines/$machine_id"
-  process_id=$(curl -fsS -X POST "$machine_url/processes" \
+  process_id=$(curl -fsS -H "$authorization" -X POST "$machine_url/processes" \
     -H 'content-type: application/json' -d '{"program":"/bin/true"}' | json_string_field id)
-  result=$(curl -fsS "$machine_url/processes/$process_id/wait" || true)
-  curl -fsS -X DELETE "$machine_url" || die "DELETE $machine_url failed"
+  result=$(curl -fsS -H "$authorization" "$machine_url/processes/$process_id/wait" || true)
+  curl -fsS -H "$authorization" -X DELETE "$machine_url" || die "DELETE $machine_url failed"
   case $result in
     *'"code":0'*) ;;
     *) die "/bin/true in machine $machine_id did not exit 0: $result" ;;
@@ -171,8 +172,8 @@ case ${1:-} in
   smoke) smoke ;;
   test)
     [ "$(instance_status)" = Running ] || die "$NAME is not running; run 'make vm-start'"
-    limactl shell --workdir /workspace "$NAME" sg kvm -c \
-      'SLOP_IMAGE_DIR="$HOME/machine-slop/image" cargo test --locked -p machined -- --ignored'
+    limactl shell --workdir /workspace "$NAME" sh -c \
+      'SLOP_IMAGE_DIR="$HOME/machine-slop/image" cargo test --locked -p machined --config "target.\"cfg(all())\".runner = [\"sudo\", \"--preserve-env=SLOP_IMAGE_DIR\"]" -- --ignored'
     ;;
   shell) exec limactl shell --workdir /workspace "$NAME" ;;
   delete) [ -z "$(instance_status)" ] || limactl delete --force "$NAME" ;;

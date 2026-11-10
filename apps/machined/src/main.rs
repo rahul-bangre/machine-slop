@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 
 const MAX_RUNNING_VMS: usize = 16;
 const DEFAULT_SPARE_MACHINES: usize = 2;
+const DEFAULT_FIRST_JAIL_UID: u32 = 1_000_000_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,28 +17,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
     let mut args = std::env::args().skip(1);
-    let (Some(address), Some(image_dir), Some(state_dir), None) =
-        (args.next(), args.next(), args.next(), args.next())
-    else {
-        return Err("usage: machined <listen address> <image dir> <state dir>".into());
+    let (Some(address), Some(image_dir), Some(state_dir), Some(tenants_file), None) = (
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+    ) else {
+        return Err(
+            "usage: machined <listen address> <image dir> <state dir> <tenants file>".into(),
+        );
     };
+    let (tenants, keys) = machined::parse_tenants(&std::fs::read_to_string(&tenants_file)?)?;
     let default_budget = default_memory_budget_mib()?;
     let limits = Limits {
         running_vms: MAX_RUNNING_VMS,
         memory_mib: env_number("SLOP_MEMORY_MIB")?
             .map_or(default_budget, |budget: u32| budget.min(default_budget)),
         spare_machines: env_number("SLOP_SPARE_MACHINES")?.unwrap_or(DEFAULT_SPARE_MACHINES),
+        first_jail_uid: env_number("SLOP_FIRST_JAIL_UID")?.unwrap_or(DEFAULT_FIRST_JAIL_UID),
     };
     tracing::info!(
         running_vms = limits.running_vms,
         memory_mib = limits.memory_mib,
         spare_machines = limits.spare_machines,
+        first_jail_uid = limits.first_jail_uid,
         "admission limits"
     );
-    let machines =
-        Machines::open(PathBuf::from(image_dir), PathBuf::from(state_dir), limits).await?;
+    tracing::info!(tenants = tenants.len(), "tenants configured");
+    let machines = Machines::open(
+        PathBuf::from(image_dir),
+        PathBuf::from(state_dir),
+        limits,
+        tenants,
+    )
+    .await?;
     let listener = TcpListener::bind(&address).await?;
-    let app = machined::app(machines.clone());
+    let app = machined::app(Arc::new(machined::Host {
+        machines: machines.clone(),
+        keys,
+    }));
 
     tracing::info!(address = %format!("http://{}", listener.local_addr()?), "machined listening");
     axum::serve(listener, app)

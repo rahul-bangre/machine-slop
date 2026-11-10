@@ -12,7 +12,7 @@ export DAYTONA_API_KEY=...
 deno task env build daytona
 deno task env smoke daytona
 
-deno task env smoke machined --machined-url=http://127.0.0.1:4001
+SLOP_API_KEY=... deno task env smoke machined --machined-url=http://127.0.0.1:4001
 ```
 
 ## Pins

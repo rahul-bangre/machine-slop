@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-#[derive(Debug, Default, Deserialize, TS)]
+#[derive(Debug, Default, Deserialize, Serialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct CreateMachine {
     #[serde(default)]
@@ -68,4 +68,40 @@ pub struct SnapshotInfo {
     pub allowed_hosts: Vec<String>,
     #[ts(type = "number")]
     pub created_unix_ms: u64,
+    #[ts(type = "number")]
+    pub stored_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct Quotas {
+    pub running_machines: u32,
+    pub memory_mib: u32,
+    pub disk_gib: u32,
+    pub creates_per_second: u32,
+}
+
+impl Quotas {
+    pub fn none() -> Self {
+        Self {
+            running_machines: 0,
+            memory_mib: 0,
+            disk_gib: 0,
+            creates_per_second: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct TenantUsage {
+    pub tenant: String,
+    pub quotas: Quotas,
+    #[ts(type = "number")]
+    pub vcpu_ms: u64,
+    #[ts(type = "number")]
+    pub memory_mib_ms: u64,
+    #[ts(type = "number")]
+    pub snapshot_mib_ms: u64,
+    #[ts(type = "number")]
+    pub as_of_unix_ms: u64,
 }

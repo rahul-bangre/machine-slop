@@ -35,6 +35,20 @@ const finished = {
 
 const paused_info = { ...machine_info, state: { state: "paused" } };
 
+const usage = {
+    tenant: "acme",
+    quotas: {
+        running_machines: 4,
+        memory_mib: 4096,
+        disk_gib: 100,
+        creates_per_second: 2,
+    },
+    vcpu_ms: 2000,
+    memory_mib_ms: 512000,
+    snapshot_mib_ms: 0,
+    as_of_unix_ms: 1794294079990,
+};
+
 const routes: Record<string, () => Response> = {
     "POST /base/machines": () => Response.json(machine_info, { status: 201 }),
     "POST /base/machines/m1/pause": () => Response.json(paused_info),
@@ -55,26 +69,39 @@ const routes: Record<string, () => Response> = {
     "PATCH /base/machines/m1": () =>
         Response.json({ ...machine_info, allowed_hosts: ["pypi.org"] }),
     "DELETE /base/machines/m1": () => new Response(null, { status: 204 }),
+    "GET /base/usage": () => Response.json(usage),
 };
 
 Deno.test("a hosted machine addresses its agent under the host's machine path", async () => {
     const seen: string[] = [];
+    const authorized: string[] = [];
     const server = Deno.serve(
         { hostname: "127.0.0.1", port: 0, onListen() {} },
         async (request) => {
             const url = new URL(request.url);
             const route = `${request.method} ${url.pathname}${url.search}`;
-            seen.push(`${route} ${await request.text()}`.trimEnd());
+            const key = request.headers.get("idempotency-key");
+            seen.push(
+                [route, await request.text(), key ? `key=${key}` : ""]
+                    .filter((part) => part !== "").join(" "),
+            );
+            authorized.push(request.headers.get("authorization") ?? "");
             return routes[route]?.() ??
                 new Response("unexpected", { status: 404 });
         },
     );
     try {
-        const host = new Host(`http://127.0.0.1:${server.addr.port}/base`);
-        const { machine, info } = await host.createMachine({
-            vcpus: 1,
-            memory_mib: 256,
+        const host = new Host(`http://127.0.0.1:${server.addr.port}/base`, {
+            apiKey: "secret",
         });
+        const { machine, info } = await host.createMachine(
+            {
+                vcpus: 1,
+                memory_mib: 256,
+            },
+            undefined,
+            "create-1",
+        );
         assert.deepEqual(info, machine_info);
         const process = await machine.startProcess({ program: "/bin/true" });
         assert.deepEqual(await Array.fromAsync(process.events(3)), [finished]);
@@ -84,9 +111,12 @@ Deno.test("a hosted machine addresses its agent under the host's machine path", 
             ["pypi.org"],
         );
         assert.deepEqual(await machine.pause(), paused_info);
-        assert.deepEqual(await machine.snapshot(), snapshot_info);
+        assert.deepEqual(
+            await machine.snapshot(undefined, "snapshot-1"),
+            snapshot_info,
+        );
         assert.deepEqual(await machine.resume(), machine_info);
-        const fork = await machine.fork();
+        const fork = await machine.fork(undefined, "fork-1");
         assert.equal(fork.machine.id, "m2");
         assert.equal(fork.info.id, "m2");
         assert.deepEqual(await host.snapshots(), [snapshot_info]);
@@ -95,23 +125,59 @@ Deno.test("a hosted machine addresses its agent under the host's machine path", 
         assert.equal(restored.machine.id, "m1");
         await host.deleteSnapshot("s1");
         await machine.destroy();
+        assert.deepEqual(await host.usage(), usage);
         assert.deepEqual(seen, [
-            'POST /base/machines {"vcpus":1,"memory_mib":256}',
+            'POST /base/machines {"vcpus":1,"memory_mib":256} key=create-1',
             'POST /base/machines/m1/processes {"program":"/bin/true"}',
             "GET /base/machines/m1/processes/p1/events?cursor=3",
             "GET /base/machines/m1",
             'PATCH /base/machines/m1 {"allowed_hosts":["pypi.org"]}',
             "POST /base/machines/m1/pause",
-            'POST /base/snapshots {"machine_id":"m1"}',
+            'POST /base/snapshots {"machine_id":"m1"} key=snapshot-1',
             "POST /base/machines/m1/resume",
-            "POST /base/machines/m1/fork",
+            "POST /base/machines/m1/fork key=fork-1",
             "GET /base/snapshots",
             "GET /base/snapshots/s1",
             'POST /base/machines {"snapshot_id":"s1"}',
             "DELETE /base/snapshots/s1",
             "DELETE /base/machines/m1",
+            "GET /base/usage",
         ]);
+        assert.ok(authorized.every((header) => header === "Bearer secret"));
     } finally {
         await server.shutdown();
+    }
+});
+
+Deno.test("a hosted machine's port tunnel carries the host's API key", async () => {
+    const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+    const accepted = (async () => {
+        const conn = await listener.accept();
+        const buffer = new Uint8Array(4096);
+        let head = "";
+        while (!head.includes("\r\n\r\n")) {
+            const read = await conn.read(buffer);
+            if (read === null) break;
+            head += new TextDecoder().decode(buffer.subarray(0, read));
+        }
+        await conn.write(
+            new TextEncoder().encode(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n",
+            ),
+        );
+        conn.close();
+        return head;
+    })();
+    try {
+        const host = new Host(`http://127.0.0.1:${listener.addr.port}`, {
+            apiKey: "secret",
+        });
+        const tunnel = await host.machine("m1").connect(8080);
+        tunnel.close();
+        const head = await accepted;
+        assert.match(head, /^GET \/machines\/m1\/ports\/8080 HTTP\/1.1\r\n/);
+        assert.match(head, /\r\nauthorization: Bearer secret\r\n/);
+    } finally {
+        listener.close();
     }
 });

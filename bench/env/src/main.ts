@@ -4,6 +4,7 @@ import { writeArtifact } from "./artifacts.ts";
 import { daytonaProvider } from "./daytona.ts";
 import { e2bProvider } from "./e2b.ts";
 import { browserEnvironment, type Environment } from "./environment.ts";
+import { machinedApiKey } from "../../agent/src/agentd-sandbox.ts";
 import { machinedSandboxes } from "./machined.ts";
 import {
     type ImageBuilder,
@@ -70,7 +71,11 @@ async function smokeTarget(
     if (name === "machined") {
         return {
             sandboxes: await ready(() =>
-                machinedSandboxes(flags["machined-url"], environment.resources)
+                machinedSandboxes(
+                    flags["machined-url"],
+                    machinedApiKey(),
+                    environment.resources,
+                )
             ),
             image: null,
         };

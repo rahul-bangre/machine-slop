@@ -28,7 +28,8 @@ make vm-stop
 ```
 
 The VM forwards its `agentd` to `127.0.0.1:3001` and `machined` to
-`127.0.0.1:4001`.
+`127.0.0.1:4001`. `machined` runs each machine as a jailed Firecracker microVM
+owned by a tenant; the VM's API key is in `~/machine-slop/api-key` inside it.
 
 ## Documentation
 

@@ -1,11 +1,16 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{os::unix::fs::MetadataExt, path::PathBuf, process::Stdio, time::Duration};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     process::{Child, Command},
 };
+
+const API_KEY: &str = "test-key";
+const OTHER_API_KEY: &str = "other-key";
+const AUTHORIZED: &str = "Host: machined\r\nAuthorization: Bearer test-key\r\n";
 
 struct Host {
     child: Child,
@@ -56,18 +61,40 @@ impl Host {
     }
 
     async fn send(&self, method: &str, path: &str, body: &str) -> (u16, Value) {
+        self.send_with(AUTHORIZED, method, path, body).await
+    }
+
+    async fn request_as(
+        &self,
+        headers: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let body = body.map(|body| body.to_string()).unwrap_or_default();
+        self.send_with(&format!("Host: machined\r\n{headers}"), method, path, &body)
+            .await
+    }
+
+    async fn send_with(&self, headers: &str, method: &str, path: &str, body: &str) -> (u16, Value) {
         tokio::time::timeout(
             Duration::from_secs(60),
-            self.send_unbounded(method, path, body),
+            self.send_unbounded(headers, method, path, body),
         )
         .await
         .expect("request completes within 60 seconds")
     }
 
-    async fn send_unbounded(&self, method: &str, path: &str, body: &str) -> (u16, Value) {
+    async fn send_unbounded(
+        &self,
+        headers: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (u16, Value) {
         let mut stream = TcpStream::connect(&self.address).await.expect("connect");
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: machined\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\n{headers}Connection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).await.expect("write");
@@ -261,7 +288,7 @@ impl Host {
             stream
                 .write_all(
                     format!(
-                        "GET /machines/{machine}/ports/{port} HTTP/1.1\r\nHost: machined\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+                        "GET /machines/{machine}/ports/{port} HTTP/1.1\r\n{AUTHORIZED}Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
                     )
                     .as_bytes(),
                 )
@@ -277,25 +304,48 @@ impl Host {
         .expect("tunnel upgrade completes within 10 seconds")
     }
 
+    fn cgroup(&self) -> PathBuf {
+        let state = std::fs::metadata(&self.state_dir).expect("state dir");
+        PathBuf::from(format!(
+            "/sys/fs/cgroup/machine-slop-{}-{}",
+            state.dev(),
+            state.ino()
+        ))
+    }
+
+    fn jail_of(&self, machine: &str) -> String {
+        let scratch = std::fs::metadata(self.machine_dir(machine).join("scratch.ext4"))
+            .expect("scratch disk")
+            .ino();
+        std::fs::read_dir(self.state_dir.join("jails/firecracker"))
+            .expect("jails")
+            .filter_map(Result::ok)
+            .find(|jail| {
+                std::fs::metadata(jail.path().join("root/scratch.ext4"))
+                    .is_ok_and(|disk| disk.ino() == scratch)
+            })
+            .expect("the machine has a jail")
+            .file_name()
+            .into_string()
+            .expect("jail id")
+    }
+
     fn firecracker_pid(&self, machine: &str) -> String {
-        let pids = self.vms_in(&self.machine_dir(machine));
+        let pids = vm_pids(&self.cgroup().join(self.jail_of(machine)));
         assert_eq!(pids.len(), 1, "machine {machine} has one VM");
         pids[0].clone()
     }
 
-    fn vms_in(&self, dir: &std::path::Path) -> Vec<String> {
-        std::fs::read_dir("/proc")
-            .expect("read /proc")
-            .filter_map(Result::ok)
-            .filter(|process| {
-                std::fs::read_link(process.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(dir))
-            })
-            .map(|process| process.file_name().to_string_lossy().into_owned())
-            .collect()
-    }
-
     fn all_vms(&self) -> usize {
-        self.vms_in(&self.state_dir.join("machines")).len()
+        std::fs::read_dir(self.cgroup())
+            .map(|jails| {
+                jails
+                    .filter_map(Result::ok)
+                    .filter(|jail| jail.path().is_dir())
+                    .map(|jail| vm_pids(&jail.path()).len())
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     async fn finish(mut self) {
@@ -321,13 +371,26 @@ impl Drop for Host {
             std::thread::sleep(Duration::from_millis(20));
         }
         let _ = self.child.start_kill();
-        for vm in self.vms_in(&self.state_dir) {
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", &vm])
-                .status();
+        if let Ok(jails) = std::fs::read_dir(self.cgroup()) {
+            for jail in jails.filter_map(Result::ok) {
+                let _ = std::fs::write(jail.path().join("cgroup.kill"), "1");
+            }
         }
         let _ = std::fs::remove_dir_all(&self.state_dir);
     }
+}
+
+fn vm_pids(cgroup: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(cgroup.join("cgroup.procs"))
+        .map(|pids| pids.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+fn digest(key: &str) -> String {
+    Sha256::digest(key.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 async fn spawn_machined(
@@ -336,10 +399,24 @@ async fn spawn_machined(
 ) -> (Child, String) {
     let image_dir = std::env::var("SLOP_IMAGE_DIR")
         .expect("SLOP_IMAGE_DIR names a directory built by vm/image/build.sh");
+    let quotas = json!({
+        "running_machines": 16,
+        "memory_mib": 1 << 20,
+        "disk_gib": 1 << 20,
+        "creates_per_second": 1000,
+    });
+    let tenants = json!({ "tenants": [
+        { "id": "tenant", "api_key_sha256": [digest(API_KEY)], "quotas": quotas },
+        { "id": "other", "api_key_sha256": [digest(OTHER_API_KEY)], "quotas": quotas },
+    ]});
+    std::fs::create_dir_all(state_dir).expect("create state dir");
+    let tenants_file = state_dir.join("tenants.json");
+    std::fs::write(&tenants_file, tenants.to_string()).expect("write tenants file");
     let mut child = Command::new(env!("CARGO_BIN_EXE_machined"))
         .arg("127.0.0.1:0")
         .arg(image_dir)
         .arg(state_dir)
+        .arg(tenants_file)
         .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -483,7 +560,9 @@ async fn a_create_abandoned_by_its_client_still_produces_a_listed_machine() {
     let host = Host::start("abandoned").await;
     let mut stream = TcpStream::connect(&host.address).await.expect("connect");
     stream
-        .write_all(b"POST /machines HTTP/1.1\r\nHost: machined\r\nContent-Length: 0\r\n\r\n")
+        .write_all(
+            format!("POST /machines HTTP/1.1\r\n{AUTHORIZED}Content-Length: 0\r\n\r\n").as_bytes(),
+        )
         .await
         .expect("write");
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -909,7 +988,7 @@ async fn an_open_agent_request_keeps_a_machine_from_expiring() {
     events
         .write_all(
             format!(
-                "GET /machines/{machine}/processes/{process}/events HTTP/1.1\r\nHost: machined\r\n\r\n"
+                "GET /machines/{machine}/processes/{process}/events HTTP/1.1\r\n{AUTHORIZED}\r\n"
             )
             .as_bytes(),
         )
@@ -1131,7 +1210,7 @@ async fn files_and_ports_reach_the_machine_through_the_host() {
     let put = host
         .exchange(
             &format!(
-                "PUT /machines/{machine}/files/workspace/site/data.bin HTTP/1.1\r\nHost: machined\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                "PUT /machines/{machine}/files/workspace/site/data.bin HTTP/1.1\r\n{AUTHORIZED}Connection: close\r\nContent-Length: {}\r\n\r\n",
                 content.len()
             ),
             &content,
@@ -1145,7 +1224,7 @@ async fn files_and_ports_reach_the_machine_through_the_host() {
     let get = host
         .exchange(
             &format!(
-                "GET /machines/{machine}/files/workspace/site/data.bin HTTP/1.1\r\nHost: machined\r\nConnection: close\r\n\r\n"
+                "GET /machines/{machine}/files/workspace/site/data.bin HTTP/1.1\r\n{AUTHORIZED}Connection: close\r\n\r\n"
             ),
             &[],
         )
@@ -1357,5 +1436,113 @@ async fn chromium_reaches_https_sites_through_the_allowlist_without_flags() {
         .request("DELETE", &format!("/machines/{machine}"), None)
         .await;
     assert_eq!(status, 204);
+    host.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn a_machine_runs_jailed_and_only_its_tenant_reaches_it() {
+    let host = Host::start("tenancy").await;
+    let other = format!("Authorization: Bearer {OTHER_API_KEY}\r\n");
+    for headers in [
+        "",
+        "Authorization: Bearer wrong\r\n",
+        "Authorization: test-key\r\n",
+    ] {
+        let (status, _) = host.request_as(headers, "GET", "/machines", None).await;
+        assert_eq!(status, 401, "{headers:?}");
+    }
+
+    let keyed = format!("Authorization: Bearer {API_KEY}\r\nIdempotency-Key: create-1\r\n");
+    let (status, created) = host
+        .request_as(
+            &keyed,
+            "POST",
+            "/machines",
+            Some(json!({ "allowed_hosts": [] })),
+        )
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let machine = created["id"].as_str().expect("machine id").to_owned();
+    let (status, replayed) = host
+        .request_as(
+            &keyed,
+            "POST",
+            "/machines",
+            Some(json!({ "allowed_hosts": [] })),
+        )
+        .await;
+    assert_eq!((status, &replayed["id"]), (201, &created["id"]));
+    let (status, _) = host
+        .request_as(&keyed, "POST", "/machines", Some(json!({ "vcpus": 1 })))
+        .await;
+    assert_eq!(status, 422, "a key names one request");
+    let (_, listed) = host.request("GET", "/machines", None).await;
+    assert_eq!(listed.as_array().map(Vec::len), Some(1));
+
+    for (method, path) in [
+        ("GET", format!("/machines/{machine}")),
+        ("POST", format!("/machines/{machine}/pause")),
+        ("POST", format!("/machines/{machine}/fork")),
+        ("GET", format!("/machines/{machine}/health")),
+        ("DELETE", format!("/machines/{machine}")),
+    ] {
+        let (status, _) = host.request_as(&other, method, &path, None).await;
+        assert_eq!(status, 404, "{method} {path} as another tenant");
+    }
+    let (_, others) = host.request_as(&other, "GET", "/machines", None).await;
+    assert_eq!(others, json!([]));
+
+    let pid = host.firecracker_pid(&machine);
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("status");
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(|value| {
+                value
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .expect("status field")
+    };
+    let uid: u32 = field("Uid:").parse().expect("uid");
+    assert!(
+        uid >= 1_000_000_000,
+        "the VM runs as its own user, not {uid}"
+    );
+    assert_eq!(
+        field("Seccomp:"),
+        "2",
+        "Firecracker's seccomp filters are on"
+    );
+    assert_eq!(
+        std::fs::read_link(format!("/proc/{pid}/root")).expect("root"),
+        PathBuf::from("/"),
+        "the VM sees only its jail"
+    );
+    let cgroup = host.cgroup().join(uid.to_string());
+    let limit = |file: &str| std::fs::read_to_string(cgroup.join(file)).expect(file);
+    assert_eq!(
+        limit("memory.max").trim(),
+        ((512u64 + 64) << 20).to_string()
+    );
+    assert_eq!(limit("cpu.max").trim(), "200000 100000");
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let (status, usage) = host.request("GET", "/usage", None).await;
+    assert_eq!(status, 200, "{usage}");
+    assert_eq!(usage["tenant"], json!("tenant"));
+    assert!(
+        usage["vcpu_ms"].as_u64().is_some_and(|ms| ms > 0),
+        "{usage}"
+    );
+    let (_, other_usage) = host.request_as(&other, "GET", "/usage", None).await;
+    assert_eq!(other_usage["vcpu_ms"], json!(0));
+
+    host.delete(&format!("/machines/{machine}")).await;
+    assert!(!running(&pid));
     host.finish().await;
 }
