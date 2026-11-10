@@ -1,6 +1,9 @@
 # Machine Slop
 
-A computer for agents.
+A computer for agents. `agentd` runs processes, moves files and reaches ports on
+a machine over HTTP; `machined` boots Firecracker microVMs that each run
+`agentd`. A TypeScript SDK drives both, and benchmarks compare them with hosted
+sandboxes.
 
 Requires rustup, Deno (version in `.tool-versions`), and Make.
 
@@ -11,11 +14,11 @@ make test
 make dev
 ```
 
-`agentd` listens on `127.0.0.1:3000`; see [apps/agentd](apps/agentd/README.md)
-for files, archives and ports.
+`make dev` starts `agentd` on `127.0.0.1:3000`.
 
-For Linux development on macOS, install [Lima](https://lima-vm.io) 1.1+. The VM
-needs an Apple M3 or later for nested virtualization.
+`machined` needs Linux with `/dev/kvm`. On macOS, install
+[Lima](https://lima-vm.io) 1.1+ and use the VM, which needs an Apple M3 or later
+for nested virtualization:
 
 ```sh
 make vm-start vm-smoke
@@ -24,6 +27,17 @@ make vm-shell
 make vm-stop
 ```
 
-In the VM, `agentd` is forwarded to `127.0.0.1:3001` and `machined` to
-`127.0.0.1:4001`. `machined` boots each machine as a Firecracker microVM; see
-[crates/machines](crates/machines/README.md).
+The VM forwards its `agentd` to `127.0.0.1:3001` and `machined` to
+`127.0.0.1:4001`.
+
+## Documentation
+
+- [apps/agentd](apps/agentd/README.md): files, archives and ports
+- [crates/process](crates/process/README.md): process execution
+- [crates/machines](crates/machines/README.md): machines and egress
+- [bench/agent](bench/agent/README.md): coding agent across sandboxes
+- [bench/browser](bench/browser/README.md): browser and observation cost
+- [bench/browser-agent](bench/browser-agent/README.md): browser runtimes for a
+  model-driven agent
+- [bench/env](bench/env/README.md): pinned browser environments for E2B and
+  Daytona
