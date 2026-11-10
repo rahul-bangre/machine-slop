@@ -150,6 +150,7 @@ await Deno.writeTextFile(
         null,
         2,
     ),
+    { createNew: true },
 );
 
 const reclaim = async () => {
