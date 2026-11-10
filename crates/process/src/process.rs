@@ -158,7 +158,7 @@ struct StdinWrite {
 
 impl StdinWrite {
     fn end(&self) -> u64 {
-        self.offset + self.data.len() as u64
+        self.offset.saturating_add(self.data.len() as u64)
     }
 
     fn admit(self, open: bool, offset: u64) -> Option<Self> {

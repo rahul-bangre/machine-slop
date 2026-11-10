@@ -197,6 +197,10 @@ async fn stdin_writes_are_ordered_by_offset_and_retries_write_once() {
         write(10, "x", false).await,
         Err(ProcessError::StdinOffsetAhead { offset: 3 })
     ));
+    assert!(matches!(
+        write(u64::MAX, "x", false).await,
+        Err(ProcessError::StdinOffsetAhead { offset: 3 })
+    ));
     let info = process.info();
     assert_eq!((info.stdin_offset, info.stdin_open), (3, true));
     write(3, "", true).await.unwrap();
@@ -213,6 +217,10 @@ async fn stdin_writes_are_ordered_by_offset_and_retries_write_once() {
     write(1, "bc", false).await.unwrap();
     assert!(matches!(
         write(3, "d", false).await,
+        Err(ProcessError::StdinClosed { offset: 3 })
+    ));
+    assert!(matches!(
+        write(u64::MAX, "x", false).await,
         Err(ProcessError::StdinClosed { offset: 3 })
     ));
     let info = process.info();
