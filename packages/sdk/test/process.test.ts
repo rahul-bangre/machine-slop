@@ -242,6 +242,21 @@ Deno.test("invalid starts, oversized bodies, and unknown process IDs are explici
                 command: { program: "/bin/true", stdin: "x".repeat(65536) },
                 status: 413,
             },
+            {
+                command: {
+                    program: "/bin/true",
+                    terminal: { rows: 0, cols: 80 },
+                },
+                status: 422,
+            },
+            {
+                command: {
+                    program: "/bin/true",
+                    terminal: { rows: 24, cols: 80 },
+                    keep_stdin_open: false,
+                },
+                status: 422,
+            },
         ];
         for (const test_case of cases) {
             await assert.rejects(

@@ -46,23 +46,31 @@ file, and an upload that fails or is cut off leaves the previous file and no
 staging file. Repeating an upload is safe. `?mode=755` sets permission bits;
 without it a replaced file keeps its bits and a new file gets `644`. The file is
 visible to later requests and processes on the machine; it is not synced to
-disk.
+disk. A symlink at the path is written through to its target. Replacing a file
+gives the path a new inode: a hard link to the old file keeps the old contents,
+and owner and extended attributes are not carried over.
 
 `DELETE` returns 204 once nothing is at the path, including when nothing was
 there. It removes a symlink, not its target.
 
-`GET /archives` writes entries relative to the directory, archives symlinks as
-symlinks, and stores modes and modification times. An error while reading the
-directory aborts the response, so the client sees a failed transfer rather than
-a short archive. `PUT /archives` creates the directory and merges the archive
-into it, overwriting files at the same paths. An entry that would land outside
-the directory, through `..` or a symlink, stops extraction with HTTP 422.
-Extraction is not atomic: after a failure, entries before the failure remain;
-repeating the same archive is safe. `tar(files)` in the SDK builds an archive
-from a map of relative paths to contents, so many files take one request.
+`GET /archives` walks the directory in name order and writes regular files,
+directories and symlinks (as symlinks) relative to it, with modes and
+modification times; sockets, pipes and devices are skipped, as is anything
+removed during the walk. Each file entry holds exactly the length the file had
+when it was opened, so a file that grows during the walk contributes that
+prefix. A file that shrinks, or any other error, aborts the response without an
+end-of-archive marker, so the client sees a failed transfer rather than a short
+or misaligned archive. `PUT /archives` creates the directory and merges the
+archive into it, overwriting files at the same paths. An entry that would land
+outside the directory, through `..` or a symlink, stops extraction with
+HTTP 422. Extraction is not atomic: after a failure, entries before the failure
+remain; repeating the same archive is safe. `tar(files)` in the SDK builds an
+archive from a map of relative paths to contents, so many files take one
+request.
 
 Errors map from the file system: missing path 404, permission 403, wrong kind of
-entry 409 (for example reading a directory as a file), full disk 507.
+entry 409 (for example reading a directory or a named pipe as a file, which
+never waits for a writer), full disk 507.
 
 ## Ports
 

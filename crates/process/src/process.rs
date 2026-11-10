@@ -67,10 +67,7 @@ impl Processes {
                     "a terminal's input stays open; omit keep_stdin_open or set it to true".into(),
                 ));
             }
-            (Some(size), _) => {
-                require_visible_size(size)?;
-                false
-            }
+            (Some(_), _) => false,
             (None, keep_open) => !keep_open.unwrap_or(false),
         };
         let mut registry = self.registry.lock().expect("process registry poisoned");
@@ -305,7 +302,6 @@ impl Process {
     }
 
     pub fn resize_terminal(&self, size: TerminalSize) -> Result<(), ProcessError> {
-        require_visible_size(size)?;
         let mut log = self.log.lock().expect("process log poisoned");
         let terminal = log.terminal.as_mut().ok_or(ProcessError::NotATerminal)?;
         let control = terminal.control.as_ref().ok_or(ProcessError::Finished)?;
@@ -618,21 +614,12 @@ impl AsyncRead for TerminalOutput {
     }
 }
 
-fn require_visible_size(size: TerminalSize) -> Result<(), ProcessError> {
-    if size.rows == 0 || size.cols == 0 {
-        return Err(ProcessError::Invalid(
-            "terminal rows and cols must be at least 1".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn set_terminal_size(control: &OwnedFd, size: TerminalSize) -> io::Result<()> {
     rustix::termios::tcsetwinsize(
         control,
         rustix::termios::Winsize {
-            ws_row: size.rows,
-            ws_col: size.cols,
+            ws_row: size.rows.get(),
+            ws_col: size.cols.get(),
             ws_xpixel: 0,
             ws_ypixel: 0,
         },

@@ -1,4 +1,4 @@
-use std::{path::Path, time::Duration};
+use std::{num::NonZeroU16, path::Path, time::Duration};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Bytes;
@@ -247,9 +247,16 @@ async fn input_the_program_never_reads_is_reported_incomplete() {
     ));
 }
 
+fn size(rows: u16, cols: u16) -> TerminalSize {
+    TerminalSize {
+        rows: NonZeroU16::new(rows).unwrap(),
+        cols: NonZeroU16::new(cols).unwrap(),
+    }
+}
+
 fn in_terminal(script: &str, rows: u16, cols: u16) -> StartProcess {
     StartProcess {
-        terminal: Some(TerminalSize { rows, cols }),
+        terminal: Some(size(rows, cols)),
         ..command("/bin/sh", &["-c", script])
     }
 }
@@ -281,19 +288,8 @@ async fn a_terminal_process_owns_a_sized_controlling_terminal() {
         ))
         .unwrap();
     stdout_until(&process, "24 80").await;
-    process
-        .resize_terminal(TerminalSize {
-            rows: 40,
-            cols: 120,
-        })
-        .unwrap();
-    assert_eq!(
-        process.info().terminal,
-        Some(TerminalSize {
-            rows: 40,
-            cols: 120
-        })
-    );
+    process.resize_terminal(size(40, 120)).unwrap();
+    assert_eq!(process.info().terminal, Some(size(40, 120)));
     process
         .write_stdin(0, Bytes::from_static(b"typed\n"), false)
         .await
@@ -316,34 +312,25 @@ async fn a_terminal_process_owns_a_sized_controlling_terminal() {
     let (pid, session) = leader.trim().split_once(' ').unwrap();
     assert_eq!(pid, session, "the program leads its own session");
     assert!(matches!(
-        process.resize_terminal(TerminalSize { rows: 1, cols: 1 }),
+        process.resize_terminal(size(1, 1)),
         Err(ProcessError::Finished)
     ));
 }
 
 #[tokio::test]
-async fn terminal_input_stays_open_and_sizes_are_validated() {
+async fn terminal_input_stays_open() {
     let processes = Processes::default();
-    for request in [
-        StartProcess {
+    assert!(matches!(
+        processes.start(StartProcess {
             keep_stdin_open: Some(false),
             ..in_terminal("true", 24, 80)
-        },
-        in_terminal("true", 0, 80),
-    ] {
-        assert!(matches!(
-            processes.start(request),
-            Err(ProcessError::Invalid(_))
-        ));
-    }
+        }),
+        Err(ProcessError::Invalid(_))
+    ));
     let process = processes.start(in_terminal("cat", 24, 80)).unwrap();
     assert!(matches!(
         process.write_stdin(0, Bytes::from_static(b"x"), true).await,
         Err(ProcessError::TerminalInputStaysOpen)
-    ));
-    assert!(matches!(
-        process.resize_terminal(TerminalSize { rows: 0, cols: 1 }),
-        Err(ProcessError::Invalid(_))
     ));
     assert!(process.info().stdin_open);
     process.kill();
@@ -356,7 +343,7 @@ async fn terminal_input_stays_open_and_sizes_are_validated() {
     ));
     let piped = processes.start(sleep_request()).unwrap();
     assert!(matches!(
-        piped.resize_terminal(TerminalSize { rows: 24, cols: 80 }),
+        piped.resize_terminal(size(24, 80)),
         Err(ProcessError::NotATerminal)
     ));
     piped.kill();

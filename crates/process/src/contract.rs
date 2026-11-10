@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroU16};
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -30,8 +30,10 @@ pub struct StartProcess {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct TerminalSize {
-    pub rows: u16,
-    pub cols: u16,
+    #[ts(type = "number")]
+    pub rows: NonZeroU16,
+    #[ts(type = "number")]
+    pub cols: NonZeroU16,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]

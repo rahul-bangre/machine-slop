@@ -1,6 +1,7 @@
 use std::{
-    io::{self, Write},
-    os::unix::fs::PermissionsExt,
+    fs::Metadata,
+    io::{self, Read, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
 };
 
@@ -23,10 +24,15 @@ use tokio_util::io::{ReaderStream, StreamReader, SyncIoBridge};
 const NEW_FILE_MODE: u32 = 0o644;
 const ARCHIVE_CHUNK_BYTES: usize = 64 * 1024;
 const ARCHIVE_CHUNKS_IN_FLIGHT: usize = 4;
+const NONBLOCKING_OPEN: i32 = rustix::fs::OFlags::NONBLOCK.bits() as i32;
 
 pub async fn read(UrlPath(path): UrlPath<String>) -> Result<Response, ApiError> {
     let path = machine_path(&path)?;
-    let file = tokio::fs::File::open(&path).await?;
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(NONBLOCKING_OPEN)
+        .open(&path)
+        .await?;
     let metadata = file.metadata().await?;
     if !metadata.is_file() {
         return Err(not_a_regular_file(&path));
@@ -53,10 +59,15 @@ pub async fn write(
     Query(options): Query<WriteOptions>,
     body: Body,
 ) -> Result<StatusCode, ApiError> {
-    let path = machine_path(&path)?;
+    let requested = machine_path(&path)?;
     let explicit_mode = options.mode.as_deref().map(parse_mode).transpose()?;
+    tokio::fs::create_dir_all(requested.parent().expect("a machine path has a parent")).await?;
+    let path = match tokio::fs::canonicalize(&requested).await {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => requested,
+        Err(error) => return Err(error.into()),
+    };
     let parent = path.parent().expect("a machine path has a parent");
-    tokio::fs::create_dir_all(parent).await?;
     let mode = match explicit_mode {
         Some(mode) => mode,
         None => match tokio::fs::metadata(&path).await {
@@ -105,13 +116,16 @@ pub async fn read_archive(UrlPath(path): UrlPath<String>) -> Result<Response, Ap
     }
     let (chunks, mut received) = mpsc::channel(ARCHIVE_CHUNKS_IN_FLIGHT);
     tokio::task::spawn_blocking(move || {
-        let mut sink = ChunkSender {
-            chunks: chunks.clone(),
+        let mut builder = tar::Builder::new(ChunkSender {
+            chunks,
             pending: Vec::with_capacity(ARCHIVE_CHUNK_BYTES),
-        };
-        let written = archive_directory(&path, &mut sink).and_then(|()| sink.flush());
+            failed: false,
+        });
+        let written = append_tree(&mut builder, &path, Path::new(""))
+            .and_then(|()| builder.finish())
+            .and_then(|()| builder.get_mut().flush());
         if let Err(error) = written {
-            let _ = chunks.blocking_send(Err(error));
+            builder.get_mut().fail(error);
         }
     });
     let stream = async_stream::stream! {
@@ -150,12 +164,90 @@ pub async fn write_archive(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn archive_directory(directory: &Path, sink: &mut ChunkSender) -> io::Result<()> {
-    let mut builder = tar::Builder::new(sink);
-    builder.follow_symlinks(false);
-    builder.append_dir_all(".", directory)?;
-    builder.into_inner()?;
+fn append_tree(
+    builder: &mut tar::Builder<ChunkSender>,
+    directory: &Path,
+    name: &Path,
+) -> io::Result<()> {
+    let mut entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries.collect::<io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let name = name.join(entry.file_name());
+        match append_entry(builder, &path, &name) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            appended => appended?,
+        }
+    }
     Ok(())
+}
+
+fn append_entry(
+    builder: &mut tar::Builder<ChunkSender>,
+    path: &Path,
+    name: &Path,
+) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        builder.append_data(&mut header_for(&metadata), name, io::empty())?;
+        append_tree(builder, path, name)
+    } else if file_type.is_symlink() {
+        builder.append_link(&mut header_for(&metadata), name, std::fs::read_link(path)?)
+    } else if file_type.is_file() {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(NONBLOCKING_OPEN)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(());
+        }
+        let contents = DeclaredLength {
+            remaining: metadata.len(),
+            file,
+            path,
+        };
+        builder.append_data(&mut header_for(&metadata), name, contents)
+    } else {
+        Ok(())
+    }
+}
+
+fn header_for(metadata: &Metadata) -> tar::Header {
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata_in_mode(metadata, tar::HeaderMode::Complete);
+    header
+}
+
+struct DeclaredLength<'a> {
+    file: std::fs::File,
+    remaining: u64,
+    path: &'a Path,
+}
+
+impl Read for DeclaredLength<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let limit = buffer
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        if limit == 0 {
+            return Ok(0);
+        }
+        let count = self.file.read(&mut buffer[..limit])?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{} shrank while it was archived", self.path.display()),
+            ));
+        }
+        self.remaining -= count as u64;
+        Ok(count)
+    }
 }
 
 fn extract_archive(reader: impl io::Read, destination: &Path) -> io::Result<()> {
@@ -194,10 +286,22 @@ fn unpack_inside<R: io::Read>(entry: &mut tar::Entry<R>, destination: &Path) -> 
 struct ChunkSender {
     chunks: mpsc::Sender<io::Result<Bytes>>,
     pending: Vec<u8>,
+    failed: bool,
+}
+
+impl ChunkSender {
+    fn fail(&mut self, error: io::Error) {
+        self.failed = true;
+        self.pending.clear();
+        let _ = self.chunks.blocking_send(Err(error));
+    }
 }
 
 impl Write for ChunkSender {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(io::Error::other("archive already failed"));
+        }
         self.pending.extend_from_slice(bytes);
         if self.pending.len() >= ARCHIVE_CHUNK_BYTES {
             self.flush()?;

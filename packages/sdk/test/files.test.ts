@@ -183,6 +183,82 @@ Deno.test("archives write many files in one request and read a directory back", 
         })
     ));
 
+Deno.test("a write goes through a symlink and a named pipe is refused without blocking", () =>
+    withMachine((machine) =>
+        inTempDir(async (dir) => {
+            await Deno.writeTextFile(`${dir}/target`, "original");
+            await Deno.symlink("target", `${dir}/link`);
+            await machine.writeFile(`${dir}/link`, "through");
+            assert.equal(await Deno.readLink(`${dir}/link`), "target");
+            assert.equal(await Deno.readTextFile(`${dir}/target`), "through");
+
+            const fifo = await machine.startProcess({
+                program: "mkfifo",
+                args: [`${dir}/fifo`],
+            });
+            assert.equal((await fifo.wait()).kind, "exited");
+            await assert.rejects(
+                machine.readFile(`${dir}/fifo`, AbortSignal.timeout(5_000)),
+                status(409),
+            );
+        })
+    ));
+
+Deno.test("an archive holds a growing file's length at open and skips sockets", () =>
+    withMachine((machine) =>
+        inTempDir(async (dir) => {
+            await Deno.mkdir(`${dir}/tree`);
+            await Deno.writeFile(
+                `${dir}/tree/a-growing`,
+                bytes(16 * 1024 * 1024),
+            );
+            await Deno.writeTextFile(`${dir}/tree/z-after`, "intact");
+            const bound = await machine.startProcess({
+                program: "python3",
+                args: [
+                    "-c",
+                    "import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])",
+                    `${dir}/tree/m-socket`,
+                ],
+            });
+            assert.equal((await bound.wait()).kind, "exited");
+            assert.ok((await Deno.lstat(`${dir}/tree/m-socket`)).isSocket);
+            const writer = await machine.startProcess({
+                program: "/bin/sh",
+                args: [
+                    "-c",
+                    'while :; do head -c 65536 /dev/zero >> "$1"; done',
+                    "sh",
+                    `${dir}/tree/a-growing`,
+                ],
+            });
+            try {
+                await machine.writeArchive(
+                    `${dir}/copy`,
+                    await machine.readArchive(`${dir}/tree`),
+                );
+            } finally {
+                await writer.kill();
+                await writer.wait();
+            }
+            assert.equal(
+                await Deno.readTextFile(`${dir}/copy/z-after`),
+                "intact",
+            );
+            const copied = await Deno.readFile(`${dir}/copy/a-growing`);
+            assert.ok(copied.length >= 16 * 1024 * 1024);
+            assert.deepEqual(
+                copied.subarray(0, 16 * 1024 * 1024),
+                bytes(16 * 1024 * 1024),
+            );
+            assert.deepEqual(
+                (await Array.fromAsync(Deno.readDir(`${dir}/copy`)))
+                    .map((entry) => entry.name).sort(),
+                ["a-growing", "z-after"],
+            );
+        })
+    ));
+
 Deno.test("an archive entry that leaves its directory is rejected", () =>
     withMachine((machine) =>
         inTempDir(async (dir) => {
