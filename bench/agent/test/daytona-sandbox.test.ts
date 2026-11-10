@@ -152,3 +152,33 @@ Deno.test("Daytona concurrent close and reclaim share deletion", async () => {
     assert.equal(f.deleted.length, 1);
     await assert.rejects(sandbox.run("later", 100));
 });
+
+Deno.test("Daytona creation rejects when reclaim wins during setup", async () => {
+    const setup = Promise.withResolvers<{ exitCode: number; result: string }>();
+    const entered = Promise.withResolvers<void>();
+    let deleted = 0;
+    const remote: DaytonaRemote = {
+        process: {
+            executeCommand() {
+                entered.resolve();
+                return setup.promise;
+            },
+        },
+    };
+    const provider = daytonaProvider({
+        create: () => Promise.resolve(remote),
+        get: () => Promise.resolve(remote),
+        delete() {
+            deleted++;
+            return Promise.resolve();
+        },
+    });
+    const creation = provider.create();
+    const rejected = assert.rejects(creation, /provider is closed/);
+    await entered.promise;
+    await provider.reclaim();
+    assert.equal(deleted, 1);
+    setup.resolve({ exitCode: 0, result: "" });
+    await rejected;
+    assert.equal(deleted, 1);
+});

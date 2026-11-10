@@ -213,6 +213,9 @@ export function daytonaProvider(client?: DaytonaClient): SandboxProvider {
                         `Daytona setup failed: ${setup.result}`,
                     );
                 }
+                if (closing) {
+                    throw new SandboxError("Daytona provider is closed");
+                }
                 return {
                     reported_boot_ms: null,
                     run: execute,
