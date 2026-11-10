@@ -9,22 +9,22 @@ import {
 import {
     Browser,
     PinMismatch,
-    pinnedArgs,
-    pinnedEnvironment,
+    pinned_args,
+    pinned_environment,
     viewport,
 } from "./browser.ts";
 import {
     isPinnedChromiumInstalled,
+    pinned_product,
     pinnedExecutable,
-    pinnedProduct,
 } from "./chromium.ts";
-import { fixtureOrigin, FixtureServer } from "./fixtures/server.ts";
+import { fixture_origin, FixtureServer } from "./fixtures/server.ts";
 import { observers } from "./observers.ts";
 import { readiness } from "./page.ts";
 import { armOrder } from "./schedule.ts";
 import { renderSummary } from "./summary.ts";
-import { tasks as allTasks } from "./tasks.ts";
-import { cpuTimeResolutionSeconds } from "./usage.ts";
+import { tasks as all_tasks } from "./tasks.ts";
+import { cpu_time_resolution_seconds } from "./usage.ts";
 
 type Config = {
     browsers: Record<
@@ -79,7 +79,7 @@ function resolveArm(name: string): Arm {
                 ? pinnedExecutable()
                 : browser.executable,
             product: browser.product === "pinned"
-                ? pinnedProduct
+                ? pinned_product
                 : browser.product,
             args: browser.args,
         },
@@ -88,34 +88,34 @@ function resolveArm(name: string): Arm {
 
 const arms = (selection(flags.arms) ?? config.arms.map((arm) => arm.name))
     .map(resolveArm);
-const taskSelection = selection(flags.tasks);
-const tasks = taskSelection
-    ? taskSelection.map((id) =>
-        allTasks.find((task) => task.id === id) ?? fail(`unknown task "${id}"`)
+const task_selection = selection(flags.tasks);
+const tasks = task_selection
+    ? task_selection.map((id) =>
+        all_tasks.find((task) => task.id === id) ?? fail(`unknown task "${id}"`)
     )
-    : allTasks.filter((task) =>
+    : all_tasks.filter((task) =>
         flags.live || task.content === "pinned-fixture"
     );
 
-const usesPinnedChromium = arms.some((arm) =>
+const uses_pinned_chromium = arms.some((arm) =>
     arm.browser.executable === pinnedExecutable()
 );
-if (usesPinnedChromium && !await isPinnedChromiumInstalled()) {
+if (uses_pinned_chromium && !await isPinnedChromiumInstalled()) {
     fail("pinned Chromium is not installed; run `deno task bench:chromium`");
 }
 
 const conditions: Conditions = {
     rounds: Number(flags.rounds),
     retries: Number(flags.retries),
-    thinkMs: Number(flags["think-ms"]),
-    stepTimeoutMs: Number(flags["step-timeout-ms"]),
-    usageSampleMs: 200,
+    think_ms: Number(flags["think-ms"]),
+    step_timeout_ms: Number(flags["step-timeout-ms"]),
+    usage_sample_ms: 200,
 };
 
-const distinctBrowsers = new Map(
+const distinct_browsers = new Map(
     arms.map((arm) => [arm.browser.name, arm.browser]),
 );
-for (const browser of distinctBrowsers.values()) {
+for (const browser of distinct_browsers.values()) {
     try {
         await (await Browser.launch(browser)).close();
     } catch (error) {
@@ -124,36 +124,36 @@ for (const browser of distinctBrowsers.values()) {
     }
 }
 
-const startedAt = new Date();
-const outputDirectory = flags.out ??
-    `bench-results/${startedAt.toISOString().replaceAll(":", "-")}`;
-await Deno.mkdir(outputDirectory, { recursive: true });
+const started_at = new Date();
+const output_directory = flags.out ??
+    `bench-results/${started_at.toISOString().replaceAll(":", "-")}`;
+await Deno.mkdir(output_directory, { recursive: true });
 
 await Deno.writeTextFile(
-    `${outputDirectory}/run.json`,
+    `${output_directory}/run.json`,
     JSON.stringify(
         {
-            startedAt: startedAt.toISOString(),
+            started_at: started_at.toISOString(),
             host: {
                 os: Deno.build.os,
-                osRelease: Deno.osRelease(),
+                os_release: Deno.osRelease(),
                 arch: Deno.build.arch,
-                logicalCpus: navigator.hardwareConcurrency,
-                memoryBytes: Deno.systemMemoryInfo().total,
-                loadAverageAtStart: Deno.loadavg(),
+                logical_cpus: navigator.hardwareConcurrency,
+                memory_bytes: Deno.systemMemoryInfo().total,
+                load_average_at_start: Deno.loadavg(),
             },
             conditions: {
                 ...conditions,
                 viewport,
-                pinnedArgs,
-                pinnedEnvironment,
+                pinned_args,
+                pinned_environment,
                 readiness,
-                fixtureOrigin,
-                freshBrowserAndProfilePerAttempt: true,
-                unmeasuredWarmUpLaunchPerBrowser: true,
-                armOrder: "rotated by round + task index",
-                cpuTimeResolutionSeconds,
-                memoryMetric:
+                fixture_origin,
+                fresh_browser_and_profile_per_attempt: true,
+                unmeasured_warm_up_launch_per_browser: true,
+                arm_order: "rotated by round + task index",
+                cpu_time_resolution_seconds,
+                memory_metric:
                     "peak of summed RSS across the browser process tree; shared pages are counted once per process",
             },
             arms: arms.map((arm) => ({
@@ -166,7 +166,7 @@ await Deno.writeTextFile(
             tasks: tasks.map((task) => ({
                 id: task.id,
                 content: task.content,
-                outcomeSource: task.outcome.source,
+                outcome_source: task.outcome.source,
                 steps: task.steps.map((step) => step.name),
             })),
         },
@@ -177,7 +177,7 @@ await Deno.writeTextFile(
 
 const server = new FixtureServer();
 const attempts: AttemptRecord[] = [];
-const attemptLog = await Deno.open(`${outputDirectory}/attempts.jsonl`, {
+const attempt_log = await Deno.open(`${output_directory}/attempts.jsonl`, {
     create: true,
     append: true,
 });
@@ -185,9 +185,9 @@ const encoder = new TextEncoder();
 
 try {
     for (let round = 1; round <= conditions.rounds; round++) {
-        for (const [taskIndex, task] of tasks.entries()) {
-            const order = armOrder(arms, round, taskIndex);
-            for (const [positionInRound, arm] of order.entries()) {
+        for (const [task_index, task] of tasks.entries()) {
+            const order = armOrder(arms, round, task_index);
+            for (const [position_in_round, arm] of order.entries()) {
                 for (
                     let attempt = 1;
                     attempt <= conditions.retries + 1;
@@ -198,13 +198,13 @@ try {
                         task,
                         round,
                         attempt,
-                        positionInRound,
+                        position_in_round,
                         conditions,
                         server,
-                        outputDirectory,
+                        output_directory,
                     });
                     attempts.push(record);
-                    await attemptLog.write(
+                    await attempt_log.write(
                         encoder.encode(JSON.stringify(record) + "\n"),
                     );
                     console.error(
@@ -219,16 +219,16 @@ try {
         }
     }
 } finally {
-    attemptLog.close();
+    attempt_log.close();
     await server.stop();
 }
 
-const summary = `# Browser bench ${startedAt.toISOString()}\n\n` +
+const summary = `# Browser bench ${started_at.toISOString()}\n\n` +
     renderSummary(
         attempts,
         arms.map((arm) => arm.name),
         tasks.map((task) => task.id),
     );
-await Deno.writeTextFile(`${outputDirectory}/summary.md`, summary);
+await Deno.writeTextFile(`${output_directory}/summary.md`, summary);
 console.log(summary);
-console.error(`results written to ${outputDirectory}`);
+console.error(`results written to ${output_directory}`);

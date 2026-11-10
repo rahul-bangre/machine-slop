@@ -1,11 +1,11 @@
 export type ProcessRow = {
     pid: number;
     ppid: number;
-    rssBytes: number;
-    cpuSeconds: number;
+    rss_bytes: number;
+    cpu_seconds: number;
 };
 
-export type UsageMark = { cpuSeconds: number; peakRssSumBytes: number };
+export type UsageMark = { cpu_seconds: number; peak_rss_sum_bytes: number };
 
 export function parsePsCpuTime(text: string): number {
     const [clock = "", days] = text.split("-").reverse();
@@ -18,34 +18,37 @@ export function parsePsCpuTime(text: string): number {
 
 export function parsePsRows(output: string): ProcessRow[] {
     return output.split("\n").flatMap((line) => {
-        const [pid, ppid, rssKib, time] = line.trim().split(/\s+/);
-        if (!pid || !ppid || !rssKib || !time) return [];
+        const [pid, ppid, rss_kib, time] = line.trim().split(/\s+/);
+        if (!pid || !ppid || !rss_kib || !time) return [];
         return [{
             pid: Number(pid),
             ppid: Number(ppid),
-            rssBytes: Number(rssKib) * 1024,
-            cpuSeconds: parsePsCpuTime(time),
+            rss_bytes: Number(rss_kib) * 1024,
+            cpu_seconds: parsePsCpuTime(time),
         }];
     });
 }
 
 export function parseLinuxStat(
     stat: string,
-    ticksPerSecond: number,
-    pageBytes: number,
+    ticks_per_second: number,
+    page_bytes: number,
 ): ProcessRow {
     const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
     const field = (index: number) => Number(fields[index - 3]);
     return {
         pid: Number(stat.slice(0, stat.indexOf(" "))),
         ppid: field(4),
-        rssBytes: field(24) * pageBytes,
-        cpuSeconds: (field(14) + field(15)) / ticksPerSecond,
+        rss_bytes: field(24) * page_bytes,
+        cpu_seconds: (field(14) + field(15)) / ticks_per_second,
     };
 }
 
-export function processTree(rows: ProcessRow[], rootPid: number): ProcessRow[] {
-    const members = new Set([rootPid]);
+export function processTree(
+    rows: ProcessRow[],
+    root_pid: number,
+): ProcessRow[] {
+    const members = new Set([root_pid]);
     for (let grew = true; grew;) {
         grew = false;
         for (const row of rows) {
@@ -73,24 +76,25 @@ async function readPsRows(): Promise<ProcessRow[]> {
     );
 }
 
-let linuxUnits: Promise<{ ticksPerSecond: number; pageBytes: number }> | null =
-    null;
+let linux_units:
+    | Promise<{ ticks_per_second: number; page_bytes: number }>
+    | null = null;
 
 async function readLinuxRows(): Promise<ProcessRow[]> {
-    linuxUnits ??= Promise.all([
+    linux_units ??= Promise.all([
         commandOutput("getconf", ["CLK_TCK"]),
         commandOutput("getconf", ["PAGESIZE"]),
     ]).then(([ticks, page]) => ({
-        ticksPerSecond: Number(ticks),
-        pageBytes: Number(page),
+        ticks_per_second: Number(ticks),
+        page_bytes: Number(page),
     }));
-    const { ticksPerSecond, pageBytes } = await linuxUnits;
+    const { ticks_per_second, page_bytes } = await linux_units;
     const rows: ProcessRow[] = [];
     for await (const entry of Deno.readDir("/proc")) {
         if (!/^\d+$/.test(entry.name)) continue;
         try {
             const stat = await Deno.readTextFile(`/proc/${entry.name}/stat`);
-            rows.push(parseLinuxStat(stat, ticksPerSecond, pageBytes));
+            rows.push(parseLinuxStat(stat, ticks_per_second, page_bytes));
         } catch (error) {
             if (!(error instanceof Deno.errors.NotFound)) throw error;
         }
@@ -102,22 +106,22 @@ export const readProcessRows = Deno.build.os === "linux"
     ? readLinuxRows
     : readPsRows;
 
-export const cpuTimeResolutionSeconds = 0.01;
+export const cpu_time_resolution_seconds = 0.01;
 
 export class UsageMeter {
-    private readonly cpuByPid = new Map<number, number>();
-    private lifetimePeak = 0;
-    private windowPeak = 0;
+    private readonly cpu_by_pid = new Map<number, number>();
+    private lifetime_peak = 0;
+    private window_peak = 0;
     private timer: ReturnType<typeof setInterval> | undefined;
 
     constructor(
-        private readonly rootPid: number,
+        private readonly root_pid: number,
         private readonly readRows: () => Promise<ProcessRow[]> =
             readProcessRows,
     ) {}
 
-    start(intervalMs: number): void {
-        this.timer = setInterval(() => void this.sample(), intervalMs);
+    start(interval_ms: number): void {
+        this.timer = setInterval(() => void this.sample(), interval_ms);
     }
 
     stop(): void {
@@ -125,34 +129,34 @@ export class UsageMeter {
     }
 
     async sample(): Promise<void> {
-        const tree = processTree(await this.readRows(), this.rootPid);
-        let rssSum = 0;
+        const tree = processTree(await this.readRows(), this.root_pid);
+        let rss_sum = 0;
         for (const row of tree) {
-            rssSum += row.rssBytes;
-            const seen = this.cpuByPid.get(row.pid) ?? 0;
-            this.cpuByPid.set(row.pid, Math.max(seen, row.cpuSeconds));
+            rss_sum += row.rss_bytes;
+            const seen = this.cpu_by_pid.get(row.pid) ?? 0;
+            this.cpu_by_pid.set(row.pid, Math.max(seen, row.cpu_seconds));
         }
-        this.windowPeak = Math.max(this.windowPeak, rssSum);
-        this.lifetimePeak = Math.max(this.lifetimePeak, rssSum);
+        this.window_peak = Math.max(this.window_peak, rss_sum);
+        this.lifetime_peak = Math.max(this.lifetime_peak, rss_sum);
     }
 
     async mark(): Promise<UsageMark> {
         await this.sample();
         const mark = {
-            cpuSeconds: this.cpuSeconds(),
-            peakRssSumBytes: this.windowPeak,
+            cpu_seconds: this.totalCpuSeconds(),
+            peak_rss_sum_bytes: this.window_peak,
         };
-        this.windowPeak = 0;
+        this.window_peak = 0;
         return mark;
     }
 
-    cpuSeconds(): number {
+    totalCpuSeconds(): number {
         let total = 0;
-        for (const seconds of this.cpuByPid.values()) total += seconds;
+        for (const seconds of this.cpu_by_pid.values()) total += seconds;
         return total;
     }
 
-    peakRssSumBytes(): number {
-        return this.lifetimePeak;
+    lifetimePeakRssSumBytes(): number {
+        return this.lifetime_peak;
     }
 }

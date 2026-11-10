@@ -7,11 +7,11 @@ export type BrowserProfile = {
     args: string[];
 };
 
-export type Startup = { devtoolsMs: number; usablePageMs: number };
+export type Startup = { devtools_ms: number; usable_page_ms: number };
 
 export const viewport = { width: 1280, height: 800, deviceScaleFactor: 1 };
 
-export const pinnedArgs = [
+export const pinned_args = [
     "--headless=new",
     `--window-size=${viewport.width},${viewport.height}`,
     `--force-device-scale-factor=${viewport.deviceScaleFactor}`,
@@ -30,9 +30,9 @@ export const pinnedArgs = [
     "--mute-audio",
 ];
 
-export const pinnedEnvironment = { TZ: "UTC" };
+export const pinned_environment = { TZ: "UTC" };
 
-const startupTimeoutMs = 30_000;
+const startup_timeout_ms = 30_000;
 
 export class PinMismatch extends Error {
     constructor(profile: BrowserProfile, actual: string) {
@@ -51,24 +51,24 @@ export class Browser {
         readonly product: string,
         private readonly cdp: Cdp,
         private readonly child: Deno.ChildProcess,
-        private readonly profileDirectory: string,
-        private readonly stderrDrained: Promise<void>,
+        private readonly profile_directory: string,
+        private readonly stderr_drained: Promise<void>,
     ) {}
 
     static async launch(profile: BrowserProfile): Promise<Browser> {
-        const profileDirectory = await Deno.makeTempDir({
+        const profile_directory = await Deno.makeTempDir({
             prefix: "browser-bench-",
         });
-        const spawnedAt = performance.now();
+        const spawned_at = performance.now();
         const child = new Deno.Command(profile.executable, {
             args: [
-                ...pinnedArgs,
+                ...pinned_args,
                 ...profile.args,
                 "--remote-debugging-port=0",
-                `--user-data-dir=${profileDirectory}`,
+                `--user-data-dir=${profile_directory}`,
                 "about:blank",
             ],
-            env: pinnedEnvironment,
+            env: pinned_environment,
             stdin: "null",
             stdout: "null",
             stderr: "piped",
@@ -76,14 +76,14 @@ export class Browser {
 
         const endpoint = Promise.withResolvers<string>();
         endpoint.promise.catch(() => {});
-        const stderrDrained = drainStderr(child.stderr, endpoint);
+        const stderr_drained = drainStderr(child.stderr, endpoint);
         try {
             const url = await withDeadline(
                 "browser startup",
-                startupTimeoutMs,
+                startup_timeout_ms,
                 endpoint.promise,
             );
-            const devtoolsMs = performance.now() - spawnedAt;
+            const devtools_ms = performance.now() - spawned_at;
             const cdp = await Cdp.connect(url);
             const { product } = await cdp.send<{ product: string }>(
                 "Browser.getVersion",
@@ -93,28 +93,32 @@ export class Browser {
             }
             const page = await withDeadline(
                 "first page",
-                startupTimeoutMs,
+                startup_timeout_ms,
                 attachFirstPage(cdp),
             );
             return new Browser(
                 child.pid,
                 page,
-                { devtoolsMs, usablePageMs: performance.now() - spawnedAt },
+                { devtools_ms, usable_page_ms: performance.now() - spawned_at },
                 product,
                 cdp,
                 child,
-                profileDirectory,
-                stderrDrained,
+                profile_directory,
+                stderr_drained,
             );
         } catch (error) {
-            await terminate(child, stderrDrained, profileDirectory);
+            await terminate(child, stderr_drained, profile_directory);
             throw error;
         }
     }
 
     async close(): Promise<void> {
         this.cdp.close();
-        await terminate(this.child, this.stderrDrained, this.profileDirectory);
+        await terminate(
+            this.child,
+            this.stderr_drained,
+            this.profile_directory,
+        );
     }
 }
 
@@ -162,8 +166,8 @@ async function drainStderr(
 
 async function terminate(
     child: Deno.ChildProcess,
-    stderrDrained: Promise<void>,
-    profileDirectory: string,
+    stderr_drained: Promise<void>,
+    profile_directory: string,
 ): Promise<void> {
     try {
         child.kill("SIGKILL");
@@ -171,6 +175,6 @@ async function terminate(
         if (!(error instanceof TypeError)) throw error;
     }
     await child.status;
-    await stderrDrained.catch(() => {});
-    await Deno.remove(profileDirectory, { recursive: true }).catch(() => {});
+    await stderr_drained.catch(() => {});
+    await Deno.remove(profile_directory, { recursive: true }).catch(() => {});
 }

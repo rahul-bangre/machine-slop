@@ -138,7 +138,7 @@
       }));
       document.querySelector("#cart-total").textContent = price(
         lines.reduce(
-          (sum, line) => sum + line.product.priceCents * line.quantity,
+          (sum, line) => sum + line.product.price_cents * line.quantity,
           0,
         ),
       );
@@ -157,7 +157,7 @@
           <p class="price"></p>
           <button class="add" type="button">Add to cart</button>`;
         card.querySelector("h2").textContent = product.name;
-        card.querySelector(".price").textContent = price(product.priceCents);
+        card.querySelector(".price").textContent = price(product.price_cents);
         card.querySelector(".add").addEventListener("click", () => {
           cart.set(product.id, (cart.get(product.id) ?? 0) + 1);
           renderCart();
@@ -201,12 +201,12 @@
             items: [...cart.entries()].map(([id, quantity]) => ({ id, quantity })),
             name: document.querySelector("#name").value,
             email: document.querySelector("#email").value,
-            acceptedTerms: document.querySelector("#terms").checked,
+            accepted_terms: document.querySelector("#terms").checked,
           }),
         });
-        const { orderId } = await response.json();
+        const { order_id } = await response.json();
         document.querySelector("#confirmation").textContent =
-          `Order ${orderId} confirmed`;
+          `Order ${order_id} confirmed`;
       },
     );
 

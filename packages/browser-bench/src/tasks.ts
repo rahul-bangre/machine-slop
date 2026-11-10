@@ -1,9 +1,9 @@
 import {
     formatPrice,
-    highestRevenueAccount,
+    highest_revenue_account,
     products,
 } from "./fixtures/data.ts";
-import { fixtureOrigin, type RequestRecord } from "./fixtures/server.ts";
+import { fixture_origin, type RequestRecord } from "./fixtures/server.ts";
 import type { Action } from "./page.ts";
 
 export type Step = {
@@ -43,22 +43,22 @@ function soleRequest(
         : `expected one ${method} ${path}, server saw ${matches.length}`;
 }
 
-const cobaltNotebook = products.find((product) =>
+const cobalt_notebook = products.find((product) =>
     product.name === "Cobalt Notebook"
 )!;
 const customer = { name: "Ada Lovelace", email: "ada@example.com" };
-const ticketNote = "Renewal at risk";
+const ticket_note = "Renewal at risk";
 
-const shopCheckout: Task = {
+const shop_checkout: Task = {
     id: "shop-checkout",
     content: "pinned-fixture",
     steps: [
         {
             name: "open shop",
-            act: { goto: `${fixtureOrigin}/shop/` },
+            act: { goto: `${fixture_origin}/shop/` },
             ready:
                 `document.querySelectorAll(".product").length === ${products.length}`,
-            observed: [cobaltNotebook.name, "Search products"],
+            observed: [cobalt_notebook.name, "Search products"],
         },
         {
             name: "search",
@@ -66,15 +66,15 @@ const shopCheckout: Task = {
             ready:
                 `document.querySelectorAll(".product:not([hidden])").length === 1`,
             observed: [
-                cobaltNotebook.name,
-                formatPrice(cobaltNotebook.priceCents),
+                cobalt_notebook.name,
+                formatPrice(cobalt_notebook.price_cents),
             ],
         },
         {
             name: "add to cart",
             act: { click: ".product:not([hidden]) .add" },
             ready: `document.querySelector("#cart-count").textContent === "1"`,
-            observed: [`Added ${cobaltNotebook.name} to cart`],
+            observed: [`Added ${cobalt_notebook.name} to cart`],
         },
         {
             name: "open cart",
@@ -119,9 +119,9 @@ const shopCheckout: Task = {
             const order = soleRequest(requests, "POST", "/api/orders");
             if (typeof order === "string") return order;
             const expected = {
-                items: [{ id: cobaltNotebook.id, quantity: 1 }],
+                items: [{ id: cobalt_notebook.id, quantity: 1 }],
                 ...customer,
-                acceptedTerms: true,
+                accepted_terms: true,
             };
             return sameJson(order.body, expected)
                 ? null
@@ -130,13 +130,13 @@ const shopCheckout: Task = {
     },
 };
 
-const docsLookup: Task = {
+const docs_lookup: Task = {
     id: "docs-lookup",
     content: "pinned-fixture",
     steps: [
         {
             name: "open docs",
-            act: { goto: `${fixtureOrigin}/docs/` },
+            act: { goto: `${fixture_origin}/docs/` },
             ready: `document.querySelectorAll("nav a").length === 6`,
             observed: ["Rate limits", "Webhooks"],
         },
@@ -172,13 +172,13 @@ const docsLookup: Task = {
     },
 };
 
-const dashboardTicket: Task = {
+const dashboard_ticket: Task = {
     id: "dashboard-ticket",
     content: "pinned-fixture",
     steps: [
         {
             name: "open dashboard",
-            act: { goto: `${fixtureOrigin}/dashboard/` },
+            act: { goto: `${fixture_origin}/dashboard/` },
             ready:
                 `document.querySelectorAll("#accounts tbody tr").length === 50`,
             observed: ["Account 0001", "Revenue"],
@@ -188,25 +188,27 @@ const dashboardTicket: Task = {
             act: { click: `th[data-key="revenue"]` },
             ready:
                 `document.querySelector('th[data-key="revenue"]').getAttribute("aria-sort") === "descending"`,
-            observed: [highestRevenueAccount.name],
+            observed: [highest_revenue_account.name],
         },
         {
             name: "open top account",
             act: { click: "#accounts tbody tr:first-child" },
             ready: `document.querySelector("#detail").open`,
-            observed: [highestRevenueAccount.name, "File ticket"],
+            observed: [highest_revenue_account.name, "File ticket"],
         },
         {
             name: "write note",
-            act: { fill: "#note", text: ticketNote },
-            ready: `document.querySelector("#note").value === "${ticketNote}"`,
+            act: { fill: "#note", text: ticket_note },
+            ready: `document.querySelector("#note").value === "${ticket_note}"`,
         },
         {
             name: "submit ticket",
             act: { click: "#submit-ticket" },
             ready:
                 `document.querySelector("#ticket-status").textContent.includes("filed")`,
-            observed: [`Ticket TCK-1 filed for ${highestRevenueAccount.name}`],
+            observed: [
+                `Ticket TCK-1 filed for ${highest_revenue_account.name}`,
+            ],
         },
     ],
     outcome: {
@@ -215,8 +217,8 @@ const dashboardTicket: Task = {
             const ticket = soleRequest(requests, "POST", "/api/tickets");
             if (typeof ticket === "string") return ticket;
             const expected = {
-                accountId: highestRevenueAccount.id,
-                note: ticketNote,
+                account_id: highest_revenue_account.id,
+                note: ticket_note,
             };
             return sameJson(ticket.body, expected)
                 ? null
@@ -225,7 +227,7 @@ const dashboardTicket: Task = {
     },
 };
 
-const wikipediaSearch: Task = {
+const wikipedia_search: Task = {
     id: "live-wikipedia-search",
     content: "live-unpinned",
     steps: [
@@ -255,7 +257,7 @@ const wikipediaSearch: Task = {
     },
 };
 
-const hackerNewsPaging: Task = {
+const hacker_news_paging: Task = {
     id: "live-hacker-news-paging",
     content: "live-unpinned",
     steps: [
@@ -278,7 +280,7 @@ const hackerNewsPaging: Task = {
     },
 };
 
-const mdnNavigation: Task = {
+const mdn_navigation: Task = {
     id: "live-mdn-navigation",
     content: "live-unpinned",
     steps: [
@@ -306,10 +308,10 @@ const mdnNavigation: Task = {
 };
 
 export const tasks: Task[] = [
-    shopCheckout,
-    docsLookup,
-    dashboardTicket,
-    wikipediaSearch,
-    hackerNewsPaging,
-    mdnNavigation,
+    shop_checkout,
+    docs_lookup,
+    dashboard_ticket,
+    wikipedia_search,
+    hacker_news_paging,
+    mdn_navigation,
 ];

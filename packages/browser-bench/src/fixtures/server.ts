@@ -3,7 +3,7 @@ import { renderDocs } from "./docs.ts";
 
 export type RequestRecord = { method: string; path: string; body: unknown };
 
-export const fixtureOrigin = "http://127.0.0.1:41730";
+export const fixture_origin = "http://127.0.0.1:41730";
 
 const pages: Record<string, string> = {
     "/shop/": await Deno.readTextFile(new URL("shop.html", import.meta.url)),
@@ -12,7 +12,7 @@ const pages: Record<string, string> = {
     ),
 };
 
-const apiLatencyMs: Record<string, number> = {
+const api_latency_ms: Record<string, number> = {
     "/api/products": 150,
     "/api/accounts": 200,
     "/api/changelog": 100,
@@ -31,7 +31,7 @@ export class FixtureServer {
     private readonly server: Deno.HttpServer;
 
     constructor() {
-        const { port, hostname } = new URL(fixtureOrigin);
+        const { port, hostname } = new URL(fixture_origin);
         this.server = Deno.serve(
             { port: Number(port), hostname, onListen: () => {} },
             (request) => this.handle(request),
@@ -58,7 +58,7 @@ export class FixtureServer {
         const record = { method: request.method, path, body };
         this.requests.push(record);
 
-        const latency = apiLatencyMs[path];
+        const latency = api_latency_ms[path];
         if (latency !== undefined) {
             await new Promise((resolve) => setTimeout(resolve, latency));
         }
@@ -72,11 +72,11 @@ export class FixtureServer {
         if (route === "GET /api/changelog") return Response.json(changelog);
         if (route === "POST /api/orders") {
             return Response.json({
-                orderId: `ORD-${1000 + this.count(route)}`,
+                order_id: `ORD-${1000 + this.count(route)}`,
             });
         }
         if (route === "POST /api/tickets") {
-            return Response.json({ ticketId: `TCK-${this.count(route)}` });
+            return Response.json({ ticket_id: `TCK-${this.count(route)}` });
         }
         return new Response(null, { status: 404 });
     }

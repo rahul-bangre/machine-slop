@@ -3,10 +3,10 @@ import pin from "../chromium.json" with { type: "json" };
 
 type PlatformPin = { url: string; sha256: string; executable: string };
 
-const packageRoot = new URL("../", import.meta.url);
-const installRoot = new URL(`.chromium/${pin.version}/`, packageRoot);
+const package_root = new URL("../", import.meta.url);
+const install_root = new URL(`.chromium/${pin.version}/`, package_root);
 
-export const pinnedProduct = pin.product;
+export const pinned_product = pin.product;
 
 function platformPin(): PlatformPin {
     const key = `${Deno.build.os}-${Deno.build.arch}`;
@@ -20,7 +20,7 @@ function platformPin(): PlatformPin {
 
 export function pinnedExecutable(): string {
     return decodeURIComponent(
-        new URL(platformPin().executable, installRoot).pathname,
+        new URL(platformPin().executable, install_root).pathname,
     );
 }
 
@@ -36,8 +36,8 @@ export async function isPinnedChromiumInstalled(): Promise<boolean> {
 export async function installPinnedChromium(): Promise<string> {
     if (await isPinnedChromiumInstalled()) return pinnedExecutable();
     const platform = platformPin();
-    await Deno.mkdir(installRoot, { recursive: true });
-    const archive = new URL("chromium.zip", installRoot).pathname;
+    await Deno.mkdir(install_root, { recursive: true });
+    const archive = new URL("chromium.zip", install_root).pathname;
 
     const response = await fetch(platform.url);
     if (!response.ok || !response.body) {
@@ -56,7 +56,7 @@ export async function installPinnedChromium(): Promise<string> {
     }
 
     const unzip = await new Deno.Command("unzip", {
-        args: ["-q", "-o", archive, "-d", installRoot.pathname],
+        args: ["-q", "-o", archive, "-d", install_root.pathname],
         stdout: "null",
         stderr: "inherit",
     }).output();

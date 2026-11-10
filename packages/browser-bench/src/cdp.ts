@@ -41,7 +41,7 @@ type Pending = {
 };
 
 export class Cdp {
-    private nextId = 1;
+    private next_id = 1;
     private readonly pending = new Map<number, Pending>();
     private readonly listeners = new Set<(event: CdpEvent) => void>();
 
@@ -73,7 +73,7 @@ export class Cdp {
         params: Record<string, unknown> = {},
         sessionId?: string,
     ): Promise<T> {
-        const id = this.nextId++;
+        const id = this.next_id++;
         return new Promise<T>((resolve, reject) => {
             if (this.socket.readyState !== WebSocket.OPEN) {
                 reject(new CdpError(method, "connection closed"));

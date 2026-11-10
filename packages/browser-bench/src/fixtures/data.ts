@@ -1,4 +1,4 @@
-export type Product = { id: string; name: string; priceCents: number };
+export type Product = { id: string; name: string; price_cents: number };
 export type Account = {
     id: string;
     name: string;
@@ -26,7 +26,7 @@ export const products: Product[] = nouns.flatMap((noun, row) =>
         return {
             id: `p${index}`,
             name: `${adjective} ${noun}`,
-            priceCents: 1200 + index * 135,
+            price_cents: 1200 + index * 135,
         };
     })
 );
@@ -39,7 +39,7 @@ export const accounts: Account[] = Array.from({ length: 1000 }, (_, index) => ({
     revenue: (index + 1) * 7919 % 100_003,
 }));
 
-export const highestRevenueAccount = accounts.reduce((top, account) =>
+export const highest_revenue_account = accounts.reduce((top, account) =>
     account.revenue > top.revenue ? account : top
 );
 
@@ -51,7 +51,7 @@ export const changelog = [
     "Published retry guidance for 429 responses",
 ];
 
-export const docsPages = [
+export const docs_pages = [
     { slug: "getting-started", title: "Getting started" },
     { slug: "authentication", title: "Authentication" },
     { slug: "rate-limits", title: "Rate limits" },
@@ -60,6 +60,6 @@ export const docsPages = [
     { slug: "errors", title: "Errors" },
 ];
 
-export function formatPrice(priceCents: number): string {
-    return `$${(priceCents / 100).toFixed(2)}`;
+export function formatPrice(price_cents: number): string {
+    return `$${(price_cents / 100).toFixed(2)}`;
 }

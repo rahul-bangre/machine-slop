@@ -1,4 +1,4 @@
-import { docsPages } from "./data.ts";
+import { docs_pages } from "./data.ts";
 
 const style = `
   :root { font-family: Georgia, serif; color: #222; line-height: 1.6; }
@@ -22,7 +22,7 @@ const filler = [
 
 function navigation(): string {
     return `<nav aria-label="Documentation">${
-        docsPages.map((page) =>
+        docs_pages.map((page) =>
             `<a href="/docs/${page.slug}">${page.title}</a>`
         ).join("")
     }</nav>`;
@@ -54,7 +54,7 @@ function layout(title: string, main: string): string {
 </html>`;
 }
 
-const rateLimits = `
+const rate_limits = `
     <h1>Rate limits</h1>
     <p><a href="#changelog">Jump to changelog</a></p>
     <table>
@@ -96,12 +96,12 @@ export function renderDocs(path: string): string | null {
     if (path === "/docs/embed/status") {
         return "<!doctype html><title>Status</title><p>All systems operational</p>";
     }
-    const page = docsPages.find((entry) => `/docs/${entry.slug}` === path);
+    const page = docs_pages.find((entry) => `/docs/${entry.slug}` === path);
     if (!page) return null;
     return layout(
         page.title,
         page.slug === "rate-limits"
-            ? rateLimits
+            ? rate_limits
             : `<h1>${page.title}</h1>${sections(page.title)}`,
     );
 }

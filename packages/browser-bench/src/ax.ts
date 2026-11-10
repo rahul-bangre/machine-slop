@@ -11,9 +11,9 @@ export type AxNode = {
     childIds?: string[];
 };
 
-const transparentRoles = new Set(["none", "generic"]);
-const droppedRoles = new Set(["InlineTextBox", "LineBreak"]);
-const reportedStates = new Set([
+const transparent_roles = new Set(["none", "generic"]);
+const dropped_roles = new Set(["InlineTextBox", "LineBreak"]);
+const reported_states = new Set([
     "checked",
     "disabled",
     "expanded",
@@ -25,26 +25,26 @@ const reportedStates = new Set([
 ]);
 
 export function renderAxTree(nodes: AxNode[]): string {
-    const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+    const by_id = new Map(nodes.map((node) => [node.nodeId, node]));
     const lines: string[] = [];
 
-    const visit = (node: AxNode, depth: number, ancestorName: string) => {
+    const visit = (node: AxNode, depth: number, ancestor_name: string) => {
         const role = String(node.role?.value ?? "");
-        if (droppedRoles.has(role)) return;
+        if (dropped_roles.has(role)) return;
         const name = String(node.name?.value ?? "").trim();
-        const isTransparent = node.ignored ||
-            (transparentRoles.has(role) && name === "") ||
-            (role === "StaticText" && ancestorName.includes(name));
-        if (!isTransparent) {
+        const is_transparent = node.ignored ||
+            (transparent_roles.has(role) && name === "") ||
+            (role === "StaticText" && ancestor_name.includes(name));
+        if (!is_transparent) {
             lines.push("  ".repeat(depth) + describe(node, role, name));
         }
-        for (const childId of node.childIds ?? []) {
-            const child = byId.get(childId);
+        for (const child_id of node.childIds ?? []) {
+            const child = by_id.get(child_id);
             if (!child) continue;
             visit(
                 child,
-                isTransparent ? depth : depth + 1,
-                isTransparent ? ancestorName : name,
+                is_transparent ? depth : depth + 1,
+                is_transparent ? ancestor_name : name,
             );
         }
     };
@@ -64,7 +64,7 @@ function describe(node: AxNode, role: string, name: string): string {
     }
     for (const property of node.properties ?? []) {
         const state = property.value.value;
-        if (!reportedStates.has(property.name) || state === false) continue;
+        if (!reported_states.has(property.name) || state === false) continue;
         parts.push(
             state === true ? property.name : `${property.name}=${state}`,
         );

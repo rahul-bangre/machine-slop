@@ -128,20 +128,20 @@
       },
     );
 
-    const pageSize = 50;
+    const page_size = 50;
     const body = document.querySelector("#accounts tbody");
     const state = {
       rows: [],
-      sortKey: null,
+      sort_key: null,
       descending: false,
       page: 0,
       selected: null,
     };
 
     function render() {
-      const start = state.page * pageSize;
+      const start = state.page * page_size;
       body.replaceChildren(
-        ...state.rows.slice(start, start + pageSize).map((account) => {
+        ...state.rows.slice(start, start + page_size).map((account) => {
           const row = document.createElement("tr");
           for (
             const value of [
@@ -161,9 +161,9 @@
       );
       document.querySelector("#page-label").textContent = `Page ${
         state.page + 1
-      } of ${Math.ceil(state.rows.length / pageSize)}`;
+      } of ${Math.ceil(state.rows.length / page_size)}`;
       for (const header of document.querySelectorAll("th")) {
-        const active = header.dataset.key === state.sortKey;
+        const active = header.dataset.key === state.sort_key;
         header.setAttribute(
           "aria-sort",
           !active ? "none" : state.descending ? "descending" : "ascending",
@@ -184,8 +184,8 @@
     for (const header of document.querySelectorAll("th")) {
       header.addEventListener("click", () => {
         const key = header.dataset.key;
-        state.descending = state.sortKey === key ? !state.descending : true;
-        state.sortKey = key;
+        state.descending = state.sort_key === key ? !state.descending : true;
+        state.sort_key = key;
         state.page = 0;
         state.rows.sort((left, right) => {
           const order = left[key] < right[key]
@@ -204,7 +204,7 @@
     });
     document.querySelector("#next").addEventListener("click", () => {
       state.page = Math.min(
-        Math.ceil(state.rows.length / pageSize) - 1,
+        Math.ceil(state.rows.length / page_size) - 1,
         state.page + 1,
       );
       render();
@@ -217,13 +217,13 @@
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
-            accountId: state.selected.id,
+            account_id: state.selected.id,
             note: document.querySelector("#note").value,
           }),
         });
-        const { ticketId } = await response.json();
+        const { ticket_id } = await response.json();
         document.querySelector("#ticket-status").textContent =
-          `Ticket ${ticketId} filed for ${state.selected.name}`;
+          `Ticket ${ticket_id} filed for ${state.selected.name}`;
       },
     );
 

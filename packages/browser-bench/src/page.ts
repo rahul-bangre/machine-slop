@@ -14,7 +14,7 @@ export class ActionError extends Error {
     }
 }
 
-export const readiness = { pollMs: 20, quietMs: 250 };
+export const readiness = { poll_ms: 20, quiet_ms: 250 };
 
 const keys = {
     Enter: {
@@ -101,35 +101,35 @@ export class Page {
         }
     }
 
-    async settle(predicate: string, timeoutMs: number): Promise<number> {
-        const deadline = performance.now() + timeoutMs;
+    async settle(predicate: string, timeout_ms: number): Promise<number> {
+        const deadline = performance.now() + timeout_ms;
         const check =
             `document.readyState === "complete" && Boolean(${predicate})`;
-        let settledAt: number | null = null;
+        let settled_at: number | null = null;
         while (performance.now() < deadline) {
             const now = performance.now();
             const holds = this.inflight.size === 0 &&
                 await this.evaluate<boolean>(check).catch(() => false);
             if (!holds) {
-                settledAt = null;
+                settled_at = null;
             } else {
-                settledAt ??= now;
-                if (now - settledAt >= readiness.quietMs) return settledAt;
+                settled_at ??= now;
+                if (now - settled_at >= readiness.quiet_ms) return settled_at;
             }
             await new Promise((resolve) =>
-                setTimeout(resolve, readiness.pollMs)
+                setTimeout(resolve, readiness.poll_ms)
             );
         }
         const pending = [...this.inflight.values()].slice(0, 3).join(", ");
         throw new TimeoutError(
             `readiness (${predicate}; ${this.inflight.size} requests in flight: ${pending})`,
-            timeoutMs,
+            timeout_ms,
         );
     }
 
     private async click(selector: string): Promise<void> {
         const point = await this.evaluate<
-            { x: number; y: number } | { obscuredBy: string } | null
+            { x: number; y: number } | { obscured_by: string } | null
         >(`(() => {
             const element = document.querySelector(${JSON.stringify(selector)});
             if (!element) return null;
@@ -140,16 +140,16 @@ export class Page {
             const y = box.y + box.height / 2;
             const hit = document.elementFromPoint(x, y);
             if (!hit || !(element.contains(hit) || hit.contains(element))) {
-                return { obscuredBy: hit ? hit.outerHTML.slice(0, 120) : "nothing" };
+                return { obscured_by: hit ? hit.outerHTML.slice(0, 120) : "nothing" };
             }
             return { x, y };
         })()`);
         if (!point) {
             throw new ActionError(`no clickable element for ${selector}`);
         }
-        if ("obscuredBy" in point) {
+        if ("obscured_by" in point) {
             throw new ActionError(
-                `${selector} is obscured by ${point.obscuredBy}`,
+                `${selector} is obscured by ${point.obscured_by}`,
             );
         }
         const mouse = { ...point, button: "left", clickCount: 1 };

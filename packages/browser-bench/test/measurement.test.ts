@@ -21,9 +21,9 @@ Deno.test("ps rows carry rss in bytes and cpu time across minute, hour and day f
         ].join("\n"),
     );
     assert.deepEqual(rows, [
-        { pid: 101, ppid: 1, rssBytes: 2048 * 1024, cpuSeconds: 1.5 },
-        { pid: 102, ppid: 101, rssBytes: 512 * 1024, cpuSeconds: 3723.25 },
-        { pid: 103, ppid: 101, rssBytes: 4096, cpuSeconds: 172_801 },
+        { pid: 101, ppid: 1, rss_bytes: 2048 * 1024, cpu_seconds: 1.5 },
+        { pid: 102, ppid: 101, rss_bytes: 512 * 1024, cpu_seconds: 3723.25 },
+        { pid: 103, ppid: 101, rss_bytes: 4096, cpu_seconds: 172_801 },
     ]);
 });
 
@@ -34,8 +34,8 @@ Deno.test("linux stat parsing survives spaces and parentheses in the command nam
     assert.deepEqual(parseLinuxStat(stat, 100, 4096), {
         pid: 4242,
         ppid: 4000,
-        rssBytes: 300 * 4096,
-        cpuSeconds: 2,
+        rss_bytes: 300 * 4096,
+        cpu_seconds: 2,
     });
 });
 
@@ -43,27 +43,27 @@ Deno.test("usage covers only the browser tree, keeps cpu of exited children and 
     const mib = 2 ** 20;
     const samples: ProcessRow[][] = [
         [
-            { pid: 10, ppid: 1, rssBytes: 100 * mib, cpuSeconds: 1 },
-            { pid: 11, ppid: 10, rssBytes: 50 * mib, cpuSeconds: 2 },
-            { pid: 12, ppid: 11, rssBytes: 30 * mib, cpuSeconds: 0.5 },
-            { pid: 99, ppid: 1, rssBytes: 900 * mib, cpuSeconds: 40 },
+            { pid: 10, ppid: 1, rss_bytes: 100 * mib, cpu_seconds: 1 },
+            { pid: 11, ppid: 10, rss_bytes: 50 * mib, cpu_seconds: 2 },
+            { pid: 12, ppid: 11, rss_bytes: 30 * mib, cpu_seconds: 0.5 },
+            { pid: 99, ppid: 1, rss_bytes: 900 * mib, cpu_seconds: 40 },
         ],
         [
-            { pid: 10, ppid: 1, rssBytes: 110 * mib, cpuSeconds: 1.5 },
-            { pid: 99, ppid: 1, rssBytes: 900 * mib, cpuSeconds: 41 },
+            { pid: 10, ppid: 1, rss_bytes: 110 * mib, cpu_seconds: 1.5 },
+            { pid: 99, ppid: 1, rss_bytes: 900 * mib, cpu_seconds: 41 },
         ],
     ];
     const meter = new UsageMeter(10, () => Promise.resolve(samples.shift()!));
 
     assert.deepEqual(await meter.mark(), {
-        cpuSeconds: 3.5,
-        peakRssSumBytes: 180 * mib,
+        cpu_seconds: 3.5,
+        peak_rss_sum_bytes: 180 * mib,
     });
     assert.deepEqual(await meter.mark(), {
-        cpuSeconds: 4,
-        peakRssSumBytes: 110 * mib,
+        cpu_seconds: 4,
+        peak_rss_sum_bytes: 110 * mib,
     });
-    assert.equal(meter.peakRssSumBytes(), 180 * mib);
+    assert.equal(meter.lifetimePeakRssSumBytes(), 180 * mib);
 });
 
 Deno.test("every arm runs in every position equally often", () => {
@@ -82,23 +82,23 @@ Deno.test("every arm runs in every position equally often", () => {
 
 function attempt(
     round: number,
-    attemptNumber: number,
+    attempt_number: number,
     failure: AttemptRecord["failure"],
 ): AttemptRecord {
     return {
         arm: "arm",
         task: "task",
         round,
-        attempt: attemptNumber,
-        positionInRound: 0,
+        attempt: attempt_number,
+        position_in_round: 0,
         status: failure ? "failed" : "passed",
         failure,
         startup: null,
-        observerPrepareMs: null,
+        observer_prepare_ms: null,
         steps: [],
-        cpuSeconds: 0,
-        peakRssSumBytes: 0,
-        wallMs: 0,
+        cpu_seconds: 0,
+        peak_rss_sum_bytes: 0,
+        wall_ms: 0,
     };
 }
 
@@ -115,9 +115,9 @@ Deno.test("reliability keeps failed attempts and separates first-attempt passes 
         ]),
         {
             runs: 3,
-            passedFirstAttempt: 1,
-            passedAfterRetries: 2,
-            failedAttempts: { timeout: 2, outcome: 1 },
+            passed_first_attempt: 1,
+            passed_after_retries: 2,
+            failed_attempts: { timeout: 2, outcome: 1 },
         },
     );
 });

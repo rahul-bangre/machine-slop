@@ -18,8 +18,8 @@ export type Observer = {
     observe(page: Page): Promise<Observation>;
 };
 
-const textTokenizer = "o200k_base (gpt-tokenizer 4.1.0)";
-const imageTokenizer = "estimate: ceil(width * height / 750)";
+const text_tokenizer = "o200k_base (gpt-tokenizer 4.1.0)";
+const image_tokenizer = "estimate: ceil(width * height / 750)";
 
 function textObservation(text: string): Observation {
     return {
@@ -33,7 +33,7 @@ function textObservation(text: string): Observation {
 export const observers: Record<string, Observer> = {
     "ax-tree": {
         format: "ax-tree/indented-v1 (Accessibility.getFullAXTree)",
-        tokenizer: textTokenizer,
+        tokenizer: text_tokenizer,
         async prepare(page) {
             await page.session.send("Accessibility.enable");
         },
@@ -46,7 +46,7 @@ export const observers: Record<string, Observer> = {
     },
     html: {
         format: "dom/outer-html",
-        tokenizer: textTokenizer,
+        tokenizer: text_tokenizer,
         async observe(page) {
             return textObservation(
                 await page.evaluate<string>(
@@ -57,7 +57,7 @@ export const observers: Record<string, Observer> = {
     },
     screenshot: {
         format: `image/png viewport ${viewport.width}x${viewport.height}`,
-        tokenizer: imageTokenizer,
+        tokenizer: image_tokenizer,
         async observe(page) {
             const { data } = await page.session.send<{ data: string }>(
                 "Page.captureScreenshot",

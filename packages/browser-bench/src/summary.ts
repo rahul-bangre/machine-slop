@@ -14,33 +14,33 @@ export function spread(values: number[]): Spread | null {
 
 export type Reliability = {
     runs: number;
-    passedFirstAttempt: number;
-    passedAfterRetries: number;
-    failedAttempts: Partial<Record<FailureKind, number>>;
+    passed_first_attempt: number;
+    passed_after_retries: number;
+    failed_attempts: Partial<Record<FailureKind, number>>;
 };
 
 export function reliability(attempts: AttemptRecord[]): Reliability {
     const rounds = Map.groupBy(attempts, (attempt) => attempt.round);
-    const failedAttempts: Partial<Record<FailureKind, number>> = {};
+    const failed_attempts: Partial<Record<FailureKind, number>> = {};
     for (const attempt of attempts) {
         if (!attempt.failure) continue;
         const { kind } = attempt.failure;
-        failedAttempts[kind] = (failedAttempts[kind] ?? 0) + 1;
+        failed_attempts[kind] = (failed_attempts[kind] ?? 0) + 1;
     }
     const outcomes = [...rounds.values()];
     return {
         runs: outcomes.length,
-        passedFirstAttempt:
+        passed_first_attempt:
             outcomes.filter((round) =>
                 round.some((attempt) =>
                     attempt.attempt === 1 && attempt.status === "passed"
                 )
             ).length,
-        passedAfterRetries:
+        passed_after_retries:
             outcomes.filter((round) =>
                 round.some((attempt) => attempt.status === "passed")
             ).length,
-        failedAttempts,
+        failed_attempts,
     };
 }
 
@@ -55,47 +55,48 @@ const metrics: {
     {
         label: "startup ms",
         digits: 0,
-        read: (attempt) => attempt.startup!.usablePageMs,
+        read: (attempt) => attempt.startup!.usable_page_ms,
     },
     {
         label: "action ms",
         digits: 0,
-        read: (attempt) => sum(attempt.steps.map((step) => step.actionMs)),
+        read: (attempt) => sum(attempt.steps.map((step) => step.action_ms)),
     },
     {
         label: "readiness ms",
         digits: 0,
-        read: (attempt) => sum(attempt.steps.map((step) => step.readinessMs)),
+        read: (attempt) => sum(attempt.steps.map((step) => step.readiness_ms)),
     },
     {
         label: "observation ms",
         digits: 0,
-        read: (attempt) => sum(attempt.steps.map((step) => step.observationMs)),
+        read: (attempt) =>
+            sum(attempt.steps.map((step) => step.observation_ms)),
     },
     {
         label: "observation tokens",
         digits: 0,
         read: (attempt) =>
-            sum(attempt.steps.map((step) => step.observationTokens)),
+            sum(attempt.steps.map((step) => step.observation_tokens)),
     },
     {
         label: "peak RSS sum MiB",
         digits: 0,
-        read: (attempt) => attempt.peakRssSumBytes / 2 ** 20,
+        read: (attempt) => attempt.peak_rss_sum_bytes / 2 ** 20,
     },
     {
         label: "active CPU s",
         digits: 2,
         read: (attempt) =>
-            sum(attempt.steps.map((step) => step.activeCpuSeconds)),
+            sum(attempt.steps.map((step) => step.active_cpu_seconds)),
     },
     {
         label: "think CPU s",
         digits: 2,
         read: (attempt) =>
-            sum(attempt.steps.map((step) => step.thinkCpuSeconds)),
+            sum(attempt.steps.map((step) => step.think_cpu_seconds)),
     },
-    { label: "total CPU s", digits: 2, read: (attempt) => attempt.cpuSeconds },
+    { label: "total CPU s", digits: 2, read: (attempt) => attempt.cpu_seconds },
 ];
 
 function table(header: string[], rows: string[][]): string {
@@ -114,8 +115,8 @@ function formatSpread(value: Spread | null, digits: number): string {
 
 export function renderSummary(
     attempts: AttemptRecord[],
-    armNames: string[],
-    taskIds: string[],
+    arm_names: string[],
+    task_ids: string[],
 ): string {
     const select = (arm: string, task: string) =>
         attempts.filter((attempt) =>
@@ -123,7 +124,7 @@ export function renderSummary(
         );
     const passing = (arm: string, task: string) =>
         select(arm, task).filter((attempt) => attempt.status === "passed");
-    const baseline = armNames[0]!;
+    const baseline = arm_names[0]!;
     const sections: string[] = [];
 
     sections.push(
@@ -137,18 +138,18 @@ export function renderSummary(
                     "passed after retries",
                     "failed attempts by kind",
                 ],
-                taskIds.flatMap((task) =>
-                    armNames.map((arm) => {
+                task_ids.flatMap((task) =>
+                    arm_names.map((arm) => {
                         const result = reliability(select(arm, task));
-                        const failures = Object.entries(result.failedAttempts)
+                        const failures = Object.entries(result.failed_attempts)
                             .map(([kind, count]) => `${kind} ${count}`)
                             .join(", ");
                         return [
                             task,
                             arm,
                             String(result.runs),
-                            String(result.passedFirstAttempt),
-                            String(result.passedAfterRetries),
+                            String(result.passed_first_attempt),
+                            String(result.passed_after_retries),
                             failures || "none",
                         ];
                     })
@@ -158,13 +159,13 @@ export function renderSummary(
 
     sections.push(
         "## Cost per task\n\nMedian (min–max) over passing attempts. Step timings are summed over the task's steps.\n\n" +
-            taskIds.map((task) =>
+            task_ids.map((task) =>
                 `### ${task}\n\n` +
                 table(
-                    ["metric", ...armNames],
+                    ["metric", ...arm_names],
                     metrics.map((metric) => [
                         metric.label,
-                        ...armNames.map((arm) =>
+                        ...arm_names.map((arm) =>
                             formatSpread(
                                 spread(passing(arm, task).map(metric.read)),
                                 metric.digits,
@@ -175,20 +176,20 @@ export function renderSummary(
             ).join("\n\n"),
     );
 
-    if (armNames.length > 1) {
+    if (arm_names.length > 1) {
         sections.push(
             `## Ratio to ${baseline}\n\nRatio of medians; below 1.00 is cheaper than ${baseline}.\n\n` +
-                taskIds.map((task) =>
+                task_ids.map((task) =>
                     `### ${task}\n\n` +
                     table(
-                        ["metric", ...armNames.slice(1)],
+                        ["metric", ...arm_names.slice(1)],
                         metrics.map((metric) => {
                             const reference = spread(
                                 passing(baseline, task).map(metric.read),
                             );
                             return [
                                 metric.label,
-                                ...armNames.slice(1).map((arm) => {
+                                ...arm_names.slice(1).map((arm) => {
                                     const value = spread(
                                         passing(arm, task).map(metric.read),
                                     );
