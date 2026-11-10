@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
 
-import type Anthropic from "@anthropic-ai/sdk";
-
 import { toolOutput } from "../src/agent.ts";
 import { agentdProvider } from "../src/agentd_sandbox.ts";
 import { type AttemptRecord, runAttempt } from "../src/attempt.ts";
-import { type Model, model_id } from "../src/model.ts";
+import type { Model, ModelTurn } from "../src/model.ts";
 import type { SandboxProvider } from "../src/sandbox.ts";
 import { failureCounts } from "../src/summary.ts";
 import { loadTasks, type Task } from "../src/tasks.ts";
@@ -14,53 +12,45 @@ const sandbox = agentdProvider({ binary: "./target/debug/agentd" });
 const limits = { max_turns: 10, command_timeout_ms: 20_000 };
 const tasks = await loadTasks();
 
-function reply(
-    content: Anthropic.ContentBlock[],
-    stop_reason: Anthropic.Message["stop_reason"],
-): Anthropic.Message {
+function turn(
+    stop: ModelTurn["stop"],
+    commands: string[] = [],
+    served_by = "scripted",
+): ModelTurn {
     return {
-        id: "msg_scripted",
-        type: "message",
-        role: "assistant",
-        model: model_id,
-        content,
-        stop_reason,
-        stop_sequence: null,
-        usage: { input_tokens: 100, output_tokens: 10 },
-    } as Anthropic.Message;
-}
-
-function bash(id: string, command: string): Anthropic.ContentBlock {
-    return {
-        type: "tool_use",
-        id,
-        name: "bash",
-        input: { command },
-    } as Anthropic.ContentBlock;
-}
-
-const done = reply(
-    [{ type: "text", text: "Done." } as Anthropic.ContentBlock],
-    "end_turn",
-);
-
-function scriptedModel(replies: Anthropic.Message[]): Model {
-    const queue = [...replies];
-    return {
-        describe: () => ({ model: "scripted" }),
-        respond: () => Promise.resolve(queue.shift() ?? done),
+        stop,
+        calls: commands.map((command, index) => ({
+            id: `call_${index}`,
+            command,
+        })),
+        served_by,
+        input_tokens: 100,
+        cached_input_tokens: 0,
+        output_tokens: 10,
     };
 }
 
-function writeSolution(task: Task): Anthropic.Message {
-    return reply(
-        Object.entries(task.solution).map(([path, content], index) =>
-            bash(
-                `call_${index}`,
-                `cat > ${path} <<'BENCH_EOF'\n${content}\nBENCH_EOF`,
-            )
+function scriptedModel(turns: ModelTurn[]): Model {
+    return {
+        describe: () => ({ model: "scripted" }),
+        isOutage: () => false,
+        begin() {
+            const queue = [...turns];
+            return {
+                transcript: () => [],
+                respond: () =>
+                    Promise.resolve(queue.shift() ?? turn("finished")),
+            };
+        },
+    };
+}
+
+function writeSolution(task: Task): ModelTurn {
+    return turn(
+        "tool_calls",
+        Object.entries(task.solution).map(([path, content]) =>
+            `cat > ${path} <<'BENCH_EOF'\n${content}\nBENCH_EOF`
         ),
-        "tool_use",
     );
 }
 
@@ -109,11 +99,9 @@ for (const task of tasks) {
 
 Deno.test("a model that never stops calling tools fails on the turn limit, and a hung command is killed", async () => {
     const task = tasks[0]!;
-    const looping: Model = {
-        describe: () => ({}),
-        respond: () =>
-            Promise.resolve(reply([bash("call", "true")], "tool_use")),
-    };
+    const looping = scriptedModel(
+        Array.from({ length: 50 }, () => turn("tool_calls", ["true"])),
+    );
     const exhausted = await attempt(task, looping);
     assert.equal(exhausted.failure?.kind, "turn_limit");
     assert.equal(exhausted.agent?.turns, limits.max_turns);
@@ -123,7 +111,7 @@ Deno.test("a model that never stops calling tools fails on the turn limit, and a
         task,
         round: 1,
         position_in_round: 0,
-        model: scriptedModel([reply([bash("call", "sleep 30")], "tool_use")]),
+        model: scriptedModel([turn("tool_calls", ["sleep 30"])]),
         limits: { max_turns: 3, command_timeout_ms: 300 },
         transcript_path: await Deno.makeTempFile(),
     });
@@ -133,7 +121,7 @@ Deno.test("a model that never stops calling tools fails on the turn limit, and a
 
 Deno.test("a refusal counts against the model and a sandbox that cannot start counts against the sandbox", async () => {
     const task = tasks[0]!;
-    const refused = await attempt(task, scriptedModel([reply([], "refusal")]));
+    const refused = await attempt(task, scriptedModel([turn("refusal")]));
     assert.equal(refused.failure?.kind, "model");
 
     const broken = await attempt(
@@ -160,4 +148,15 @@ Deno.test("long command output keeps its head, tail and exit status and says how
     assert.ok(output.startsWith("aaaa"));
     assert.ok(output.includes("[10000 characters of output omitted]"));
     assert.ok(output.endsWith("bbbb\nexit code 3"));
+});
+
+Deno.test("a run served by more than one model counts against the model", async () => {
+    const switched = await attempt(
+        tasks[0]!,
+        scriptedModel([
+            turn("tool_calls", ["true"], "model-a"),
+            turn("finished", [], "model-b"),
+        ]),
+    );
+    assert.equal(switched.failure?.kind, "model");
 });

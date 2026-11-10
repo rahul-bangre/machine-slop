@@ -3,7 +3,8 @@
   "specifiers": {
     "npm:@anthropic-ai/sdk@1.6.0": "1.6.0",
     "npm:e2b@2.63.0": "2.63.0",
-    "npm:gpt-tokenizer@4.1.0": "4.1.0"
+    "npm:gpt-tokenizer@4.1.0": "4.1.0",
+    "npm:openai@7.53.0": "7.53.0"
   },
   "npm": {
     "@anthropic-ai/sdk@1.6.0": {
@@ -126,6 +127,9 @@
         "minipass"
       ]
     },
+    "openai@7.53.0": {
+      "integrity": "sha512-PXiIZraFYMb2QYgTtWqDA16Oszj4fWRZNn7qLIAddmiJxM5uQPWBFaxp9O8MhLfTUOQ+iQsnFSRJhLPecsGovQ=="
+    },
     "openapi-fetch@0.17.0": {
       "integrity": "sha512-PsbZR1wAPcG91eEthKhN+Zn92FMHxv+/faECIwjXdxfTODGSGegYv0sc1Olz+HYPvKOuoXfp+0pA2XVt2cI0Ig==",
       "dependencies": [
@@ -177,7 +181,8 @@
       "bench/agent": {
         "dependencies": [
           "npm:@anthropic-ai/sdk@1.6.0",
-          "npm:e2b@2.63.0"
+          "npm:e2b@2.63.0",
+          "npm:openai@7.53.0"
         ]
       },
       "bench/browser": {

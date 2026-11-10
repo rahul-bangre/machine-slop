@@ -6,7 +6,10 @@ import type { Limits } from "./agent.ts";
 import { agentdProvider } from "./agentd_sandbox.ts";
 import { type AttemptRecord, runAttempt } from "./attempt.ts";
 import { e2bProvider } from "./e2b_sandbox.ts";
-import { claudeModel } from "./model.ts";
+import { claudeCliModel } from "./claude_cli_model.ts";
+import { claudeModel, default_claude_model } from "./claude_model.ts";
+import type { Model } from "./model.ts";
+import { openaiModel } from "./openai_model.ts";
 import type { SandboxProvider } from "./sandbox.ts";
 import { renderSummary } from "./summary.ts";
 import { loadTasks } from "./tasks.ts";
@@ -14,6 +17,10 @@ import { loadTasks } from "./tasks.ts";
 const { values: flags } = parseArgs({
     options: {
         sandboxes: { type: "string", default: "agentd" },
+        model: {
+            type: "string",
+            default: `claude-cli:${default_claude_model}`,
+        },
         tasks: { type: "string" },
         rounds: { type: "string", default: "3" },
         "max-turns": { type: "string", default: "30" },
@@ -51,6 +58,26 @@ function provider(name: string): SandboxProvider {
     fail(`unknown sandbox "${name}"; choose agentd or e2b`);
 }
 
+function pinnedModel(spec: string): Model {
+    const separator = spec.indexOf(":");
+    const vendor = spec.slice(0, separator);
+    const model_id = spec.slice(separator + 1);
+    if (separator < 1 || model_id === "") {
+        fail("--model takes <provider>:<model id>, such as openai:<model id>");
+    }
+    if (vendor === "claude-cli") return claudeCliModel(model_id);
+    if (vendor === "anthropic") return claudeModel(model_id);
+    if (vendor === "openai") {
+        if (!Deno.env.get("OPENAI_API_KEY")) {
+            fail("an openai model needs OPENAI_API_KEY");
+        }
+        return openaiModel(model_id);
+    }
+    fail(
+        `unknown model provider "${vendor}"; choose claude-cli, anthropic or openai`,
+    );
+}
+
 function settingsFromFlags(): { rounds: number; limits: Limits } {
     try {
         return {
@@ -78,7 +105,7 @@ const tasks = flags.tasks
         all_tasks.find((task) => task.id === id) ?? fail(`unknown task "${id}"`)
     )
     : all_tasks;
-const model = claudeModel();
+const model = pinnedModel(flags.model);
 
 const started_at = new Date();
 const output_directory = flags.out ??

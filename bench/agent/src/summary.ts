@@ -52,9 +52,12 @@ const metrics: {
     {
         label: "input tokens",
         digits: 0,
-        read: (attempt) =>
-            attempt.agent.input_tokens + attempt.agent.cache_read_input_tokens +
-            attempt.agent.cache_creation_input_tokens,
+        read: (attempt) => attempt.agent.input_tokens,
+    },
+    {
+        label: "of which cached",
+        digits: 0,
+        read: (attempt) => attempt.agent.cached_input_tokens,
     },
     {
         label: "output tokens",

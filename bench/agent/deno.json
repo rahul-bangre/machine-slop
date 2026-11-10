@@ -1,6 +1,7 @@
 {
   "imports": {
     "@anthropic-ai/sdk": "npm:@anthropic-ai/sdk@1.6.0",
-    "e2b": "npm:e2b@2.63.0"
+    "e2b": "npm:e2b@2.63.0",
+    "openai": "npm:openai@7.53.0"
   }
 }

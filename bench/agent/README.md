@@ -4,13 +4,13 @@ Runs the same coding agent on the same tasks in different sandboxes, to compare
 what each sandbox costs an agent end to end.
 
 ```sh
-export ANTHROPIC_API_KEY=...
 make build
 deno task bench:agent --agentd-binary ./target/release/agentd
 
 export E2B_API_KEY=...
 deno task bench:agent --sandboxes agentd,e2b --rounds 3
 deno task bench:agent --agentd-url http://127.0.0.1:3001 --tasks todo-cli
+deno task bench:agent --model openai:<model id>
 ```
 
 Results land in `bench-results/agent-<timestamp>/`:
@@ -20,8 +20,8 @@ Results land in `bench-results/agent-<timestamp>/`:
 - `transcripts/`: the full conversation of every attempt
 - `summary.md`: pass counts and cost per task, per sandbox
 
-Every attempt calls the model, so a run costs money: one agent session per task,
-per sandbox, per round.
+Every attempt calls the model: one agent session per task, per sandbox, per
+round. That is API spend, or subscription usage with `claude-cli`.
 
 ## Sandboxes
 
@@ -40,10 +40,26 @@ comparable between the two. Command latency is.
 
 ## Model
 
-The model is fixed in `src/model.ts`: one model id, one effort level, one system
-prompt, and a single bash tool. Each command runs in a fresh shell in the task
-directory. Refusal fallback is off, because a fallback would change the model
-mid-run; a response from any other model fails the attempt.
+`--model <provider>:<model id>` pins one model for the whole run. The default is
+`claude-cli:claude-opus-5-5`.
+
+- `claude-cli` runs the `claude` command headless, so it uses that CLI's login
+  and needs no API key. The CLI gets no tools: each reply is schema-validated
+  JSON listing the commands to run, and the next message carries their output.
+  The CLI adds its own scaffolding tokens, may make small side calls on another
+  model, and saves each session in its history.
+- `anthropic` calls the Messages API with a bash tool. It needs
+  `ANTHROPIC_API_KEY`. Refusal fallback is off, because a fallback would change
+  the model mid-run.
+- `openai` calls Chat Completions with a bash function tool. It needs
+  `OPENAI_API_KEY`.
+
+All three share the same sandbox rules in the system prompt, and each command
+runs in a fresh shell in the task directory. An attempt whose turns are served
+by more than one model fails.
+
+Results from different providers are not comparable with each other: the tool
+protocol and token accounting differ. Compare sandboxes under one model.
 
 The model is not deterministic. Turn counts and token use vary between attempts,
 so compare sandboxes over several rounds.

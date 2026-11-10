@@ -1,6 +1,4 @@
-import type Anthropic from "@anthropic-ai/sdk";
-
-import { isModelOutage, type Model, model_id } from "./model.ts";
+import type { Model, ModelTurn, ToolResult } from "./model.ts";
 import { type CommandResult, type Sandbox, SandboxError } from "./sandbox.ts";
 
 export type Limits = { max_turns: number; command_timeout_ms: number };
@@ -12,19 +10,17 @@ export type CommandRecord = {
     output_chars: number;
 };
 
-export type AgentStop = "finished" | "turn_limit" | "refusal" | "max_tokens";
-
 export type AgentRun = {
-    stop: AgentStop;
+    stop: "finished" | "turn_limit" | "refusal" | "max_tokens";
+    served_by: string | null;
     turns: number;
     model_ms: number;
     sandbox_ms: number;
     commands: CommandRecord[];
     input_tokens: number;
-    cache_read_input_tokens: number;
-    cache_creation_input_tokens: number;
+    cached_input_tokens: number;
     output_tokens: number;
-    transcript: Anthropic.MessageParam[];
+    transcript: unknown;
 };
 
 export class ModelError extends Error {
@@ -57,89 +53,70 @@ export function toolOutput(result: CommandResult): string {
     ].join("\n");
 }
 
-function bashCommand(input: unknown): string | null {
-    if (typeof input !== "object" || input === null) return null;
-    const { command } = input as { command?: unknown };
-    return typeof command === "string" ? command : null;
-}
-
 export async function runAgent(
     model: Model,
     sandbox: Sandbox,
     prompt: string,
     limits: Limits,
 ): Promise<AgentRun> {
+    const conversation = model.begin(prompt);
     const run: AgentRun = {
         stop: "turn_limit",
+        served_by: null,
         turns: 0,
         model_ms: 0,
         sandbox_ms: 0,
         commands: [],
         input_tokens: 0,
-        cache_read_input_tokens: 0,
-        cache_creation_input_tokens: 0,
+        cached_input_tokens: 0,
         output_tokens: 0,
-        transcript: [{ role: "user", content: prompt }],
+        transcript: null,
     };
+    let results: ToolResult[] = [];
 
     while (run.turns < limits.max_turns) {
         const asked_at = performance.now();
-        let response: Anthropic.Message;
+        let turn: ModelTurn;
         try {
-            response = await model.respond(run.transcript);
+            turn = await conversation.respond(results);
         } catch (error) {
-            if (!isModelOutage(error)) throw error;
+            if (!model.isOutage(error)) throw error;
             throw new ModelError((error as Error).message, { cause: error });
         }
         run.model_ms += performance.now() - asked_at;
         run.turns++;
-        if (response.model !== model_id) {
+        run.transcript = conversation.transcript();
+        run.input_tokens += turn.input_tokens;
+        run.cached_input_tokens += turn.cached_input_tokens;
+        run.output_tokens += turn.output_tokens;
+        run.served_by ??= turn.served_by;
+        if (turn.served_by !== run.served_by) {
             throw new ModelError(
-                `response came from ${response.model}, pinned ${model_id}`,
+                `model changed mid-run from ${run.served_by} to ${turn.served_by}`,
             );
         }
-        run.input_tokens += response.usage.input_tokens;
-        run.output_tokens += response.usage.output_tokens;
-        run.cache_read_input_tokens += response.usage.cache_read_input_tokens ??
-            0;
-        run.cache_creation_input_tokens +=
-            response.usage.cache_creation_input_tokens ?? 0;
-        run.transcript.push({ role: "assistant", content: response.content });
-
-        if (response.stop_reason === "refusal") {
-            run.stop = "refusal";
-            return run;
-        }
-        if (response.stop_reason === "max_tokens") {
-            run.stop = "max_tokens";
-            return run;
-        }
-        const calls = response.content.filter(
-            (block): block is Anthropic.ToolUseBlock =>
-                block.type === "tool_use",
-        );
-        if (calls.length === 0) {
-            run.stop = "finished";
+        if (turn.stop !== "tool_calls") {
+            run.stop = turn.stop;
             return run;
         }
 
-        const results: Anthropic.ToolResultBlockParam[] = [];
-        for (const call of calls) {
-            const command = bashCommand(call.input);
-            if (command === null) {
+        results = [];
+        for (const call of turn.calls) {
+            if (call.command === null) {
                 results.push({
-                    type: "tool_result",
-                    tool_use_id: call.id,
+                    id: call.id,
                     is_error: true,
-                    content:
-                        "Each command runs in a fresh shell already; pass a command string.",
+                    output: "Pass a single command string.",
                 });
                 continue;
             }
             const started_at = performance.now();
             let result: CommandResult;
             try {
-                result = await sandbox.run(command, limits.command_timeout_ms);
+                result = await sandbox.run(
+                    call.command,
+                    limits.command_timeout_ms,
+                );
             } catch (error) {
                 throw new SandboxError(
                     `command failed to run: ${
@@ -150,20 +127,15 @@ export async function runAgent(
             }
             const ms = performance.now() - started_at;
             run.sandbox_ms += ms;
-            const content = toolOutput(result);
+            const output = toolOutput(result);
             run.commands.push({
                 ms,
                 exit_code: result.exit_code,
                 timed_out: result.timed_out,
-                output_chars: content.length,
+                output_chars: output.length,
             });
-            results.push({
-                type: "tool_result",
-                tool_use_id: call.id,
-                content,
-            });
+            results.push({ id: call.id, is_error: false, output });
         }
-        run.transcript.push({ role: "user", content: results });
     }
     return run;
 }
