@@ -20,7 +20,7 @@ use crate::{
     contract::{MachineInfo, MachineState},
     egress::EgressPolicy,
     files,
-    firecracker::Vm,
+    firecracker::{FIRECRACKER, Jail, Launch, ROOTFS, SAVED_STATE, SCRATCH, Vm},
     machines::{Admission, MachineError},
 };
 
@@ -33,14 +33,11 @@ const RECORD: &str = "machine.json";
 const CHECKPOINT: &str = "checkpoint";
 const CHECKPOINT_STAGING: &str = "checkpoint.tmp";
 const CHECKPOINT_WITHDRAWN: &str = "checkpoint.withdrawn";
-const RESTORED: &str = "restored";
-const FIRECRACKER: &str = "firecracker";
-const ROOTFS: &str = "rootfs.ext4";
-const SAVED_STATE: [&str; 2] = ["vmstate", "memory"];
-const SCRATCH: &str = "scratch.ext4";
+const CHECKPOINT_RETIRED: &str = "checkpoint.retired";
 
 #[derive(Clone, Debug)]
 pub struct Image {
+    jailer: PathBuf,
     firecracker: PathBuf,
     kernel: PathBuf,
     rootfs: PathBuf,
@@ -59,10 +56,15 @@ impl Image {
             }
         };
         Ok(Self {
+            jailer: file("jailer")?,
             firecracker: file("firecracker")?,
             kernel: file("vmlinux")?,
             rootfs: file("rootfs.ext4")?,
         })
+    }
+
+    pub(crate) fn jailer(&self) -> PathBuf {
+        self.jailer.clone()
     }
 }
 
@@ -129,10 +131,12 @@ pub struct Booted {
 }
 
 impl Booted {
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_image(
         id: String,
         dir: PathBuf,
         image: &Image,
+        jail: &Jail,
         vcpus: u8,
         memory_mib: u32,
         egress: EgressPolicy,
@@ -144,9 +148,15 @@ impl Booted {
             files::link_immutable(&image.firecracker, &dir.join(FIRECRACKER)).await?;
             files::link_immutable(&image.rootfs, &dir.join(ROOTFS)).await?;
             create_scratch_disk(&dir.join(SCRATCH)).await?;
-            let config = firecracker_config(image, vcpus, memory_mib).to_string();
-            tokio::fs::write(dir.join("config.json"), config).await?;
-            Vm::boot(&dir, admission, egress.subscribe())
+            let launch = Launch {
+                dir: &dir,
+                jail,
+                admission,
+                egress: egress.subscribe(),
+                vcpus,
+                memory_mib,
+            };
+            Vm::boot(launch, &image.kernel, firecracker_config(vcpus, memory_mib)).await
         };
         let vm = boot.await;
         Self::once_ready(id, dir, vm, vcpus, memory_mib, egress).await
@@ -158,6 +168,7 @@ impl Booted {
         dir: PathBuf,
         saved: &Path,
         disk: Disk,
+        jail: &Jail,
         vcpus: u8,
         memory_mib: u32,
         egress: EgressPolicy,
@@ -169,15 +180,19 @@ impl Booted {
             for name in [FIRECRACKER, ROOTFS] {
                 files::link_immutable(&saved.join(name), &dir.join(name)).await?;
             }
-            tokio::fs::create_dir(dir.join(RESTORED)).await?;
-            for name in SAVED_STATE {
-                files::link_immutable(&saved.join(name), &dir.join(RESTORED).join(name)).await?;
-            }
             match disk {
                 Disk::Copy => files::copy_disk(&saved.join(SCRATCH), &dir.join(SCRATCH)).await?,
                 Disk::Take => tokio::fs::rename(saved.join(SCRATCH), dir.join(SCRATCH)).await?,
             }
-            let vm = restore(&dir, RESTORED, admission, egress.subscribe()).await?;
+            let launch = Launch {
+                dir: &dir,
+                jail,
+                admission,
+                egress: egress.subscribe(),
+                vcpus,
+                memory_mib,
+            };
+            let vm = Vm::restore(launch, saved).await?;
             if let Err(error) = vm.resume().await {
                 vm.kill().await;
                 return Err(error);
@@ -337,7 +352,7 @@ impl Machine {
         }
         let record: Record = files::read_record(&dir, RECORD).await?;
         let egress = EgressPolicy::parse(&record.allowed_hosts).map_err(io::Error::other)?;
-        for stale in [CHECKPOINT_STAGING, CHECKPOINT_WITHDRAWN, RESTORED] {
+        for stale in [CHECKPOINT_STAGING, CHECKPOINT_WITHDRAWN, CHECKPOINT_RETIRED] {
             files::remove_dir_if_present(&dir.join(stale)).await?;
         }
         let machine = Self {
@@ -521,7 +536,7 @@ impl Exclusive<'_> {
         }
         self.set(Phase::Paused);
         vm.kill().await;
-        files::remove_dir_logged(&self.dir.join(RESTORED)).await;
+        files::remove_dir_logged(&self.dir.join(CHECKPOINT_RETIRED)).await;
         Ok(())
     }
 
@@ -566,11 +581,19 @@ impl Exclusive<'_> {
         Ok(matches!(self.live()?, Live::Paused))
     }
 
-    pub async fn resume(&self, admission: Admission) -> Result<(), MachineError> {
+    pub async fn resume(&self, jail: &Jail, admission: Admission) -> Result<(), MachineError> {
         let Live::Paused = self.live()? else {
             return Ok(());
         };
-        let vm = match restore(&self.dir, CHECKPOINT, admission, self.egress.subscribe()).await {
+        let launch = Launch {
+            dir: &self.dir,
+            jail,
+            admission,
+            egress: self.egress.subscribe(),
+            vcpus: self.vcpus,
+            memory_mib: self.memory_mib,
+        };
+        let vm = match Vm::restore(launch, &self.dir.join(CHECKPOINT)).await {
             Ok(vm) => vm,
             Err(error) => return Err(self.failed("resume", error)),
         };
@@ -579,7 +602,7 @@ impl Exclusive<'_> {
             let reinstated = async {
                 let checkpoint = self.dir.join(CHECKPOINT);
                 if !tokio::fs::try_exists(&checkpoint).await? {
-                    tokio::fs::rename(self.dir.join(RESTORED), checkpoint).await?;
+                    tokio::fs::rename(self.dir.join(CHECKPOINT_RETIRED), checkpoint).await?;
                 }
                 files::sync(&self.dir).await
             };
@@ -606,8 +629,8 @@ impl Exclusive<'_> {
     }
 
     async fn retire_checkpoint(&self) -> io::Result<()> {
-        files::remove_dir_if_present(&self.dir.join(RESTORED)).await?;
-        tokio::fs::rename(self.dir.join(CHECKPOINT), self.dir.join(RESTORED)).await?;
+        files::remove_dir_if_present(&self.dir.join(CHECKPOINT_RETIRED)).await?;
+        tokio::fs::rename(self.dir.join(CHECKPOINT), self.dir.join(CHECKPOINT_RETIRED)).await?;
         files::sync(&self.dir).await
     }
 
@@ -706,20 +729,6 @@ impl Exclusive<'_> {
     }
 }
 
-async fn restore(
-    dir: &Path,
-    saved: &str,
-    admission: Admission,
-    egress: watch::Receiver<EgressPolicy>,
-) -> io::Result<Vm> {
-    let vm = Vm::unconfigured(dir, admission, egress)?;
-    if let Err(error) = vm.load(saved).await {
-        vm.kill().await;
-        return Err(error);
-    }
-    Ok(vm)
-}
-
 async fn wait_until_ready(vm: &Vm, dir: &Path) -> Result<(), BootError> {
     let deadline = Instant::now() + BOOT_TIMEOUT;
     loop {
@@ -783,10 +792,10 @@ async fn create_scratch_disk(path: &Path) -> io::Result<()> {
     }
 }
 
-fn firecracker_config(image: &Image, vcpus: u8, memory_mib: u32) -> serde_json::Value {
+fn firecracker_config(vcpus: u8, memory_mib: u32) -> serde_json::Value {
     json!({
         "boot-source": {
-            "kernel_image_path": image.kernel,
+            "kernel_image_path": "vmlinux",
             "boot_args": "console=ttyS0 reboot=k panic=1 quiet loglevel=1 ro init=/sbin/slop-init",
         },
         "drives": [

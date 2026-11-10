@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     io,
     ops::ControlFlow,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
@@ -18,7 +19,7 @@ use crate::{
     },
     egress::{EgressPolicy, MAX_MACHINE_TUNNEL_FILES},
     files,
-    firecracker::kill_orphans,
+    firecracker::Jail,
     machine::{Activity, BootError, Booted, Disk, Image, Machine, MachineSpec, MachineUse},
 };
 
@@ -29,7 +30,7 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u32 = 600;
 const MEMORY_MIB_RANGE: std::ops::RangeInclusive<u32> = 128..=32768;
 const IDLE_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u32> = 1..=86400;
 const OPEN_FILES_OUTSIDE_EGRESS: u64 = 4096;
-const MACHINE_OVERHEAD_MIB: u32 = 64;
+pub(crate) const MACHINE_OVERHEAD_MIB: u32 = 64;
 const HOST_RESERVE_MIB: u32 = 512;
 const SNAPSHOT_RECORD: &str = "snapshot.json";
 
@@ -85,16 +86,43 @@ pub struct Limits {
     pub running_vms: usize,
     pub memory_mib: u32,
     pub spare_machines: usize,
+    pub first_jail_uid: u32,
 }
 
 pub(crate) struct Admission {
     _slot: OwnedSemaphorePermit,
     _memory: OwnedSemaphorePermit,
+    seat: Seat,
+}
+
+impl Admission {
+    pub(crate) fn uid(&self) -> u32 {
+        self.seat.uid
+    }
+}
+
+struct Seat {
+    uid: u32,
+    free: Arc<std::sync::Mutex<Vec<u32>>>,
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        lock(&self.free).push(self.uid);
+    }
+}
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub struct Machines {
     _state_lock: std::fs::File,
     image: Image,
+    jail: Jail,
+    seats: Arc<std::sync::Mutex<Vec<u32>>>,
     machines_dir: PathBuf,
     snapshots_dir: PathBuf,
     limits: Limits,
@@ -165,10 +193,12 @@ impl Machines {
         let snapshots_dir = state_dir.join("snapshots");
         for dir in [&machines_dir, &snapshots_dir] {
             tokio::fs::create_dir_all(dir).await?;
+            tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
         }
         let machines_dir = tokio::fs::canonicalize(machines_dir).await?;
         let snapshots_dir = tokio::fs::canonicalize(snapshots_dir).await?;
-        kill_orphans(&machines_dir)?;
+        let jail = Jail::new(image.jailer(), &state_dir)?;
+        jail.kill_orphans()?;
         let mut state = State::default();
         for (id, dir) in subdirectories(&machines_dir).await? {
             match Machine::recover(id.clone(), dir.clone()).await {
@@ -211,9 +241,16 @@ impl Machines {
             snapshots = state.snapshots.len(),
             "state recovered"
         );
+        let seats = (0..limits.running_vms)
+            .rev()
+            .map(|seat| u32::try_from(seat).map(|seat| limits.first_jail_uid.saturating_add(seat)))
+            .collect::<Result<_, _>>()
+            .map_err(io::Error::other)?;
         let machines = Arc::new(Self {
             _state_lock: state_lock,
             image,
+            jail,
+            seats: Arc::new(std::sync::Mutex::new(seats)),
             machines_dir,
             snapshots_dir,
             slots: Arc::new(Semaphore::new(limits.running_vms)),
@@ -397,9 +434,18 @@ impl Machines {
         egress: EgressPolicy,
     ) -> Result<Booted, MachineError> {
         let (id, dir) = self.new_machine_dir();
-        Booted::from_image(id, dir, &self.image, vcpus, memory_mib, egress, admission)
-            .await
-            .map_err(MachineError::Boot)
+        Booted::from_image(
+            id,
+            dir,
+            &self.image,
+            &self.jail,
+            vcpus,
+            memory_mib,
+            egress,
+            admission,
+        )
+        .await
+        .map_err(MachineError::Boot)
     }
 
     async fn restore(
@@ -421,9 +467,11 @@ impl Machines {
     ) -> Result<Booted, MachineError> {
         let (id, dir) = self.new_machine_dir();
         let (vcpus, memory_mib, egress) = (spec.vcpus, spec.memory_mib, spec.egress.clone());
-        Booted::from_saved(id, dir, saved, disk, vcpus, memory_mib, egress, admission)
-            .await
-            .map_err(MachineError::Boot)
+        Booted::from_saved(
+            id, dir, saved, disk, &self.jail, vcpus, memory_mib, egress, admission,
+        )
+        .await
+        .map_err(MachineError::Boot)
     }
 
     async fn admission(&self, memory_mib: u32) -> Result<Admission, MachineError> {
@@ -471,7 +519,7 @@ impl Machines {
         if available_memory_mib()?.saturating_sub(HOST_RESERVE_MIB) < required_mib {
             return Ok(None);
         }
-        Ok(reserve(&self.slots, &self.memory, required_mib).ok())
+        Ok(reserve(&self.slots, &self.memory, &self.seats, required_mib).ok())
     }
 
     async fn admit(
@@ -647,7 +695,7 @@ impl Machines {
             let resumed = async {
                 if machine.is_paused()? {
                     let admission = machines.admission(machine.spec().memory_mib).await?;
-                    machine.resume(admission).await?;
+                    machine.resume(&machines.jail, admission).await?;
                 }
                 Ok(machine.info())
             };
@@ -836,6 +884,7 @@ impl Machines {
             .acquire_many_owned(u32::try_from(self.limits.running_vms).unwrap_or(u32::MAX))
             .await;
         drop(every_vm_has_exited);
+        self.jail.release_cgroup();
     }
 
     pub fn create_counts(&self) -> (u64, u64) {
@@ -931,6 +980,7 @@ fn log_outcome<T, E: std::fmt::Display>(
 fn reserve(
     slots: &Arc<Semaphore>,
     memory: &Arc<Semaphore>,
+    seats: &Arc<std::sync::Mutex<Vec<u32>>>,
     required_mib: u32,
 ) -> Result<Admission, MachineError> {
     let slot = slots
@@ -941,9 +991,16 @@ fn reserve(
         .clone()
         .try_acquire_many_owned(required_mib)
         .map_err(|_| MachineError::Capacity)?;
+    let uid = lock(seats)
+        .pop()
+        .ok_or_else(|| MachineError::Io(io::Error::other("every jail uid is in use")))?;
     Ok(Admission {
         _slot: slot,
         _memory: memory,
+        seat: Seat {
+            uid,
+            free: seats.clone(),
+        },
     })
 }
 
@@ -999,16 +1056,19 @@ mod tests {
     fn admission_reserves_memory_atomically_and_releases_failed_attempts() {
         let slots = Arc::new(Semaphore::new(2));
         let memory = Arc::new(Semaphore::new(1024));
-        let first = reserve(&slots, &memory, 768).unwrap();
+        let seats = Arc::new(std::sync::Mutex::new(vec![7, 8]));
+        let first = reserve(&slots, &memory, &seats, 768).unwrap();
         assert!(matches!(
-            reserve(&slots, &memory, 512),
+            reserve(&slots, &memory, &seats, 512),
             Err(MachineError::Capacity)
         ));
         assert_eq!(slots.available_permits(), 1);
         assert_eq!(memory.available_permits(), 256);
+        assert_eq!(*lock(&seats), vec![7]);
         drop(first);
-        let _second = reserve(&slots, &memory, 1024).unwrap();
+        let second = reserve(&slots, &memory, &seats, 1024).unwrap();
         assert_eq!(memory.available_permits(), 0);
+        assert_eq!(second.uid(), 8);
     }
 
     #[test]

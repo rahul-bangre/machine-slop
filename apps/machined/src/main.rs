@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 
 const MAX_RUNNING_VMS: usize = 16;
 const DEFAULT_SPARE_MACHINES: usize = 2;
+const DEFAULT_FIRST_JAIL_UID: u32 = 1_000_000_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,11 +28,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         memory_mib: env_number("SLOP_MEMORY_MIB")?
             .map_or(default_budget, |budget: u32| budget.min(default_budget)),
         spare_machines: env_number("SLOP_SPARE_MACHINES")?.unwrap_or(DEFAULT_SPARE_MACHINES),
+        first_jail_uid: env_number("SLOP_FIRST_JAIL_UID")?.unwrap_or(DEFAULT_FIRST_JAIL_UID),
     };
     tracing::info!(
         running_vms = limits.running_vms,
         memory_mib = limits.memory_mib,
         spare_machines = limits.spare_machines,
+        first_jail_uid = limits.first_jail_uid,
         "admission limits"
     );
     let machines =

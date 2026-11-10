@@ -1,6 +1,7 @@
 use std::{
+    fs::Permissions,
     io,
-    os::unix::ffi::OsStrExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -17,61 +18,171 @@ use tokio::{
 
 use crate::{
     egress::{self, EGRESS_PORT, EgressPolicy},
-    machines::Admission,
+    files::{self, link_immutable},
+    machines::{Admission, MACHINE_OVERHEAD_MIB},
 };
 
 pub const AGENTD_PORT: u32 = 3000;
+pub(crate) const FIRECRACKER: &str = "firecracker";
+pub(crate) const ROOTFS: &str = "rootfs.ext4";
+pub(crate) const SCRATCH: &str = "scratch.ext4";
+pub(crate) const SAVED_STATE: [&str; 2] = ["vmstate", "memory"];
+const KERNEL: &str = "vmlinux";
+const RESTORED: &str = "restored";
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const VM_THREADS_BEYOND_VCPUS: u32 = 32;
 const API_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const API_TIMEOUT: Duration = Duration::from_secs(600);
+const CGROUP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) struct Jail {
+    jailer: PathBuf,
+    jails_dir: PathBuf,
+    cgroup: String,
+}
+
+impl Jail {
+    pub(crate) fn new(jailer: PathBuf, state_dir: &Path) -> io::Result<Self> {
+        let state = std::fs::metadata(state_dir)?;
+        Ok(Self {
+            jailer,
+            jails_dir: state_dir.join("jails"),
+            cgroup: format!("machine-slop-{}-{}", state.dev(), state.ino()),
+        })
+    }
+
+    pub(crate) fn cgroup(&self) -> PathBuf {
+        Path::new(CGROUP_ROOT).join(&self.cgroup)
+    }
+
+    fn seat_dir(&self, uid: u32) -> PathBuf {
+        self.jails_dir.join(FIRECRACKER).join(uid.to_string())
+    }
+
+    pub(crate) fn kill_orphans(&self) -> io::Result<()> {
+        let entries = match std::fs::read_dir(self.cgroup()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            entries => Some(entries?),
+        };
+        for entry in entries.into_iter().flatten() {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                std::fs::write(entry.path().join("cgroup.kill"), "1")?;
+                remove_cgroup(&entry.path())?;
+            }
+        }
+        files::remove_if_present(std::fs::remove_dir_all(&self.jails_dir))?;
+        std::fs::create_dir(&self.jails_dir)?;
+        std::fs::set_permissions(&self.jails_dir, Permissions::from_mode(0o700))
+    }
+
+    pub(crate) fn release_cgroup(&self) {
+        if let Err(error) = files::remove_if_present(std::fs::remove_dir(self.cgroup())) {
+            tracing::warn!(cgroup = %self.cgroup().display(), %error, "machine cgroup was not removed");
+        }
+    }
+}
+
+fn remove_cgroup(cgroup: &Path) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + CGROUP_DRAIN_TIMEOUT;
+    loop {
+        match std::fs::remove_dir(cgroup) {
+            Err(error) if error.kind() == io::ErrorKind::ResourceBusy => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::other(format!(
+                        "processes in {} survived SIGKILL",
+                        cgroup.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            result => return files::remove_if_present(result),
+        }
+    }
+}
+
+pub(crate) struct Launch<'a> {
+    pub dir: &'a Path,
+    pub jail: &'a Jail,
+    pub admission: Admission,
+    pub egress: watch::Receiver<EgressPolicy>,
+    pub vcpus: u8,
+    pub memory_mib: u32,
+}
 
 #[derive(Clone)]
 pub struct Vm {
-    dir: PathBuf,
+    root: PathBuf,
     exit: watch::Receiver<Option<String>>,
     kill: Arc<Notify>,
 }
 
 impl Vm {
-    pub fn boot(
-        dir: &Path,
-        admission: Admission,
-        egress: watch::Receiver<EgressPolicy>,
-    ) -> io::Result<Self> {
-        let console = std::fs::File::create(dir.join("console.log"))?;
-        Self::spawn(
-            dir,
-            console,
-            &["--config-file", "config.json"],
-            admission,
-            egress,
-        )
+    pub(crate) async fn boot(launch: Launch<'_>, kernel: &Path, config: Value) -> io::Result<Self> {
+        let root = launch.prepare_jail().await?;
+        link_immutable(kernel, &root.join(KERNEL)).await?;
+        tokio::fs::write(root.join("config.json"), config.to_string()).await?;
+        let console = std::fs::File::create(launch.dir.join("console.log"))?;
+        Self::spawn(launch, root, console, &["--config-file", "config.json"])
     }
 
-    pub fn unconfigured(
-        dir: &Path,
-        admission: Admission,
-        egress: watch::Receiver<EgressPolicy>,
-    ) -> io::Result<Self> {
-        for socket in ["api.sock", "vsock.sock", &egress_socket_name()] {
-            crate::files::remove_if_present(std::fs::remove_file(dir.join(socket)))?;
+    pub(crate) async fn restore(launch: Launch<'_>, saved: &Path) -> io::Result<Self> {
+        let root = launch.prepare_jail().await?;
+        tokio::fs::create_dir(root.join(RESTORED)).await?;
+        for name in SAVED_STATE {
+            link_immutable(&saved.join(name), &root.join(RESTORED).join(name)).await?;
         }
         let console = std::fs::File::options()
             .create(true)
             .append(true)
-            .open(dir.join("console.log"))?;
-        Self::spawn(dir, console, &[], admission, egress)
+            .open(launch.dir.join("console.log"))?;
+        let vm = Self::spawn(launch, root, console, &[])?;
+        if let Err(error) = vm.load().await {
+            vm.kill().await;
+            return Err(error);
+        }
+        Ok(vm)
     }
 
     fn spawn(
-        dir: &Path,
+        launch: Launch<'_>,
+        root: PathBuf,
         console: std::fs::File,
         args: &[&str],
-        admission: Admission,
-        egress: watch::Receiver<EgressPolicy>,
     ) -> io::Result<Self> {
-        let egress_listener = UnixListener::bind(dir.join(egress_socket_name()))?;
-        let mut child = Command::new(dir.join("firecracker"))
-            .args(["--api-sock", "api.sock"])
+        let Launch {
+            dir,
+            jail,
+            admission,
+            egress,
+            vcpus,
+            memory_mib,
+        } = launch;
+        let uid = admission.uid().to_string();
+        let seat_dir = jail.seat_dir(admission.uid());
+        let cgroup = jail.cgroup().join(&uid);
+        remove_cgroup(&cgroup)?;
+        let egress_socket = root.join(egress_socket_name());
+        let egress_listener = UnixListener::bind(&egress_socket)?;
+        std::fs::set_permissions(&egress_socket, Permissions::from_mode(0o777))?;
+        let reserved_bytes = (u64::from(memory_mib) + u64::from(MACHINE_OVERHEAD_MIB)) << 20;
+        let mut child = Command::new(&jail.jailer)
+            .args(["--id", &uid, "--exec-file"])
+            .arg(dir.join(FIRECRACKER))
+            .args(["--uid", &uid, "--gid", &uid, "--chroot-base-dir"])
+            .arg(&jail.jails_dir)
+            .args(["--cgroup-version", "2", "--parent-cgroup", &jail.cgroup])
+            .args(["--cgroup", &format!("memory.max={reserved_bytes}")])
+            .args(["--cgroup", "memory.swap.max=0"])
+            .args([
+                "--cgroup",
+                &format!("cpu.max={} 100000", u32::from(vcpus) * 100_000),
+            ])
+            .args([
+                "--cgroup",
+                &format!("pids.max={}", u32::from(vcpus) + VM_THREADS_BEYOND_VCPUS),
+            ])
+            .args(["--", "--api-sock", "api.sock"])
             .args(args)
             .current_dir(dir)
             .stdin(Stdio::null())
@@ -96,6 +207,15 @@ impl Vm {
                 Err(error) => format!("failed to wait for firecracker: {error}"),
             };
             tracing::info!(path = %vm_dir.display(), %message, "firecracker exited");
+            let dismantled = tokio::task::spawn_blocking(move || {
+                remove_cgroup(&cgroup)?;
+                files::remove_if_present(std::fs::remove_dir_all(seat_dir))
+            })
+            .await
+            .unwrap_or_else(|error| Err(io::Error::other(error)));
+            if let Err(error) = dismantled {
+                tracing::error!(%error, "machine jail was not removed");
+            }
             drop(admission);
             exit_sender.send_replace(Some(message));
         });
@@ -106,11 +226,7 @@ impl Vm {
                 _ = exited.wait_for(Option::is_some) => {}
             }
         });
-        Ok(Self {
-            dir: dir.to_owned(),
-            exit,
-            kill,
-        })
+        Ok(Self { root, exit, kill })
     }
 
     pub fn exited(&self) -> Option<String> {
@@ -132,26 +248,44 @@ impl Vm {
             .await
     }
 
-    pub async fn save(&self, dir: &Path) -> io::Result<()> {
-        self.api(
-            "PUT",
-            "/snapshot/create",
-            json!({
-                "snapshot_type": "Full",
-                "snapshot_path": dir.join("vmstate"),
-                "mem_file_path": dir.join("memory"),
-            }),
-        )
-        .await
+    pub async fn save(&self, into: &Path) -> io::Result<()> {
+        let saved = async {
+            self.api(
+                "PUT",
+                "/snapshot/create",
+                json!({
+                    "snapshot_type": "Full",
+                    "snapshot_path": SAVED_STATE[0],
+                    "mem_file_path": SAVED_STATE[1],
+                }),
+            )
+            .await?;
+            for name in SAVED_STATE {
+                let saved = self.root.join(name);
+                seal(&saved)?;
+                tokio::fs::rename(&saved, into.join(name)).await?;
+            }
+            Ok(())
+        };
+        let saved = saved.await;
+        if saved.is_err() {
+            for name in SAVED_STATE {
+                files::remove_if_present(tokio::fs::remove_file(self.root.join(name)).await)?;
+            }
+        }
+        saved
     }
 
-    pub async fn load(&self, dir: &str) -> io::Result<()> {
+    async fn load(&self) -> io::Result<()> {
         self.api(
             "PUT",
             "/snapshot/load",
             json!({
-                "snapshot_path": format!("{dir}/vmstate"),
-                "mem_backend": { "backend_type": "File", "backend_path": format!("{dir}/memory") },
+                "snapshot_path": format!("{RESTORED}/{}", SAVED_STATE[0]),
+                "mem_backend": {
+                    "backend_type": "File",
+                    "backend_path": format!("{RESTORED}/{}", SAVED_STATE[1]),
+                },
                 "resume_vm": false,
             }),
         )
@@ -159,7 +293,7 @@ impl Vm {
     }
 
     pub async fn connect(&self) -> io::Result<UnixStream> {
-        connect_vsock(&self.dir.join("vsock.sock"), AGENTD_PORT).await
+        connect_vsock(&self.root.join("vsock.sock"), AGENTD_PORT).await
     }
 
     async fn api(&self, method: &str, path: &str, body: Value) -> io::Result<()> {
@@ -216,7 +350,7 @@ impl Vm {
     async fn connect_api(&self) -> io::Result<UnixStream> {
         let deadline = tokio::time::Instant::now() + API_SOCKET_TIMEOUT;
         loop {
-            match UnixStream::connect(self.dir.join("api.sock")).await {
+            match UnixStream::connect(self.root.join("api.sock")).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) => {
                     if let Some(message) = self.exited() {
@@ -265,37 +399,25 @@ pub async fn connect_vsock(path: &Path, port: u32) -> io::Result<UnixStream> {
     }
 }
 
-pub fn kill_orphans(machines_dir: &Path) -> io::Result<()> {
-    let runs_under_machines_dir = |process: &Path| {
-        std::fs::read_link(process.join("cwd")).is_ok_and(|cwd| cwd.starts_with(machines_dir))
-    };
-    let is_firecracker = |process: &Path| {
-        std::fs::read(process.join("cmdline")).is_ok_and(|cmdline| {
-            let program = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
-            Path::new(std::ffi::OsStr::from_bytes(program)).file_name()
-                == Some(std::ffi::OsStr::new("firecracker"))
-        })
-    };
-    let mut orphans = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
-        let pid = entry.file_name().to_str().and_then(|pid| pid.parse().ok());
-        if let Some(pid) = pid.and_then(rustix::process::Pid::from_raw)
-            && runs_under_machines_dir(&entry.path())
-            && is_firecracker(&entry.path())
-        {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-            orphans.push(entry.path());
+impl Launch<'_> {
+    async fn prepare_jail(&self) -> io::Result<PathBuf> {
+        let seat_dir = self.jail.seat_dir(self.admission.uid());
+        files::remove_dir_if_present(&seat_dir).await?;
+        let root = seat_dir.join("root");
+        tokio::fs::create_dir_all(&root).await?;
+        for disk in [ROOTFS, SCRATCH] {
+            tokio::fs::hard_link(self.dir.join(disk), root.join(disk)).await?;
         }
+        tokio::fs::set_permissions(root.join(SCRATCH), Permissions::from_mode(0o666)).await?;
+        Ok(root)
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while orphans.iter().any(|orphan| runs_under_machines_dir(orphan)) {
-        if std::time::Instant::now() >= deadline {
-            return Err(io::Error::other(
-                "processes of an earlier machined survived SIGKILL",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    Ok(())
+}
+
+fn seal(path: &Path) -> io::Result<()> {
+    rustix::fs::chown(
+        path,
+        Some(rustix::process::geteuid()),
+        Some(rustix::process::getegid()),
+    )?;
+    std::fs::set_permissions(path, Permissions::from_mode(0o444))
 }

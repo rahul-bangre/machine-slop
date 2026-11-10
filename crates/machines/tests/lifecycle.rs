@@ -17,6 +17,7 @@ use tokio::{
 
 const MEMORY_BUDGET_MIB: u32 = 1 << 20;
 const DEFAULT_RESERVATION_MIB: u32 = 512 + 64;
+const FIRST_JAIL_UID: u32 = 1_000_000;
 
 struct Host {
     root: PathBuf,
@@ -31,16 +32,32 @@ impl Host {
         std::fs::write(image.join("vmlinux"), "kernel").expect("write kernel");
         std::fs::write(image.join("rootfs.ext4"), "rootfs").expect("write rootfs");
         let script = format!(
-            "#!/bin/bash\nFAKE_FIRECRACKER='{}' FAKE_FIRECRACKER_ARGS=\"$*\" exec -a firecracker '{}' --exact fake_firecracker --nocapture\n",
+            "#!/bin/bash\nFAKE_FIRECRACKER='{}' FAKE_MACHINE_DIR=\"$(dirname \"$0\")\" FAKE_FIRECRACKER_ARGS=\"$*\" exec -a firecracker '{}' --exact fake_firecracker --nocapture\n",
             root.display(),
             std::env::current_exe().expect("test binary").display(),
         );
         std::fs::write(image.join("firecracker"), script).expect("write firecracker");
-        std::fs::set_permissions(
-            image.join("firecracker"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .expect("make firecracker executable");
+        let jailer = format!(
+            r#"#!/bin/bash
+echo "$*" >> '{}/jails'
+while [ "$1" != -- ]; do
+  case $1 in
+    --id) id=$2 ;;
+    --exec-file) exec_file=$2 ;;
+    --chroot-base-dir) base=$2 ;;
+  esac
+  shift 2
+done
+shift
+cd "$base/$(basename "$exec_file")/$id/root" && exec "$exec_file" "$@"
+"#,
+            root.display()
+        );
+        std::fs::write(image.join("jailer"), jailer).expect("write jailer");
+        for program in ["firecracker", "jailer"] {
+            std::fs::set_permissions(image.join(program), std::fs::Permissions::from_mode(0o755))
+                .expect("make program executable");
+        }
         Self { root }
     }
 
@@ -55,6 +72,7 @@ impl Host {
                 running_vms: capacity,
                 memory_mib: MEMORY_BUDGET_MIB,
                 spare_machines: spares,
+                first_jail_uid: FIRST_JAIL_UID,
             };
             match Machines::open(image.clone(), state.clone(), limits).await {
                 Ok(machines) => return machines,
@@ -89,6 +107,29 @@ impl Host {
         self.root.join("state/machines").join(id)
     }
 
+    fn jail_root(&self, id: &str) -> PathBuf {
+        let exec_file = format!(
+            "--exec-file {} ",
+            self.machine_dir(id).join("firecracker").display()
+        );
+        let jail = self
+            .jails()
+            .into_iter()
+            .rfind(|jail| jail.contains(&exec_file))
+            .expect("the machine was jailed");
+        let uid = jail.split_whitespace().nth(1).expect("jail id").to_owned();
+        self.root
+            .join("state/jails/firecracker")
+            .join(uid)
+            .join("root")
+    }
+
+    fn jails(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.join("jails"))
+            .map(|jails| jails.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
     fn snapshot_dir(&self, id: &str) -> PathBuf {
         self.root.join("state/snapshots").join(id)
     }
@@ -103,8 +144,14 @@ impl Host {
             .expect("read /proc")
             .filter_map(Result::ok)
             .filter(|process| {
-                std::fs::read_link(process.path().join("cwd"))
-                    .is_ok_and(|cwd| cwd.starts_with(&dir))
+                std::fs::read(process.path().join("environ")).is_ok_and(|environ| {
+                    environ
+                        .split(|byte| *byte == 0)
+                        .filter_map(|variable| variable.strip_prefix(b"FAKE_MACHINE_DIR="))
+                        .any(|machine| {
+                            Path::new(std::str::from_utf8(machine).unwrap_or("")).starts_with(&dir)
+                        })
+                })
             })
             .count()
     }
@@ -201,8 +248,8 @@ async fn create_allowing(machines: &Arc<Machines>, hosts: &[&str]) -> MachineInf
         .info()
 }
 
-async fn egress_allows_localhost(machine_dir: &Path) -> bool {
-    let mut guest = UnixStream::connect(machine_dir.join("vsock.sock_1080"))
+async fn egress_allows_localhost(jail_root: &Path) -> bool {
+    let mut guest = UnixStream::connect(jail_root.join("vsock.sock_1080"))
         .await
         .expect("connect to the machine's egress proxy");
     guest
@@ -243,14 +290,14 @@ async fn pause_publishes_a_checkpoint_that_resume_consumes() {
         !dir.join("checkpoint").exists(),
         "a running machine has no checkpoint to restore a second time"
     );
-    assert!(dir.join("restored/memory").is_file());
+    assert!(dir.join("checkpoint.retired/memory").is_file());
     assert!(agent_answers(&machines, &id).await);
     assert_eq!(states(machines.resume(&id).await), MachineState::Running);
     assert_eq!(host.vms_started(), 2, "one boot and one restore");
 
     assert_eq!(states(machines.pause(&id).await), MachineState::Paused);
     assert!(dir.join("checkpoint/memory").is_file());
-    assert!(!dir.join("restored").exists());
+    assert!(!dir.join("checkpoint.retired").exists());
     machines.destroy(&id).await.expect("destroy");
     assert!(!dir.exists());
 }
@@ -447,6 +494,10 @@ async fn a_restart_keeps_what_was_acknowledged_and_nothing_else() {
     drop(machines);
     assert!(host.vm_is_alive(&running), "machined died without cleanup");
     let machines = host.open(8).await;
+    eventually("removed the jails of the earlier run", || async {
+        host.all_vms() == 0
+    })
+    .await;
 
     assert_eq!(state(&machines, &paused).await, MachineState::Paused);
     for lost in [&running, &resumed] {
@@ -703,7 +754,10 @@ async fn a_create_takes_a_spare_that_is_replaced_and_never_recorded() {
     drop((machines, full, sized));
     assert_eq!(host.all_vms(), 2, "machined died without cleanup");
     let machines = host.open(2).await;
-    assert_eq!(host.all_vms(), 0);
+    eventually("removed the jails of the earlier run", || async {
+        host.all_vms() == 0
+    })
+    .await;
     assert_eq!(machines.list().await.len(), 1);
     assert!(is_exited(&state(&machines, &first).await));
     let dirs = std::fs::read_dir(host.root.join("state/machines")).expect("machines");
@@ -799,7 +853,7 @@ async fn a_checkpoint_is_never_in_place_while_it_is_being_written() {
         let (machines, id) = (machines.clone(), id.clone());
         tokio::spawn(async move { machines.pause(&id).await })
     };
-    let staged = dir.join("checkpoint.tmp/memory");
+    let staged = host.jail_root(&id).join("memory");
     eventually("started saving", || async { staged.is_file() }).await;
     assert!(
         !dir.join("checkpoint").exists(),
@@ -838,7 +892,7 @@ async fn a_resume_that_cannot_retire_the_checkpoint_leaves_the_machine_paused() 
     assert_eq!(host.vm_pauses(), 1, "only the original pause");
 
     host.fail("nothing");
-    std::fs::remove_file(dir.join("restored")).expect("unblock retire");
+    std::fs::remove_file(dir.join("checkpoint.retired")).expect("unblock retire");
     assert_eq!(states(machines.resume(&id).await), MachineState::Running);
 }
 
@@ -917,7 +971,7 @@ async fn allowed_hosts_survive_pause_and_restart_and_pass_to_forks_and_snapshots
     let host = Host::new("egress");
     let machines = host.open(8).await;
     let source = create_allowing(&machines, &["localhost"]).await.id;
-    assert!(egress_allows_localhost(&host.machine_dir(&source)).await);
+    assert!(egress_allows_localhost(&host.jail_root(&source)).await);
 
     machines.pause(&source).await.expect("pause");
     let narrowed = UpdateMachine {
@@ -933,12 +987,12 @@ async fn allowed_hosts_survive_pause_and_restart_and_pass_to_forks_and_snapshots
     );
     let resumed = machines.get(&source).await.expect("machine").info();
     assert_eq!(resumed.allowed_hosts, ["example.com"]);
-    assert!(!egress_allows_localhost(&host.machine_dir(&source)).await);
+    assert!(!egress_allows_localhost(&host.jail_root(&source)).await);
 
     let fork = machines.fork(&source).await.expect("fork").info();
     assert_eq!(fork.allowed_hosts, ["example.com"]);
     assert_eq!(fork.idle_timeout_secs, resumed.idle_timeout_secs);
-    assert!(!egress_allows_localhost(&host.machine_dir(&fork.id)).await);
+    assert!(!egress_allows_localhost(&host.jail_root(&fork.id)).await);
 
     machines.pause(&source).await.expect("pause");
     host.fail("hold-load");
@@ -986,7 +1040,7 @@ async fn allowed_hosts_survive_pause_and_restart_and_pass_to_forks_and_snapshots
     let taken = snapshot(&machines, &source).await.expect("snapshot");
     assert_eq!(taken.allowed_hosts, ["example.com"]);
     let inheriting = create_from(&machines, &taken).await;
-    assert!(!egress_allows_localhost(&host.machine_dir(&inheriting)).await);
+    assert!(!egress_allows_localhost(&host.jail_root(&inheriting)).await);
     let overriding = CreateMachine {
         snapshot_id: Some(taken.id.clone()),
         allowed_hosts: Some(vec!["localhost".into()]),
@@ -994,7 +1048,7 @@ async fn allowed_hosts_survive_pause_and_restart_and_pass_to_forks_and_snapshots
     };
     let overriding = machines.create(overriding).await.expect("create").info();
     assert_eq!(overriding.allowed_hosts, ["localhost"]);
-    assert!(egress_allows_localhost(&host.machine_dir(&overriding.id)).await);
+    assert!(egress_allows_localhost(&host.jail_root(&overriding.id)).await);
 }
 
 #[tokio::test]
@@ -1002,18 +1056,20 @@ async fn a_spare_has_no_egress_until_a_create_gives_it_that_machines_list() {
     let host = Host::new("spare-egress");
     let machines = host.open_with_spares(2, 1).await;
     eventually("booted a spare", || async { machines.spares().await == 1 }).await;
-    let spare_dir = std::fs::read_dir(host.root.join("state/machines"))
+    let spare = std::fs::read_dir(host.root.join("state/machines"))
         .expect("machines")
         .next()
         .expect("the spare's directory")
         .expect("entry")
-        .path();
-    assert!(!egress_allows_localhost(&spare_dir).await);
+        .file_name()
+        .into_string()
+        .expect("spare id");
+    assert!(!egress_allows_localhost(&host.jail_root(&spare)).await);
 
     let taken = create_allowing(&machines, &["localhost"]).await;
-    assert_eq!(host.machine_dir(&taken.id), spare_dir);
+    assert_eq!(taken.id, spare);
     assert_eq!(taken.allowed_hosts, ["localhost"]);
-    assert!(egress_allows_localhost(&spare_dir).await);
+    assert!(egress_allows_localhost(&host.jail_root(&spare)).await);
 }
 
 #[tokio::test]
@@ -1149,7 +1205,7 @@ async fn shutdown_saves_machines_concurrently_and_keeps_going_when_cancelled() {
     };
     eventually("every machine is being saved at once", || async {
         ids.iter()
-            .all(|id| host.machine_dir(id).join("checkpoint.tmp/memory").is_file())
+            .all(|id| host.jail_root(id).join("memory").is_file())
     })
     .await;
     shutting_down.abort();
@@ -1178,6 +1234,7 @@ async fn memory_is_reserved_by_running_vms_and_given_up_by_spares() {
         running_vms: 8,
         memory_mib: budget,
         spare_machines: 1,
+        first_jail_uid: FIRST_JAIL_UID,
     };
     let machines = Machines::open(image, state, limits).await.expect("open");
     eventually("booted a spare", || async { machines.spares().await == 1 }).await;
@@ -1310,6 +1367,12 @@ async fn fake_firecracker() {
         configured: booted,
         running: booted,
     }));
+    tokio::spawn(async {
+        while std::env::current_dir().is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::process::exit(0);
+    });
     let api = UnixListener::bind("api.sock").expect("bind api socket");
     let vsock = UnixListener::bind("vsock.sock").expect("bind vsock socket");
     let agent = vm.clone();
@@ -1324,6 +1387,10 @@ async fn fake_firecracker() {
         let (stream, _) = api.accept().await.expect("accept");
         answer_api(stream, &vm, &root.join("fail")).await;
     }
+}
+
+fn machine_dir() -> PathBuf {
+    PathBuf::from(std::env::var("FAKE_MACHINE_DIR").expect("machine dir"))
 }
 
 fn append(path: &Path, text: &str) {
@@ -1411,7 +1478,9 @@ async fn answer_api(stream: UnixStream, vm: &std::sync::Mutex<FakeVm>, fail: &Pa
                 Ok(())
             }
             "PATCH /vm" if failing == "resume" || !vm.configured => Err("cannot resume"),
-            "PATCH /vm" if Path::new("checkpoint").exists() => Err("checkpoint is published"),
+            "PATCH /vm" if machine_dir().join("checkpoint").exists() => {
+                Err("checkpoint is published")
+            }
             "PATCH /vm" => {
                 vm.running = true;
                 append(Path::new("scratch.ext4"), "w");
@@ -1442,7 +1511,8 @@ async fn answer_api(stream: UnixStream, vm: &std::sync::Mutex<FakeVm>, fail: &Pa
                 } else {
                     vm.configured = true;
                     if failing == "block-retire" {
-                        std::fs::write("restored", "not a directory").expect("block retire");
+                        std::fs::write(machine_dir().join("checkpoint.retired"), "not a directory")
+                            .expect("block retire");
                     }
                     Ok(())
                 }
