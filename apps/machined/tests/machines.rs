@@ -11,81 +11,61 @@ struct Host {
     child: Child,
     address: String,
     state_dir: PathBuf,
+    env: Vec<(&'static str, &'static str)>,
 }
 
 impl Host {
     async fn start(name: &str) -> Self {
-        Self::start_with_budget(name, None).await
+        Self::start_with(name, &[]).await
     }
 
-    async fn start_with_budget(name: &str, budget: Option<&str>) -> Self {
-        let image_dir = std::env::var("SLOP_IMAGE_DIR")
-            .expect("SLOP_IMAGE_DIR names a directory built by vm/image/build.sh");
+    async fn start_with(name: &str, env: &[(&'static str, &'static str)]) -> Self {
         let state_dir =
             std::env::temp_dir().join(format!("machined-test-{}-{name}", std::process::id()));
-        let mut command = Command::new(env!("CARGO_BIN_EXE_machined"));
-        command
-            .arg("127.0.0.1:0")
-            .arg(image_dir)
-            .arg(&state_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(budget) = budget {
-            command.env("SLOP_MEMORY_MIB", budget);
-        }
-        let mut child = command.spawn().expect("spawn machined");
-        let mut lines = BufReader::new(child.stderr.take().expect("stderr")).lines();
-        let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
-            .await
-            .expect("machined starts within 10 seconds")
-            .expect("read machined output")
-            .expect("machined reports its address");
-        let log: Value = serde_json::from_str(&line).expect("structured startup log");
-        let address = log["fields"]["address"]
-            .as_str()
-            .expect("listen address")
-            .strip_prefix("http://")
-            .expect("HTTP address")
-            .to_owned();
-        tokio::spawn(
-            async move { while lines.next_line().await.is_ok_and(|line| line.is_some()) {} },
-        );
+        let (child, address) = spawn_machined(&state_dir, env).await;
         Self {
             child,
             address,
             state_dir: std::fs::canonicalize(&state_dir).expect("state dir exists"),
+            env: env.to_vec(),
         }
     }
 
-    async fn stop(mut self) {
-        if let Some(pid) = self.child.id() {
-            Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status()
-                .await
-                .expect("signal machined");
-            let status = tokio::time::timeout(Duration::from_secs(10), self.child.wait())
-                .await
-                .expect("machined shuts down within 10 seconds")
-                .expect("reap machined");
-            assert!(status.success(), "machined shuts down cleanly");
-        }
-        std::fs::remove_dir_all(&self.state_dir).expect("remove state dir");
+    async fn restart(&mut self, signal: &str) {
+        self.stop(signal).await;
+        (self.child, self.address) = spawn_machined(&self.state_dir, &self.env).await;
+    }
+
+    async fn stop(&mut self, signal: &str) {
+        let pid = self.child.id().expect("machined pid").to_string();
+        Command::new("kill")
+            .args([signal, &pid])
+            .status()
+            .await
+            .expect("signal machined");
+        let status = tokio::time::timeout(Duration::from_secs(60), self.child.wait())
+            .await
+            .expect("machined exits")
+            .expect("wait for machined");
+        assert_eq!(status.success(), signal == "-TERM");
     }
 
     async fn request(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        let body = body.map(|body| body.to_string()).unwrap_or_default();
+        self.send(method, path, &body).await
+    }
+
+    async fn send(&self, method: &str, path: &str, body: &str) -> (u16, Value) {
         tokio::time::timeout(
             Duration::from_secs(60),
-            self.request_inner(method, path, body),
+            self.send_unbounded(method, path, body),
         )
         .await
         .expect("request completes within 60 seconds")
     }
 
-    async fn request_inner(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    async fn send_unbounded(&self, method: &str, path: &str, body: &str) -> (u16, Value) {
         let mut stream = TcpStream::connect(&self.address).await.expect("connect");
-        let body = body.map(|body| body.to_string()).unwrap_or_default();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: machined\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -158,6 +138,110 @@ impl Host {
         result["code"].clone()
     }
 
+    async fn start_holding(&self, machine: &str, code: u8) -> String {
+        let (status, process) = self
+            .request(
+                "POST",
+                &format!("/machines/{machine}/processes"),
+                Some(json!({
+                    "program": "/bin/sh",
+                    "args": ["-c", format!("code={code}; read line; exit $code")],
+                    "keep_stdin_open": true,
+                })),
+            )
+            .await;
+        assert_eq!(status, 201, "start process: {process}");
+        process["id"].as_str().expect("process id").to_owned()
+    }
+
+    async fn is_running(&self, machine: &str, process: &str) -> bool {
+        let (status, info) = self
+            .request(
+                "GET",
+                &format!("/machines/{machine}/processes/{process}"),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "process info: {info}");
+        info["status"]["state"] == "running"
+    }
+
+    async fn release(&self, machine: &str, process: &str) -> Value {
+        let path = format!("/machines/{machine}/processes/{process}");
+        let (status, body) = self
+            .send("POST", &format!("{path}/stdin?offset=0"), "go\n")
+            .await;
+        assert_eq!(status, 204, "write stdin: {body}");
+        let (status, result) = self.request("GET", &format!("{path}/wait"), None).await;
+        assert_eq!(status, 200, "wait: {result}");
+        result["code"].clone()
+    }
+
+    async fn transition(&self, machine: &str, to: &str) -> (u16, Value) {
+        self.request("POST", &format!("/machines/{machine}/{to}"), None)
+            .await
+    }
+
+    async fn pause(&self, machine: &str) {
+        let (status, info) = self.transition(machine, "pause").await;
+        assert_eq!(status, 200, "pause: {info}");
+        assert_eq!(info["state"], json!({ "state": "paused" }));
+    }
+
+    async fn resume(&self, machine: &str) {
+        let (status, info) = self.transition(machine, "resume").await;
+        assert_eq!(status, 200, "resume: {info}");
+        assert_eq!(info["state"], json!({ "state": "running" }));
+    }
+
+    async fn snapshot(&self, machine: &str) -> String {
+        let (status, snapshot) = self
+            .request("POST", "/snapshots", Some(json!({ "machine_id": machine })))
+            .await;
+        assert_eq!(status, 201, "snapshot: {snapshot}");
+        assert_eq!(snapshot["machine_id"], json!(machine));
+        snapshot["id"].as_str().expect("snapshot id").to_owned()
+    }
+
+    async fn create_from(&self, snapshot: &str) -> String {
+        let (status, info) = self
+            .request(
+                "POST",
+                "/machines",
+                Some(json!({ "snapshot_id": snapshot })),
+            )
+            .await;
+        assert_eq!(status, 201, "create from snapshot: {info}");
+        assert_eq!(info["state"], json!({ "state": "running" }));
+        info["id"].as_str().expect("machine id").to_owned()
+    }
+
+    async fn fork(&self, machine: &str) -> String {
+        let (status, info) = self
+            .request("POST", &format!("/machines/{machine}/fork"), None)
+            .await;
+        assert_eq!(status, 201, "fork: {info}");
+        assert_eq!(info["state"], json!({ "state": "running" }));
+        info["id"].as_str().expect("machine id").to_owned()
+    }
+
+    async fn state(&self, machine: &str) -> Value {
+        let (status, info) = self
+            .request("GET", &format!("/machines/{machine}"), None)
+            .await;
+        assert_eq!(status, 200, "machine info: {info}");
+        info["state"]["state"].clone()
+    }
+
+    async fn delete(&self, path: &str) {
+        let (status, body) = self.request("DELETE", path, None).await;
+        assert_eq!(status, 204, "delete {path}: {body}");
+    }
+
+    fn machine_dir(&self, machine: &str) -> PathBuf {
+        self.state_dir.join("machines").join(machine)
+    }
+
     async fn exchange(&self, head: &str, body: &[u8]) -> Vec<u8> {
         tokio::time::timeout(Duration::from_secs(60), async {
             let mut stream = TcpStream::connect(&self.address).await.expect("connect");
@@ -173,57 +257,125 @@ impl Host {
 
     async fn tunnel(&self, machine: &str, port: u16) -> Option<TcpStream> {
         tokio::time::timeout(Duration::from_secs(10), async {
-        let mut stream = TcpStream::connect(&self.address).await.expect("connect");
-        stream
-            .write_all(
-                format!(
-                    "GET /machines/{machine}/ports/{port} HTTP/1.1\r\nHost: machined\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+            let mut stream = TcpStream::connect(&self.address).await.expect("connect");
+            stream
+                .write_all(
+                    format!(
+                        "GET /machines/{machine}/ports/{port} HTTP/1.1\r\nHost: machined\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+                    )
+                    .as_bytes(),
                 )
-                .as_bytes(),
-            )
-            .await
-            .expect("write upgrade");
-        let mut head = Vec::new();
-        while !head.ends_with(b"\r\n\r\n") {
-            head.push(stream.read_u8().await.expect("read upgrade response"));
-        }
-        head.starts_with(b"HTTP/1.1 101 ").then_some(stream)
-        }).await.expect("tunnel upgrade completes within 10 seconds")
+                .await
+                .expect("write upgrade");
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.expect("read upgrade response"));
+            }
+            head.starts_with(b"HTTP/1.1 101 ").then_some(stream)
+        })
+        .await
+        .expect("tunnel upgrade completes within 10 seconds")
     }
 
     fn firecracker_pid(&self, machine: &str) -> String {
-        std::fs::read_to_string(
-            self.state_dir
-                .join("machines")
-                .join(machine)
-                .join("firecracker.pid"),
-        )
-        .expect("firecracker pid file")
+        let pids = self.vms_in(&self.machine_dir(machine));
+        assert_eq!(pids.len(), 1, "machine {machine} has one VM");
+        pids[0].clone()
+    }
+
+    fn vms_in(&self, dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir("/proc")
+            .expect("read /proc")
+            .filter_map(Result::ok)
+            .filter(|process| {
+                std::fs::read_link(process.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(dir))
+            })
+            .map(|process| process.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn all_vms(&self) -> usize {
+        self.vms_in(&self.state_dir.join("machines")).len()
+    }
+
+    async fn finish(mut self) {
+        if self.child.try_wait().expect("machined status").is_none() {
+            self.stop("-TERM").await;
+        }
+        std::fs::remove_dir_all(&self.state_dir).expect("remove state dir");
     }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
+        let Some(pid) = self.child.id() else {
+            return;
+        };
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        let machined_stopped_its_vms = std::time::Instant::now() + Duration::from_secs(30);
+        while matches!(self.child.try_wait(), Ok(None))
+            && std::time::Instant::now() < machined_stopped_its_vms
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = self.child.start_kill();
-        if let Ok(entries) = std::fs::read_dir(self.state_dir.join("machines")) {
-            for entry in entries.flatten() {
-                let dir = entry.path();
-                if let Ok(pid) = std::fs::read_to_string(dir.join("firecracker.pid"))
-                    && std::fs::read_link(format!("/proc/{}/cwd", pid.trim()))
-                        .is_ok_and(|cwd| cwd == dir)
-                {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-KILL", pid.trim()])
-                        .status();
-                }
-            }
+        for vm in self.vms_in(&self.state_dir) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &vm])
+                .status();
         }
         let _ = std::fs::remove_dir_all(&self.state_dir);
     }
 }
 
+async fn spawn_machined(
+    state_dir: &std::path::Path,
+    env: &[(&'static str, &'static str)],
+) -> (Child, String) {
+    let image_dir = std::env::var("SLOP_IMAGE_DIR")
+        .expect("SLOP_IMAGE_DIR names a directory built by vm/image/build.sh");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_machined"))
+        .arg("127.0.0.1:0")
+        .arg(image_dir)
+        .arg(state_dir)
+        .envs(env.iter().copied())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn machined");
+    let mut lines = BufReader::new(child.stderr.take().expect("stderr")).lines();
+    let address = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .expect("read machined output")
+                .expect("machined reports its address");
+            eprintln!("machined: {line}");
+            let log: Value = serde_json::from_str(&line).expect("structured log");
+            if let Some(address) = log["fields"]["address"].as_str() {
+                break address
+                    .strip_prefix("http://")
+                    .expect("HTTP address")
+                    .to_owned();
+            }
+        }
+    })
+    .await
+    .expect("machined starts listening within 30 seconds");
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("machined: {line}");
+        }
+    });
+    (child, address)
+}
+
 fn running(pid: &str) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+    std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok()
 }
 
 #[tokio::test]
@@ -277,22 +429,14 @@ async fn machines_are_isolated_and_destroyed_with_their_vm() {
     assert_eq!(machines.as_array().map(Vec::len), Some(1));
     assert_eq!(machines[0]["id"], json!(second));
 
-    let pid = host.child.id().expect("machined pid").to_string();
-    Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .await
-        .expect("signal machined");
-    let status = tokio::time::timeout(Duration::from_secs(10), host.child.wait())
-        .await
-        .expect("machined exits after SIGTERM")
-        .expect("wait for machined");
-    assert!(status.success());
-    assert!(
-        !running(&second_pid),
-        "remaining machines are destroyed on shutdown"
+    host.stop("-TERM").await;
+    assert!(!running(&second_pid));
+    assert_eq!(
+        host.all_vms(),
+        0,
+        "no VM outlives a machined that shut down, spares included"
     );
-    host.stop().await;
+    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
 }
 
 #[tokio::test]
@@ -305,6 +449,7 @@ async fn invalid_requests_are_rejected_without_booting() {
         json!({ "idle_timeout_secs": 0 }),
         json!({ "idle_timeout_secs": 86401 }),
         json!({ "disk": 1 }),
+        json!({ "snapshot_id": "0", "vcpus": 1 }),
         json!({ "allowed_hosts": ["*.*.example.com"] }),
         json!({ "allowed_hosts": "example.com" }),
         json!({ "allowed_hosts": null }),
@@ -312,9 +457,24 @@ async fn invalid_requests_are_rejected_without_booting() {
         let (status, _) = host.request("POST", "/machines", Some(body.clone())).await;
         assert_eq!(status, 422, "{body}");
     }
+    for (method, path, body) in [
+        ("POST", "/machines", Some(json!({ "snapshot_id": "0" }))),
+        ("POST", "/snapshots", Some(json!({ "machine_id": "0" }))),
+        ("POST", "/machines/0/pause", None),
+        ("POST", "/machines/0/resume", None),
+        ("GET", "/snapshots/0", None),
+        ("DELETE", "/snapshots/0", None),
+    ] {
+        let (status, _) = host.request(method, path, body).await;
+        assert_eq!(status, 404, "{method} {path}");
+    }
+    let (status, _) = host.request("POST", "/snapshots", None).await;
+    assert_eq!(status, 422);
     let (_, machines) = host.request("GET", "/machines", None).await;
     assert_eq!(machines, json!([]));
-    host.stop().await;
+    let (_, snapshots) = host.request("GET", "/snapshots", None).await;
+    assert_eq!(snapshots, json!([]));
+    host.finish().await;
 }
 
 #[tokio::test]
@@ -347,7 +507,347 @@ async fn a_create_abandoned_by_its_client_still_produces_a_listed_machine() {
         .request("DELETE", &format!("/machines/{id}"), None)
         .await;
     assert_eq!(status, 204);
-    host.stop().await;
+    host.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn a_paused_machine_resumes_with_its_processes_memory_and_disk() {
+    let mut host = Host::start("pause").await;
+    let machine = host.create().await;
+    let holding = host.start_holding(&machine, 42).await;
+    assert_eq!(
+        host.exit_code(
+            &machine,
+            "echo in-memory > /dev/shm/marker && echo on-disk > /root/marker"
+        )
+        .await,
+        json!(0)
+    );
+    let pid = host.firecracker_pid(&machine);
+
+    host.pause(&machine).await;
+    assert!(!running(&pid), "a paused machine's firecracker has exited");
+    host.pause(&machine).await;
+    let (status, body) = host
+        .request("GET", &format!("/machines/{machine}/health"), None)
+        .await;
+    assert_eq!(status, 409, "a paused machine has no agent: {body}");
+
+    host.restart("-TERM").await;
+    assert_eq!(host.state(&machine).await, json!("paused"));
+
+    host.resume(&machine).await;
+    host.resume(&machine).await;
+    assert!(
+        host.is_running(&machine, &holding).await,
+        "agentd still tracks the process it started before the pause"
+    );
+    assert_eq!(
+        host.exit_code(
+            &machine,
+            "grep -qx in-memory /dev/shm/marker && grep -qx on-disk /root/marker"
+        )
+        .await,
+        json!(0)
+    );
+    assert_eq!(host.release(&machine, &holding).await, json!(42));
+
+    let holding = host.start_holding(&machine, 43).await;
+    host.pause(&machine).await;
+    host.resume(&machine).await;
+    assert_eq!(host.release(&machine, &holding).await, json!(43));
+    assert_eq!(
+        host.exit_code(&machine, "grep -qx in-memory /dev/shm/marker")
+            .await,
+        json!(0)
+    );
+    host.delete(&format!("/machines/{machine}")).await;
+    host.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn concurrent_resumes_restore_one_vm() {
+    let host = Host::start("resumes").await;
+    let machine = host.create().await;
+    let holding = host.start_holding(&machine, 9).await;
+    host.pause(&machine).await;
+
+    let (first, second, third, fourth) = tokio::join!(
+        host.transition(&machine, "resume"),
+        host.transition(&machine, "resume"),
+        host.transition(&machine, "resume"),
+        host.transition(&machine, "resume"),
+    );
+    for (status, info) in [first, second, third, fourth] {
+        assert_eq!(status, 200, "resume: {info}");
+        assert_eq!(info["state"], json!({ "state": "running" }));
+    }
+    host.firecracker_pid(&machine);
+    assert_eq!(host.release(&machine, &holding).await, json!(9));
+    host.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn machines_from_a_snapshot_are_independent_of_it_its_source_and_each_other() {
+    let mut host = Host::start("snapshot").await;
+    let source = host.create().await;
+    let holding = host.start_holding(&source, 7).await;
+    assert_eq!(
+        host.exit_code(
+            &source,
+            "echo in-memory > /dev/shm/marker && echo on-disk > /root/marker"
+        )
+        .await,
+        json!(0)
+    );
+    let snapshot = host.snapshot(&source).await;
+    assert_eq!(host.state(&source).await, json!("running"));
+    assert_eq!(
+        host.exit_code(
+            &source,
+            "echo source > /root/later && echo source > /dev/shm/later"
+        )
+        .await,
+        json!(0)
+    );
+    let first = host.create_from(&snapshot).await;
+    let second = host.create_from(&snapshot).await;
+    let has_snapshot_state_only = "grep -qx in-memory /dev/shm/marker && grep -qx on-disk /root/marker \
+        && test ! -e /root/later && test ! -e /dev/shm/later";
+    for machine in [&first, &second] {
+        assert_eq!(
+            host.exit_code(machine, has_snapshot_state_only).await,
+            json!(0),
+            "a machine starts from the snapshot, not from its source's later writes"
+        );
+        assert!(host.is_running(machine, &holding).await);
+    }
+    assert_eq!(
+        host.exit_code(
+            &first,
+            "echo first > /root/later && echo first > /dev/shm/later"
+        )
+        .await,
+        json!(0)
+    );
+    assert_eq!(host.release(&first, &holding).await, json!(7));
+    assert!(
+        host.is_running(&second, &holding).await,
+        "each machine has its own copy of the process"
+    );
+    assert!(host.is_running(&source, &holding).await);
+    assert_eq!(
+        host.exit_code(&source, "grep -qx source /root/later").await,
+        json!(0)
+    );
+
+    host.delete(&format!("/machines/{source}")).await;
+    host.restart("-TERM").await;
+    let (_, snapshots) = host.request("GET", "/snapshots", None).await;
+    assert_eq!(snapshots.as_array().map(Vec::len), Some(1));
+    assert_eq!(snapshots[0]["id"], json!(snapshot));
+    let (status, info) = host
+        .request("GET", &format!("/snapshots/{snapshot}"), None)
+        .await;
+    assert_eq!((status, &info["machine_id"]), (200, &json!(source)));
+
+    let third = host.create_from(&snapshot).await;
+    assert_eq!(
+        host.exit_code(&third, has_snapshot_state_only).await,
+        json!(0),
+        "writes by earlier machines never reach the snapshot"
+    );
+
+    host.delete(&format!("/snapshots/{snapshot}")).await;
+    let (status, _) = host
+        .request("GET", &format!("/snapshots/{snapshot}"), None)
+        .await;
+    assert_eq!(status, 404);
+    let (status, _) = host
+        .request(
+            "POST",
+            "/machines",
+            Some(json!({ "snapshot_id": snapshot })),
+        )
+        .await;
+    assert_eq!(status, 404);
+    assert!(!host.state_dir.join("snapshots").join(&snapshot).exists());
+
+    host.resume(&first).await;
+    assert_eq!(
+        host.exit_code(
+            &first,
+            "grep -qx first /root/later && grep -qx first /dev/shm/later"
+        )
+        .await,
+        json!(0)
+    );
+    host.resume(&second).await;
+    assert_eq!(host.release(&second, &holding).await, json!(7));
+    host.pause(&third).await;
+    host.resume(&third).await;
+    assert_eq!(host.release(&third, &holding).await, json!(7));
+    host.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn a_snapshot_of_a_paused_machine_is_unchanged_by_the_machine_resuming() {
+    let host = Host::start("paused-snapshot").await;
+    let source = host.create().await;
+    let holding = host.start_holding(&source, 3).await;
+    assert_eq!(
+        host.exit_code(
+            &source,
+            "echo before > /root/state && echo before > /dev/shm/state"
+        )
+        .await,
+        json!(0)
+    );
+    host.pause(&source).await;
+    let snapshot = host.snapshot(&source).await;
+    assert_eq!(host.state(&source).await, json!("paused"));
+
+    host.resume(&source).await;
+    assert_eq!(
+        host.exit_code(
+            &source,
+            "echo after > /root/state && echo after > /dev/shm/state"
+        )
+        .await,
+        json!(0)
+    );
+    host.pause(&source).await;
+    host.resume(&source).await;
+
+    let restored = host.create_from(&snapshot).await;
+    assert_eq!(
+        host.exit_code(
+            &restored,
+            "grep -qx before /root/state && grep -qx before /dev/shm/state"
+        )
+        .await,
+        json!(0),
+        "the snapshot shares its memory file with its source, which only ever maps it privately"
+    );
+    assert_eq!(host.release(&restored, &holding).await, json!(3));
+    assert_eq!(
+        host.exit_code(
+            &source,
+            "grep -qx after /root/state && grep -qx after /dev/shm/state"
+        )
+        .await,
+        json!(0)
+    );
+    assert_eq!(host.release(&source, &holding).await, json!(3));
+    host.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn a_killed_machined_loses_running_machines_and_keeps_paused_ones() {
+    let mut host = Host::start("killed").await;
+    let paused = host.create().await;
+    let holding = host.start_holding(&paused, 5).await;
+    host.pause(&paused).await;
+    let resumed = host.create().await;
+    host.pause(&resumed).await;
+    host.resume(&resumed).await;
+    let unsaved = host.create().await;
+    let pids = [
+        host.firecracker_pid(&resumed),
+        host.firecracker_pid(&unsaved),
+    ];
+
+    host.restart("-KILL").await;
+    for pid in &pids {
+        assert!(!running(pid), "the next machined kills orphaned VMs");
+    }
+    for lost in [&resumed, &unsaved] {
+        assert_eq!(host.state(lost).await, json!("exited"));
+        let (status, body) = host.transition(lost, "resume").await;
+        assert_eq!(
+            status, 409,
+            "memory that was not saved is not restored: {body}"
+        );
+    }
+    assert_eq!(host.state(&paused).await, json!("paused"));
+    host.resume(&paused).await;
+    assert_eq!(host.release(&paused, &holding).await, json!(5));
+    for machine in [&resumed, &unsaved, &paused] {
+        host.delete(&format!("/machines/{machine}")).await;
+    }
+    let (_, machines) = host.request("GET", "/machines", None).await;
+    assert_eq!(machines, json!([]));
+    host.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn a_fork_branches_a_running_machine_without_stopping_it() {
+    let host = Host::start("fork").await;
+    let source = host
+        .create_with(Some(json!({ "memory_mib": SMALL_MACHINE_MIB })))
+        .await["id"]
+        .as_str()
+        .expect("machine id")
+        .to_owned();
+    let holding = host.start_holding(&source, 11).await;
+    assert_eq!(
+        host.exit_code(
+            &source,
+            "echo in-memory > /dev/shm/marker && echo on-disk > /root/marker"
+        )
+        .await,
+        json!(0)
+    );
+    let pid = host.firecracker_pid(&source);
+
+    let branch = host.fork(&source).await;
+    assert_ne!(branch, source);
+    assert_eq!(host.state(&source).await, json!("running"));
+    assert_eq!(
+        host.firecracker_pid(&source),
+        pid,
+        "the source is the same VM as before the fork"
+    );
+
+    for (machine, own) in [(&source, "source"), (&branch, "branch")] {
+        assert!(host.is_running(machine, &holding).await);
+        let script = format!(
+            "grep -qx in-memory /dev/shm/marker && grep -qx on-disk /root/marker \\
+            && test ! -e /root/own && echo {own} > /root/own && echo {own} > /dev/shm/own"
+        );
+        assert_eq!(host.exit_code(machine, &script).await, json!(0));
+    }
+    assert_eq!(host.release(&branch, &holding).await, json!(11));
+    assert!(
+        host.is_running(&source, &holding).await,
+        "each machine has its own copy of the process"
+    );
+
+    let second = host.fork(&branch).await;
+    host.pause(&source).await;
+    let third = host.fork(&source).await;
+    assert_eq!(host.state(&source).await, json!("paused"));
+    for (machine, own) in [(&second, "branch"), (&third, "source")] {
+        let script = format!("grep -qx {own} /root/own && grep -qx {own} /dev/shm/own");
+        assert_eq!(host.exit_code(machine, &script).await, json!(0));
+    }
+    assert_eq!(host.release(&third, &holding).await, json!(11));
+    host.resume(&source).await;
+    assert_eq!(host.release(&source, &holding).await, json!(11));
+    assert!(
+        std::fs::read_dir(host.state_dir.join("snapshots"))
+            .expect("snapshots dir")
+            .next()
+            .is_none(),
+        "a fork leaves no saved state behind"
+    );
+    host.finish().await;
 }
 
 #[tokio::test]
@@ -390,7 +890,7 @@ async fn a_machine_unused_for_its_idle_timeout_is_destroyed() {
         .request("DELETE", &format!("/machines/{id}"), None)
         .await;
     assert_eq!(status, 204);
-    host.stop().await;
+    host.finish().await;
 }
 
 #[tokio::test]
@@ -431,7 +931,7 @@ async fn an_open_agent_request_keeps_a_machine_from_expiring() {
     drop(events);
     host.wait_until_gone(&machine, Duration::from_secs(10))
         .await;
-    host.stop().await;
+    host.finish().await;
 }
 
 fn proxy_status_for(url: &str) -> String {
@@ -444,7 +944,10 @@ async fn egress_reaches_only_allowed_public_hosts() {
     let host = Host::start("egress").await;
 
     let allowed = host
-        .create_with(Some(json!({ "allowed_hosts": ["Example.com"] })))
+        .create_with(Some(json!({
+            "allowed_hosts": ["Example.com"],
+            "memory_mib": SMALL_MACHINE_MIB,
+        })))
         .await;
     assert_eq!(allowed["allowed_hosts"], json!(["example.com"]));
     let allowed = allowed["id"].as_str().expect("machine id");
@@ -459,7 +962,11 @@ async fn egress_reaches_only_allowed_public_hosts() {
         json!(0)
     );
 
-    let offline = host.create_with(Some(json!({ "allowed_hosts": [] }))).await;
+    let offline = host
+        .create_with(Some(
+            json!({ "allowed_hosts": [], "memory_mib": SMALL_MACHINE_MIB }),
+        ))
+        .await;
     assert_eq!(offline["allowed_hosts"], json!([]));
     let offline = offline["id"].as_str().expect("machine id");
     assert_eq!(
@@ -468,7 +975,9 @@ async fn egress_reaches_only_allowed_public_hosts() {
         json!(0)
     );
 
-    let unrestricted = host.create_with(None).await;
+    let unrestricted = host
+        .create_with(Some(json!({ "memory_mib": SMALL_MACHINE_MIB })))
+        .await;
     assert_eq!(unrestricted["allowed_hosts"], json!(["*"]));
     let unrestricted = unrestricted["id"].as_str().expect("machine id");
     assert_eq!(
@@ -482,13 +991,31 @@ async fn egress_reaches_only_allowed_public_hosts() {
         json!(0)
     );
 
-    for machine in [allowed, offline, unrestricted] {
+    host.pause(allowed).await;
+    host.resume(allowed).await;
+    let fork = host.fork(allowed).await;
+    for restored in [allowed, &fork] {
+        assert_eq!(
+            host.exit_code(restored, "curl -fsS -o /dev/null https://example.com/")
+                .await,
+            json!(0),
+            "a restored machine still reaches the hosts it is allowed"
+        );
+        assert_eq!(
+            host.exit_code(restored, &proxy_status_for("https://example.org/"))
+                .await,
+            json!(0),
+            "a restored machine is still refused the others"
+        );
+    }
+
+    for machine in [allowed, offline, unrestricted, &fork] {
         let (status, _) = host
             .request("DELETE", &format!("/machines/{machine}"), None)
             .await;
         assert_eq!(status, 204);
     }
-    host.stop().await;
+    host.finish().await;
 }
 
 const HOLD_TUNNEL_UNTIL_CLOSED: &str = r#"
@@ -584,7 +1111,7 @@ async fn allowed_hosts_change_while_a_machine_runs_and_revocation_closes_tunnels
 
     let (status, _) = host.request("DELETE", &path, None).await;
     assert_eq!(status, 204);
-    host.stop().await;
+    host.finish().await;
 }
 
 fn body_of(response: &[u8]) -> &[u8] {
@@ -664,7 +1191,7 @@ async fn files_and_ports_reach_the_machine_through_the_host() {
         .request("DELETE", &format!("/machines/{machine}"), None)
         .await;
     assert_eq!(status, 204);
-    host.stop().await;
+    host.finish().await;
 }
 
 #[tokio::test]
@@ -703,13 +1230,17 @@ async fn an_open_port_tunnel_keeps_a_machine_from_expiring() {
 
     drop(tunnel);
     host.wait_until_gone(machine, Duration::from_secs(10)).await;
-    host.stop().await;
+    host.finish().await;
 }
 
 #[tokio::test]
 #[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
 async fn memory_admission_rejects_before_boot_and_recovers_after_destroy() {
-    let host = Host::start_with_budget("memory", Some("700")).await;
+    let host = Host::start_with(
+        "memory",
+        &[("SLOP_MEMORY_MIB", "700"), ("SLOP_SPARE_MACHINES", "0")],
+    )
+    .await;
     let first = host.create().await;
     let (status, _) = host.request("POST", "/machines", None).await;
     assert_eq!(status, 503);
@@ -723,29 +1254,33 @@ async fn memory_admission_rejects_before_boot_and_recovers_after_destroy() {
     assert!(metrics.contains("machined_memory_reserved_mib 576\n"));
     assert!(metrics.contains("machined_memory_budget_mib 700\n"));
     assert!(metrics.contains("machined_creates_total{result=\"failure\"} 1\n"));
-    assert_eq!(
-        host.request("DELETE", &format!("/machines/{first}"), None)
-            .await
-            .0,
-        204
+
+    host.pause(&first).await;
+    let (_, metrics) = host.request("GET", "/metrics", None).await;
+    let metrics = metrics.as_str().unwrap();
+    assert!(
+        metrics.contains("machined_memory_reserved_mib 0\n"),
+        "a paused machine reserves no memory: {metrics}"
     );
+    assert!(metrics.contains("machined_machines{state=\"paused\"} 1\n"));
     let second = host.create().await;
-    assert_ne!(first, second);
-    assert_eq!(
-        host.request("DELETE", &format!("/machines/{second}"), None)
-            .await
-            .0,
-        204
-    );
+    let (status, body) = host.transition(&first, "resume").await;
+    assert_eq!(status, 503, "no memory to resume into: {body}");
+    assert_eq!(host.state(&first).await, json!("paused"));
+
+    host.delete(&format!("/machines/{second}")).await;
+    host.resume(&first).await;
+    host.delete(&format!("/machines/{first}")).await;
     let (_, metrics) = host.request("GET", "/metrics", None).await;
     let metrics = metrics.as_str().unwrap();
     assert!(metrics.contains("machined_machines_active 0\n"));
     assert!(metrics.contains("machined_memory_reserved_mib 0\n"));
     assert!(metrics.contains("machined_creates_total{result=\"success\"} 2\n"));
-    host.stop().await;
+    host.finish().await;
 }
 
 const CHROMIUM_MACHINE_MIB: u32 = 1024;
+const SMALL_MACHINE_MIB: u32 = 256;
 
 const CHROMIUM_LOADS_A_PAGE_SERVED_IN_THE_MACHINE: &str = r#"
 cd "$(mktemp -d)"
@@ -799,7 +1334,7 @@ async fn chromium_runs_headless_in_a_machine_without_network() {
         .request("DELETE", &format!("/machines/{machine}"), None)
         .await;
     assert_eq!(status, 204);
-    host.stop().await;
+    host.finish().await;
 }
 
 #[tokio::test]
@@ -822,5 +1357,5 @@ async fn chromium_reaches_https_sites_through_the_allowlist_without_flags() {
         .request("DELETE", &format!("/machines/{machine}"), None)
         .await;
     assert_eq!(status, 204);
-    host.stop().await;
+    host.finish().await;
 }

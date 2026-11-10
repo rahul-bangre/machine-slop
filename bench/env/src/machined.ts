@@ -19,7 +19,7 @@ export async function machinedSandboxes(
         });
     if (running.length > 0) {
         throw new ProviderNotReady(
-            `machined at ${url} already runs ${running.length} machines. Machines carry no owner, so the smoke test needs the host to itself and destroys every machine it finds.`,
+            `machined at ${url} already has ${running.length} machines, running, paused or exited. Machines carry no owner, so the smoke test needs the host to itself and destroys every machine it finds. Delete them first; they survive a machined restart.`,
         );
     }
     return {
