@@ -38,6 +38,7 @@ export type StepRecord = {
     observation_bytes: number;
     observation_sha256: string;
     observation_file: string;
+    observation_delivery: "full" | "delta";
     observation_content_checked: boolean;
     active_cpu_seconds: number;
     think_cpu_seconds: number;
@@ -88,7 +89,8 @@ export async function runAttempt(
     context: AttemptContext,
 ): Promise<AttemptRecord> {
     const { arm, task, conditions, server } = context;
-    const observer = observers[arm.observer]!;
+    const observer = observers[arm.observer]!();
+    const observed_state: ObservedState = { text: null };
     const record: AttemptRecord = {
         arm: arm.name,
         task: task.id,
@@ -124,7 +126,15 @@ export async function runAttempt(
         for (const [index, step] of task.steps.entries()) {
             current_step = step.name;
             record.steps.push(
-                await runStep(context, observer, page, meter, step, index),
+                await runStep(
+                    context,
+                    observer,
+                    observed_state,
+                    page,
+                    meter,
+                    step,
+                    index,
+                ),
             );
         }
         current_step = null;
@@ -156,9 +166,29 @@ export async function runAttempt(
     return record;
 }
 
+type ObservedState = { text: string | null };
+
+function rebuiltState(
+    observer: Observer,
+    previous_state: string | null,
+    sent: string,
+): string {
+    if (!observer.rebuild || previous_state === null) return sent;
+    try {
+        return observer.rebuild(previous_state, sent);
+    } catch (error) {
+        throw new ObservationIncomplete(
+            `delta cannot be applied to the previous state: ${
+                error instanceof Error ? error.message : error
+            }`,
+        );
+    }
+}
+
 async function runStep(
     context: AttemptContext,
     observer: Observer,
+    observed_state: ObservedState,
     page: Page,
     meter: UsageMeter,
     step: Step,
@@ -202,13 +232,21 @@ async function runStep(
     await Deno.writeFile(path, observation.bytes);
 
     if (observation.text !== null) {
-        const text = observation.text;
+        const state = rebuiltState(
+            observer,
+            observed_state.text,
+            observation.text,
+        );
+        observed_state.text = state;
+        if (observer.rebuild) {
+            await Deno.writeTextFile(`${path}.rebuilt-state.txt`, state);
+        }
         const missing = (step.observed ?? []).filter((expected) =>
-            !text.includes(expected)
+            !state.includes(expected)
         );
         if (missing.length > 0) {
             throw new ObservationIncomplete(
-                `observation lacks ${JSON.stringify(missing)} (${file})`,
+                `observed state lacks ${JSON.stringify(missing)} (${file})`,
             );
         }
     }
@@ -225,6 +263,7 @@ async function runStep(
         observation_bytes: observation.bytes.length,
         observation_sha256: await sha256Hex(observation.bytes),
         observation_file: file,
+        observation_delivery: observer.rebuild ? "delta" : "full",
         observation_content_checked: observation.text !== null &&
             (step.observed?.length ?? 0) > 0,
         active_cpu_seconds: after_active.cpu_seconds - before.cpu_seconds,

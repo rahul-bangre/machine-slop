@@ -66,9 +66,24 @@ Fixture tasks are judged from the fixture server's request log, not from the
 browser: the order or ticket the server received must be the right one. Live
 tasks are judged from page state.
 
-Each step also names text the observation must contain. An observation that
+Each step also names text the agent must be able to see. An observation that
 lacks it fails the attempt, so an observation path that is cheap because it
 drops content does not pass. Screenshots are not content-checked.
+
+## Delta observations
+
+An observer may send only what changed since its previous observation. It then
+supplies `rebuild(previous_state, sent)`, a pure function. The harness applies
+it to the state it holds itself, runs the content check against that rebuilt
+state, and counts tokens on what was sent. A delta that does not apply fails the
+attempt. Both the sent delta and the rebuilt state are saved.
+
+`ax-diff` is the reference: a full accessibility tree first, then a line delta
+diffed from a full capture. It saves tokens, not capture work, so it shows what
+delta delivery is worth before a native implementation exists.
+
+The rebuilt state is checked for the expected text only. It is not compared line
+for line with a fresh full capture.
 
 Failed attempts are kept. Timings are summarised over passing attempts only, and
 the reliability table reports how many runs passed first time, how many passed

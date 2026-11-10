@@ -51,6 +51,15 @@ const { values: flags } = parseArgs({
     },
 });
 
+function describeObservation(observer_name: string) {
+    const observer = observers[observer_name]!();
+    return {
+        format: observer.format,
+        tokenizer: observer.tokenizer,
+        delivery: observer.rebuild ? "delta" : "full",
+    };
+}
+
 function fail(message: string): never {
     console.error(message);
     Deno.exit(2);
@@ -158,10 +167,7 @@ await Deno.writeTextFile(
             },
             arms: arms.map((arm) => ({
                 ...arm,
-                observation: {
-                    format: observers[arm.observer]!.format,
-                    tokenizer: observers[arm.observer]!.tokenizer,
-                },
+                observation: describeObservation(arm.observer),
             })),
             tasks: tasks.map((task) => ({
                 id: task.id,

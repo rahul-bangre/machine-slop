@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import type { AttemptRecord } from "../src/attempt.ts";
 import { renderAxTree } from "../src/ax.ts";
+import { applyDelta, diffLines } from "../src/delta.ts";
 import { armOrder } from "../src/schedule.ts";
 import { reliability, spread } from "../src/summary.ts";
 import {
@@ -179,4 +180,45 @@ Deno.test("accessibility rendering hoists unnamed wrappers and drops text alread
             `  text "$40.35"`,
         ].join("\n"),
     );
+});
+
+Deno.test("a line delta carries only the changed lines and rebuilds the next state exactly", () => {
+    const previous = [
+        `RootWebArea "Shop"`,
+        `  status`,
+        `    text "48 products"`,
+        `  button "Cart (0)"`,
+        `  article "Copper Kettle"`,
+        `  article "Cobalt Notebook"`,
+    ].join("\n");
+    const next = [
+        `RootWebArea "Shop"`,
+        `  status`,
+        `    text "Added Cobalt Notebook to cart"`,
+        `  button "Cart (1)"`,
+        `  article "Cobalt Notebook"`,
+        `  dialog "Your cart"`,
+    ].join("\n");
+
+    const delta = diffLines(previous, next);
+    assert.equal(
+        delta,
+        [
+            `@@ -3,3`,
+            `+    text "Added Cobalt Notebook to cart"`,
+            `+  button "Cart (1)"`,
+            `@@ -7,0`,
+            `+  dialog "Your cart"`,
+        ].join("\n"),
+    );
+    assert.equal(applyDelta(previous, delta), next);
+    assert.equal(applyDelta(previous, diffLines(previous, previous)), previous);
+    assert.equal(applyDelta(previous, diffLines(previous, "")), "");
+    assert.equal(applyDelta("", diffLines("", next)), next);
+});
+
+Deno.test("a delta that does not fit the previous state is rejected instead of rebuilding a wrong one", () => {
+    assert.throws(() => applyDelta("a\nb", "@@ -5,1\n+c"));
+    assert.throws(() => applyDelta("a\nb", "@@ -2,4\n+c"));
+    assert.throws(() => applyDelta("a\nb", "stray line"));
 });
