@@ -20,4 +20,5 @@ jobs:
         run: rustup show active-toolchain
       - run: make setup
       - run: make check
+      - run: make test
       - run: make build
