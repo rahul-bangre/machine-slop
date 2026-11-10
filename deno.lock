@@ -1245,6 +1245,12 @@
         "dependencies": [
           "npm:gpt-tokenizer@4.1.0"
         ]
+      },
+      "bench/env": {
+        "dependencies": [
+          "npm:@daytona/sdk@0.231.0",
+          "npm:e2b@2.63.0"
+        ]
       }
     }
   }

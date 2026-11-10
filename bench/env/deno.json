@@ -1,0 +1,6 @@
+{
+  "imports": {
+    "@daytona/sdk": "npm:@daytona/sdk@0.231.0",
+    "e2b": "npm:e2b@2.63.0"
+  }
+}
