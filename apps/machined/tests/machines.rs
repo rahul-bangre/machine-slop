@@ -12,12 +12,26 @@ const API_KEY: &str = "test-key";
 const OTHER_API_KEY: &str = "other-key";
 const AUTHORIZED: &str = "Host: machined\r\nAuthorization: Bearer test-key\r\n";
 
-struct Host {
-    child: Child,
+struct Api {
     address: String,
     preview_address: Option<String>,
+}
+
+struct Host {
+    child: Child,
+    api: Api,
     state_dir: PathBuf,
-    env: Vec<(&'static str, &'static str)>,
+    listen: String,
+    tenants: bool,
+    env: Vec<(String, String)>,
+}
+
+impl std::ops::Deref for Host {
+    type Target = Api;
+
+    fn deref(&self) -> &Api {
+        &self.api
+    }
 }
 
 impl Host {
@@ -25,23 +39,40 @@ impl Host {
         Self::start_with(name, &[]).await
     }
 
-    async fn start_with(name: &str, env: &[(&'static str, &'static str)]) -> Self {
+    async fn start_with(name: &str, env: &[(&str, &str)]) -> Self {
+        Self::launch(name, "127.0.0.1:0", true, env).await
+    }
+
+    async fn in_fleet(name: &str, listen: &str, env: &[(&str, &str)]) -> Self {
+        Self::launch(name, listen, false, env).await
+    }
+
+    async fn launch(name: &str, listen: &str, tenants: bool, env: &[(&str, &str)]) -> Self {
         let state_dir =
             std::env::temp_dir().join(format!("machined-test-{}-{name}", std::process::id()));
-        let (child, address, preview_address) = spawn_machined(&state_dir, env).await;
+        let env: Vec<_> = env
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        let (child, address, preview_address) =
+            spawn_machined(&state_dir, listen, tenants, &env).await;
         Self {
             child,
-            address,
-            preview_address,
+            api: Api {
+                address,
+                preview_address,
+            },
             state_dir: std::fs::canonicalize(&state_dir).expect("state dir exists"),
-            env: env.to_vec(),
+            listen: listen.to_owned(),
+            tenants,
+            env,
         }
     }
 
     async fn restart(&mut self, signal: &str) {
         self.stop(signal).await;
-        (self.child, self.address, self.preview_address) =
-            spawn_machined(&self.state_dir, &self.env).await;
+        (self.child, self.api.address, self.api.preview_address) =
+            spawn_machined(&self.state_dir, &self.listen, self.tenants, &self.env).await;
     }
 
     async fn stop(&mut self, signal: &str) {
@@ -58,6 +89,63 @@ impl Host {
         assert_eq!(status.success(), signal == "-TERM");
     }
 
+    fn machine_dir(&self, machine: &str) -> PathBuf {
+        self.state_dir.join("machines").join(machine)
+    }
+
+    fn cgroup(&self) -> PathBuf {
+        let state = std::fs::metadata(&self.state_dir).expect("state dir");
+        PathBuf::from(format!(
+            "/sys/fs/cgroup/machine-slop-{}-{}",
+            state.dev(),
+            state.ino()
+        ))
+    }
+
+    fn jail_of(&self, machine: &str) -> String {
+        let scratch = std::fs::metadata(self.machine_dir(machine).join("scratch.ext4"))
+            .expect("scratch disk")
+            .ino();
+        std::fs::read_dir(self.state_dir.join("jails/firecracker"))
+            .expect("jails")
+            .filter_map(Result::ok)
+            .find(|jail| {
+                std::fs::metadata(jail.path().join("root/scratch.ext4"))
+                    .is_ok_and(|disk| disk.ino() == scratch)
+            })
+            .expect("the machine has a jail")
+            .file_name()
+            .into_string()
+            .expect("jail id")
+    }
+
+    fn firecracker_pid(&self, machine: &str) -> String {
+        let pids = vm_pids(&self.cgroup().join(self.jail_of(machine)));
+        assert_eq!(pids.len(), 1, "machine {machine} has one VM");
+        pids[0].clone()
+    }
+
+    fn all_vms(&self) -> usize {
+        std::fs::read_dir(self.cgroup())
+            .map(|jails| {
+                jails
+                    .filter_map(Result::ok)
+                    .filter(|jail| jail.path().is_dir())
+                    .map(|jail| vm_pids(&jail.path()).len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    async fn finish(mut self) {
+        if self.child.try_wait().expect("machined status").is_none() {
+            self.stop("-TERM").await;
+        }
+        std::fs::remove_dir_all(&self.state_dir).expect("remove state dir");
+    }
+}
+
+impl Api {
     async fn request(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let body = body.map(|body| body.to_string()).unwrap_or_default();
         self.send(method, path, &body).await
@@ -268,10 +356,6 @@ impl Host {
         assert_eq!(status, 204, "delete {path}: {body}");
     }
 
-    fn machine_dir(&self, machine: &str) -> PathBuf {
-        self.state_dir.join("machines").join(machine)
-    }
-
     async fn exchange(&self, head: &str, body: &[u8]) -> Vec<u8> {
         tokio::time::timeout(Duration::from_secs(60), async {
             let mut stream = TcpStream::connect(&self.address).await.expect("connect");
@@ -365,57 +449,6 @@ impl Host {
         .await
         .expect("tunnel upgrade completes within 10 seconds")
     }
-
-    fn cgroup(&self) -> PathBuf {
-        let state = std::fs::metadata(&self.state_dir).expect("state dir");
-        PathBuf::from(format!(
-            "/sys/fs/cgroup/machine-slop-{}-{}",
-            state.dev(),
-            state.ino()
-        ))
-    }
-
-    fn jail_of(&self, machine: &str) -> String {
-        let scratch = std::fs::metadata(self.machine_dir(machine).join("scratch.ext4"))
-            .expect("scratch disk")
-            .ino();
-        std::fs::read_dir(self.state_dir.join("jails/firecracker"))
-            .expect("jails")
-            .filter_map(Result::ok)
-            .find(|jail| {
-                std::fs::metadata(jail.path().join("root/scratch.ext4"))
-                    .is_ok_and(|disk| disk.ino() == scratch)
-            })
-            .expect("the machine has a jail")
-            .file_name()
-            .into_string()
-            .expect("jail id")
-    }
-
-    fn firecracker_pid(&self, machine: &str) -> String {
-        let pids = vm_pids(&self.cgroup().join(self.jail_of(machine)));
-        assert_eq!(pids.len(), 1, "machine {machine} has one VM");
-        pids[0].clone()
-    }
-
-    fn all_vms(&self) -> usize {
-        std::fs::read_dir(self.cgroup())
-            .map(|jails| {
-                jails
-                    .filter_map(Result::ok)
-                    .filter(|jail| jail.path().is_dir())
-                    .map(|jail| vm_pids(&jail.path()).len())
-                    .sum()
-            })
-            .unwrap_or(0)
-    }
-
-    async fn finish(mut self) {
-        if self.child.try_wait().expect("machined status").is_none() {
-            self.stop("-TERM").await;
-        }
-        std::fs::remove_dir_all(&self.state_dir).expect("remove state dir");
-    }
 }
 
 impl Drop for Host {
@@ -455,31 +488,37 @@ fn digest(key: &str) -> String {
         .collect()
 }
 
-async fn spawn_machined(
-    state_dir: &std::path::Path,
-    env: &[(&'static str, &'static str)],
-) -> (Child, String, Option<String>) {
-    let image_dir = std::env::var("SLOP_IMAGE_DIR")
-        .expect("SLOP_IMAGE_DIR names a directory built by vm/image/build.sh");
+fn tenants_file() -> Value {
     let quotas = json!({
         "running_machines": 16,
         "memory_mib": 1 << 20,
         "disk_gib": 1 << 20,
         "creates_per_second": 1000,
     });
-    let tenants = json!({ "tenants": [
+    json!({ "tenants": [
         { "id": "tenant", "api_key_sha256": [digest(API_KEY)], "quotas": quotas },
         { "id": "other", "api_key_sha256": [digest(OTHER_API_KEY)], "quotas": quotas },
-    ]});
+    ]})
+}
+
+async fn spawn_machined(
+    state_dir: &std::path::Path,
+    listen: &str,
+    with_tenants: bool,
+    env: &[(String, String)],
+) -> (Child, String, Option<String>) {
+    let image_dir = std::env::var("SLOP_IMAGE_DIR")
+        .expect("SLOP_IMAGE_DIR names a directory built by vm/image/build.sh");
     std::fs::create_dir_all(state_dir).expect("create state dir");
-    let tenants_file = state_dir.join("tenants.json");
-    std::fs::write(&tenants_file, tenants.to_string()).expect("write tenants file");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_machined"))
-        .arg("127.0.0.1:0")
-        .arg(image_dir)
-        .arg(state_dir)
-        .arg(tenants_file)
-        .envs(env.iter().copied())
+    let mut command = Command::new(env!("CARGO_BIN_EXE_machined"));
+    command.arg(listen).arg(image_dir).arg(state_dir);
+    if with_tenants {
+        let tenants = state_dir.join("tenants.json");
+        std::fs::write(&tenants, tenants_file().to_string()).expect("write tenants file");
+        command.arg(tenants);
+    }
+    let mut child = command
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -1952,4 +1991,214 @@ async fn a_machine_runs_jailed_and_only_its_tenant_reaches_it() {
     host.delete(&format!("/machines/{machine}")).await;
     assert!(!running(&pid));
     host.finish().await;
+}
+
+struct RemovedOnDrop(PathBuf);
+
+impl Drop for RemovedOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn free_address() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    listener.local_addr().expect("address").to_string()
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn a_snapshot_taken_on_one_fleet_host_starts_a_machine_on_another_through_controld() {
+    let scratch = RemovedOnDrop(
+        std::env::temp_dir().join(format!("machined-test-{}-fleet", std::process::id())),
+    );
+    let _ = std::fs::remove_dir_all(&scratch.0);
+    std::fs::create_dir_all(&scratch.0).expect("scratch dir");
+    let store = format!("file://{}", scratch.0.join("store").display());
+    let control_key_file = scratch.0.join("control.key");
+    std::fs::write(&control_key_file, "fleet-control-key").expect("control key");
+    let (tenants, keys) =
+        slop_machines::parse_tenants(&tenants_file().to_string()).expect("tenants");
+    let control = controld::Control::open(controld::Config {
+        store: slop_machines::Store::open(&store).expect("store"),
+        state_dir: scratch.0.join("controld"),
+        tenants,
+        keys,
+        control_key: "fleet-control-key".into(),
+    })
+    .await
+    .expect("open controld");
+    tokio::spawn(control.clone().reconcile_periodically());
+    let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind controld");
+    let control_address = control_listener.local_addr().expect("address").to_string();
+    tokio::spawn(async move { axum::serve(control_listener, controld::app(control)).await });
+    let control_url = format!("http://{control_address}");
+    let api = Api {
+        address: control_address,
+        preview_address: None,
+    };
+
+    let mut hosts = Vec::new();
+    for name in ["fleet-a", "fleet-b"] {
+        let listen = free_address().await;
+        let advertised = format!("http://{listen}");
+        let key_file = control_key_file.display().to_string();
+        let env = [
+            ("SLOP_STORE", store.as_str()),
+            ("SLOP_CONTROL_URL", control_url.as_str()),
+            ("SLOP_ADVERTISE_URL", advertised.as_str()),
+            ("SLOP_CONTROL_KEY_FILE", key_file.as_str()),
+            ("SLOP_SPARE_MACHINES", "0"),
+            ("SLOP_MEMORY_MIB", "640"),
+        ];
+        hosts.push(Host::in_fleet(name, &listen, &env).await);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, reported) = api
+            .request_as(
+                "Authorization: Bearer fleet-control-key\r\n",
+                "GET",
+                "/hosts",
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "hosts: {reported}");
+        let reporting = reported.as_array().map_or(0, |hosts| {
+            hosts
+                .iter()
+                .filter(|host| host["reporting"] == true)
+                .count()
+        });
+        if reporting == 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "hosts never reported: {reported}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let source = api.create().await;
+    let holding = api.start_holding(&source, 9).await;
+    assert_eq!(
+        api.exit_code(
+            &source,
+            "echo in-memory > /dev/shm/marker && echo on-disk > /root/marker"
+        )
+        .await,
+        json!(0)
+    );
+    let snapshot = api.snapshot(&source).await;
+    let (source_host, other_host) = if hosts[0].machine_dir(&source).exists() {
+        (&hosts[0], &hosts[1])
+    } else {
+        (&hosts[1], &hosts[0])
+    };
+    assert!(source_host.machine_dir(&source).exists());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let restored = loop {
+        let (status, info) = api
+            .request(
+                "POST",
+                "/machines",
+                Some(json!({ "snapshot_id": snapshot })),
+            )
+            .await;
+        if status == 201 {
+            break info["id"].as_str().expect("machine id").to_owned();
+        }
+        assert_eq!(status, 503, "create from snapshot: {info}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the other host never reported room: {info}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(
+        other_host.machine_dir(&restored).exists(),
+        "the source's host is full, so the snapshot starts on the other host"
+    );
+    assert_eq!(
+        api.exit_code(
+            &restored,
+            "grep -qx in-memory /dev/shm/marker && grep -qx on-disk /root/marker"
+        )
+        .await,
+        json!(0)
+    );
+    assert_eq!(api.release(&restored, &holding).await, json!(9));
+    assert!(api.is_running(&source, &holding).await);
+
+    api.start_process(
+        &restored,
+        "exec python3 -c 'import socket; s = socket.create_server((\"127.0.0.1\", 8300)); c, _ = s.accept(); c.sendall(c.recv(5))'",
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut tunnel = loop {
+        if let Some(tunnel) = api.tunnel(&restored, 8300).await {
+            break tunnel;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "listener never accepted a tunnel through controld"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    tunnel.write_all(b"hello").await.expect("write tunnel");
+    let mut echoed = [0; 5];
+    tunnel.read_exact(&mut echoed).await.expect("read tunnel");
+    assert_eq!(&echoed, b"hello");
+
+    let (status, listed) = api.request("GET", "/machines", None).await;
+    assert_eq!(status, 200, "list: {listed}");
+    assert_eq!(listed.as_array().map(Vec::len), Some(2));
+    let (status, others) = api
+        .request_as(
+            "Authorization: Bearer other-key\r\n",
+            "GET",
+            "/machines",
+            None,
+        )
+        .await;
+    assert_eq!((status, others), (200, json!([])));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, usage) = api.request("GET", "/usage", None).await;
+        assert_eq!(status, 200, "usage: {usage}");
+        if usage["vcpu_ms"].as_u64().unwrap_or(0) > 0
+            && usage["snapshot_mib_ms"].as_u64().unwrap_or(0) > 0
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "usage never reached controld: {usage}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    api.delete(&format!("/snapshots/{snapshot}")).await;
+    let (status, _) = api
+        .request(
+            "POST",
+            "/machines",
+            Some(json!({ "snapshot_id": snapshot })),
+        )
+        .await;
+    assert_eq!(status, 404);
+    for machine in [&source, &restored] {
+        api.delete(&format!("/machines/{machine}")).await;
+    }
+    for host in hosts {
+        host.finish().await;
+    }
 }

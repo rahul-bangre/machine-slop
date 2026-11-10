@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use crate::{Quotas, TenantConfig};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use slop_machines::{Quotas, TenantConfig};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

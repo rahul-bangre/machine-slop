@@ -16,7 +16,9 @@ use tokio::{
 };
 use tower::ServiceExt;
 
-use crate::{ApiError, agentd, relay_until_either_side_ends, relay_upgrades, unreachable_agentd};
+use slop_machines::relay_until_either_side_ends;
+
+use crate::{ApiError, agentd, relay_upgrades, unreachable_agentd};
 
 const TCP: &str = "tcp";
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;

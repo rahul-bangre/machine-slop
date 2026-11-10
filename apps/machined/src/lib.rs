@@ -1,5 +1,4 @@
 mod preview;
-mod tenants;
 
 use std::sync::Arc;
 
@@ -8,26 +7,47 @@ use axum::{
     body::{Body, Bytes},
     extract::{FromRequestParts, Path, Request, State},
     http::{StatusCode, Uri, header, request::Parts},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
 use hyper::{client::conn::http1::SendRequest, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
+use sha2::Digest;
 use slop_machines::{
-    CreateMachine, CreatePreview, CreateSnapshot, IdempotencyKey, Machine, MachineError,
-    MachineInfo, MachineState, Machines, PreviewInfo, SnapshotInfo, Tenant, TenantUsage,
-    UpdateMachine,
+    CreateMachine, CreatePreview, CreateSnapshot, HostReport, HostReportReply, IdempotencyKey,
+    Machine, MachineError, MachineInfo, MachineState, Machines, PreviewInfo, Settlement,
+    SnapshotInfo, Tenant, TenantUsage, UpdateMachine,
 };
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 pub use preview::serve_previews;
-pub use tenants::{ApiKeys, parse as parse_tenants};
+pub use slop_machines::{ApiKeys, parse_tenants};
 
 pub struct Host {
     pub machines: Arc<Machines>,
-    pub keys: ApiKeys,
+    pub access: Access,
 }
+
+pub enum Access {
+    TenantKeys(ApiKeys),
+    ControlPlane(ControlKey),
+}
+
+pub struct ControlKey([u8; 32]);
+
+impl ControlKey {
+    pub fn new(key: &str) -> Self {
+        Self(sha2::Sha256::digest(key.trim().as_bytes()).into())
+    }
+
+    pub fn admits(&self, presented: &str) -> bool {
+        <[u8; 32]>::from(sha2::Sha256::digest(presented.as_bytes())) == self.0
+    }
+}
+
+pub const TENANT_HEADER: &str = "slop-tenant";
+pub const GENERATION_HEADER: &str = "slop-generation";
 
 pub fn app(host: Arc<Host>) -> Router {
     Router::new()
@@ -47,7 +67,42 @@ pub fn app(host: Arc<Host>) -> Router {
         )
         .route("/previews", get(list_previews).post(create_preview))
         .route("/previews/{id}", get(preview_info).delete(delete_preview))
+        .route("/operations/{key}/settle", post(settle))
+        .layer(middleware::from_fn_with_state(
+            host.clone(),
+            stamp_generation,
+        ))
         .with_state(host)
+}
+
+async fn stamp_generation(State(host): State<Arc<Host>>, request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if host.machines.pool().is_some() {
+        let generation = host.machines.generation();
+        if let Ok(value) =
+            header::HeaderValue::from_str(&format!("{}.{}", generation.boot, generation.change))
+        {
+            response.headers_mut().insert(GENERATION_HEADER, value);
+        }
+    }
+    response
+}
+
+async fn settle(
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
+    Path(key): Path<String>,
+) -> Result<Response, ApiError> {
+    let key = IdempotencyKey::parse(&key)?;
+    let (settlement, _) = host.machines.settle(&tenant, key).await?;
+    Ok(match settlement {
+        Settlement::Made(info) => Json(info).into_response(),
+        Settlement::Nothing => (
+            StatusCode::NOT_FOUND,
+            "no machine exists for this operation, and none will be made for it",
+        )
+            .into_response(),
+    })
 }
 
 struct Caller(Arc<Tenant>);
@@ -56,12 +111,19 @@ impl FromRequestParts<Arc<Host>> for Caller {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, host: &Arc<Host>) -> Result<Self, Response> {
-        parts
+        let presented = parts
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .and_then(|key| host.keys.tenant_of(key))
+            .and_then(|value| value.strip_prefix("Bearer "));
+        let tenant = match &host.access {
+            Access::TenantKeys(keys) => presented.and_then(|key| keys.tenant_of(key)),
+            Access::ControlPlane(control) => presented
+                .filter(|key| control.admits(key))
+                .and_then(|_| parts.headers.get(TENANT_HEADER))
+                .and_then(|value| value.to_str().ok()),
+        };
+        tenant
             .and_then(|tenant| host.machines.tenant(tenant))
             .map(Self)
             .ok_or_else(|| {
@@ -89,6 +151,74 @@ impl<S: Sync> FromRequestParts<S> for Retry {
                 })?;
                 Ok(Self(Some(IdempotencyKey::parse(key)?)))
             }
+        }
+    }
+}
+
+pub const REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub async fn report_to_control_plane(
+    machines: Arc<Machines>,
+    control: String,
+    advertised: String,
+    control_key: String,
+) {
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<http_body_util::Full<Bytes>>();
+    let endpoint = format!("{}/hosts", control.trim_end_matches('/'));
+    let mut reaching = true;
+    let mut ticks = tokio::time::interval(REPORT_INTERVAL);
+    loop {
+        ticks.tick().await;
+        let (Some(pool), Some(store)) = (machines.pool(), machines.store()) else {
+            return;
+        };
+        let (generation, reported, executions) = machines.report().await;
+        let report = HostReport {
+            url: advertised.clone(),
+            pool: pool.to_owned(),
+            store: store.url().to_owned(),
+            room: machines.room().await,
+            egress_addresses: machines.egress_addresses(),
+            generation,
+            machines: reported,
+            executions,
+        };
+        let sent = async {
+            let body = serde_json::to_vec(&report).map_err(|error| error.to_string())?;
+            let request = hyper::Request::post(endpoint.as_str())
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {control_key}"))
+                .body(http_body_util::Full::new(Bytes::from(body)))
+                .map_err(|error| error.to_string())?;
+            let response = tokio::time::timeout(REPORT_INTERVAL, client.request(request))
+                .await
+                .map_err(|_| "no answer".to_owned())?
+                .map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("control plane answered {}", response.status()));
+            }
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .map_err(|error| error.to_string())?
+                .to_bytes();
+            let reply: HostReportReply =
+                serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+            machines
+                .forget_executions(&reply.recorded_executions)
+                .await
+                .map_err(|error| format!("forgetting recorded executions failed: {error}"))
+        };
+        match (sent.await, reaching) {
+            (Ok(()), false) => {
+                tracing::info!(%control, "reporting to the control plane");
+                reaching = true;
+            }
+            (Err(error), true) => {
+                tracing::warn!(%control, %error, "reporting to the control plane failed");
+                reaching = false;
+            }
+            _ => {}
         }
     }
 }
@@ -204,8 +334,8 @@ async fn create_snapshot(
 async fn list_snapshots(
     State(host): State<Arc<Host>>,
     Caller(tenant): Caller,
-) -> Json<Vec<SnapshotInfo>> {
-    Json(host.machines.snapshots(&tenant).await)
+) -> Result<Json<Vec<SnapshotInfo>>, ApiError> {
+    Ok(Json(host.machines.snapshots(&tenant).await?))
 }
 
 async fn snapshot_info(
@@ -213,8 +343,7 @@ async fn snapshot_info(
     Caller(tenant): Caller,
     Path(id): Path<String>,
 ) -> Result<Json<SnapshotInfo>, ApiError> {
-    let snapshot = host.machines.snapshot_info(&tenant, &id).await;
-    Ok(Json(snapshot.ok_or(MachineError::UnknownSnapshot)?))
+    Ok(Json(host.machines.snapshot_info(&tenant, &id).await?))
 }
 
 async fn delete_snapshot(
@@ -316,22 +445,8 @@ async fn agentd(
 
 async fn relay_upgrades(client: OnUpgrade, upstream: OnUpgrade) {
     if let (Ok(client), Ok(upstream)) = tokio::join!(client, upstream) {
-        relay_until_either_side_ends(TokioIo::new(client), TokioIo::new(upstream)).await;
-    }
-}
-
-async fn relay_until_either_side_ends(
-    client: impl AsyncRead + AsyncWrite + Unpin,
-    agentd: impl AsyncRead + AsyncWrite + Unpin,
-) {
-    let (mut from_client, mut to_client) = tokio::io::split(client);
-    let (mut from_agentd, mut to_agentd) = tokio::io::split(agentd);
-    tokio::select! {
-        _ = tokio::io::copy(&mut from_client, &mut to_agentd) => {}
-        _ = async {
-            let _ = tokio::io::copy(&mut from_agentd, &mut to_client).await;
-            let _ = to_client.shutdown().await;
-        } => {}
+        slop_machines::relay_until_either_side_ends(TokioIo::new(client), TokioIo::new(upstream))
+            .await;
     }
 }
 
@@ -386,6 +501,7 @@ impl From<MachineError> for ApiError {
             | MachineError::UnknownPreview => StatusCode::NOT_FOUND,
             MachineError::Conflict(_) => StatusCode::CONFLICT,
             MachineError::Capacity | MachineError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+            MachineError::Store(_) => StatusCode::BAD_GATEWAY,
             MachineError::Boot(_) | MachineError::Failed { .. } | MachineError::Io(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }

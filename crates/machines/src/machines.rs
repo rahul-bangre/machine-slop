@@ -12,12 +12,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, watch};
+use tokio::sync::{
+    Mutex, Notify, OwnedSemaphorePermit, RwLock, RwLockWriteGuard, Semaphore, watch,
+};
 
 use crate::{
     contract::{
-        CreateMachine, CreatePreview, CreateSnapshot, MachineInfo, MachineState, PreviewInfo,
-        SnapshotInfo, UpdateMachine,
+        CreateMachine, CreatePreview, CreateSnapshot, ExecutionUsage, Generation, MachineInfo,
+        MachineState, PreviewInfo, ReportedMachine, Room, SnapshotInfo, UpdateMachine,
     },
     egress::{Egress, EgressPolicy, MAX_MACHINE_EGRESS_FILES, can_send_from},
     files,
@@ -25,16 +27,59 @@ use crate::{
     gateway::Gateway,
     machine::{
         Activity, BootError, Booted, Disk, Image, Machine, MachineSpec, MachineUse, Ownership,
-        provisioned_disk_mib,
+        SAVED_FILES, provisioned_disk_mib,
     },
     previews::{
         DEFAULT_PREVIEW_TTL_SECS, MAX_PREVIEW_CONNECTIONS, MAX_PREVIEW_TTL_SECS,
         MAX_PREVIEWS_PER_MACHINE, PREVIEW_FILES_PER_CONNECTION, Preview, PreviewOrigin, PreviewUse,
     },
+    store::{Digests, Store, StoredSnapshot, seed_image_cache},
     tenants::{
         Idempotency, IdempotencyKey, Storage, Tenant, TenantCharge, TenantConfig, Tenants, unix_ms,
     },
 };
+
+pub enum Tenancy {
+    Local(Vec<TenantConfig>),
+    Fleet { pool: String, store: Arc<Store> },
+}
+
+struct Fleet {
+    pool: String,
+    store: Arc<Store>,
+    images_dir: PathBuf,
+    abandoned_dir: PathBuf,
+    digests: Digests,
+    fetching: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    boot: u64,
+    changes: AtomicU64,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CopyRecord {
+    store: String,
+    info: SnapshotInfo,
+    tenant: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Mode {
+    Standalone,
+    Fleet,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ModeRecord {
+    mode: Mode,
+    #[serde(default)]
+    boots: u64,
+}
+
+pub enum Settlement {
+    Made(MachineInfo),
+    Nothing,
+}
 
 #[derive(Default)]
 pub struct Network {
@@ -43,7 +88,7 @@ pub struct Network {
 }
 
 const DEFAULT_VCPUS: u8 = 2;
-const DEFAULT_MEMORY_MIB: u32 = 512;
+pub const DEFAULT_MEMORY_MIB: u32 = 512;
 const MAX_VCPUS: u8 = 32;
 const DEFAULT_IDLE_TIMEOUT_SECS: u32 = 600;
 const MEMORY_MIB_RANGE: std::ops::RangeInclusive<u32> = 128..=32768;
@@ -52,6 +97,9 @@ const OPEN_FILES_OUTSIDE_EGRESS: u64 = 4096;
 pub(crate) const MACHINE_OVERHEAD_MIB: u32 = 64;
 const HOST_RESERVE_MIB: u32 = 512;
 const SNAPSHOT_RECORD: &str = "snapshot.json";
+const COPY_RECORD: &str = "copy.json";
+const MODE_RECORD: &str = "mode.json";
+const ABANDONED_KEY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -67,6 +115,7 @@ pub enum MachineError {
     },
     Capacity,
     ShuttingDown,
+    Store(io::Error),
     Boot(BootError),
     Failed {
         message: String,
@@ -79,7 +128,7 @@ impl std::error::Error for MachineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Boot(error) => Some(error),
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::Store(error) => Some(error),
             _ => None,
         }
     }
@@ -101,6 +150,7 @@ impl std::fmt::Display for MachineError {
             Self::UnknownPreview => write!(f, "unknown preview"),
             Self::Capacity => write!(f, "machine capacity reached"),
             Self::ShuttingDown => write!(f, "host is shutting down"),
+            Self::Store(error) => write!(f, "snapshot store: {error}"),
             Self::Boot(error) => write!(f, "{error}"),
             Self::Failed { message, state } => {
                 let state = match state {
@@ -138,9 +188,9 @@ impl Admission {
         self.tenant = Some(charge);
     }
 
-    pub(crate) fn start_metering(&mut self) {
+    pub(crate) fn start_metering(&mut self, machine_id: &str) {
         if let Some(charge) = &mut self.tenant {
-            charge.start_metering();
+            charge.start_metering(machine_id);
         }
     }
 
@@ -174,6 +224,7 @@ pub struct Machines {
     gateway: Arc<Gateway>,
     network: Network,
     tenants: Tenants,
+    fleet: Option<Fleet>,
     seats: Arc<std::sync::Mutex<Vec<u32>>>,
     machines_dir: PathBuf,
     snapshots_dir: PathBuf,
@@ -227,6 +278,20 @@ struct Snapshot {
     storage: std::sync::Mutex<Option<Storage>>,
 }
 
+enum Restorable {
+    Local(Arc<Snapshot>),
+    Stored(StoredSnapshot),
+}
+
+impl Restorable {
+    fn info(&self) -> &SnapshotInfo {
+        match self {
+            Self::Local(snapshot) => &snapshot.info,
+            Self::Stored(stored) => &stored.info,
+        }
+    }
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct SnapshotRecord {
     #[serde(flatten)]
@@ -241,7 +306,7 @@ impl Machines {
         image_dir: PathBuf,
         state_dir: PathBuf,
         limits: Limits,
-        tenants: Vec<TenantConfig>,
+        tenancy: Tenancy,
         network: Network,
     ) -> io::Result<Arc<Self>> {
         let image = Image::in_dir(&image_dir)?;
@@ -280,7 +345,31 @@ impl Machines {
         let snapshots_dir = tokio::fs::canonicalize(snapshots_dir).await?;
         let jail = Jail::new(image.jailer(), &state_dir)?;
         jail.kill_orphans()?;
-        let tenants = Tenants::open(&state_dir, tenants).await?;
+        let boots = record_mode(&state_dir, &tenancy).await?;
+        let (tenants, fleet) = match tenancy {
+            Tenancy::Local(configs) => (Tenants::open(&state_dir, configs).await?, None),
+            Tenancy::Fleet { pool, store } => {
+                let images_dir = state_dir.join("images");
+                let abandoned_dir = state_dir.join("abandoned");
+                for dir in [&images_dir, &abandoned_dir] {
+                    tokio::fs::create_dir_all(dir).await?;
+                    tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+                }
+                remove_unused_images(&images_dir).await?;
+                remove_old_files(&abandoned_dir, ABANDONED_KEY_RETENTION).await?;
+                let fleet = Fleet {
+                    pool,
+                    store,
+                    images_dir: tokio::fs::canonicalize(images_dir).await?,
+                    abandoned_dir: tokio::fs::canonicalize(abandoned_dir).await?,
+                    digests: Digests::new(),
+                    fetching: std::sync::Mutex::default(),
+                    boot: boots,
+                    changes: AtomicU64::new(0),
+                };
+                (Tenants::open_for_fleet(&state_dir).await?, Some(fleet))
+            }
+        };
         let gateway = Gateway::open(&state_dir).await?;
         let mut state = State::default();
         for (id, dir) in subdirectories(&machines_dir).await? {
@@ -295,30 +384,22 @@ impl Machines {
             }
         }
         for (id, dir) in subdirectories(&snapshots_dir).await? {
-            if !tokio::fs::try_exists(dir.join(SNAPSHOT_RECORD)).await? {
-                tokio::fs::remove_dir_all(&dir).await?;
-                continue;
-            }
-            match files::read_record::<SnapshotRecord>(&dir, SNAPSHOT_RECORD).await {
-                Ok(record) => {
-                    let tenant = tenants.owner(&record.tenant);
-                    let mib = stored_mib(record.info.stored_bytes);
-                    let metered_since = record.info.created_unix_ms.max(tenants.recorded_as_of());
-                    let storage = tenant.store(tenant.keep_disk(mib), mib, metered_since);
-                    let snapshot = Snapshot {
-                        info: record.info,
-                        tenant,
-                        idempotency: record.idempotency,
-                        dir,
-                        deleted: RwLock::new(false),
-                        storage: std::sync::Mutex::new(Some(storage)),
-                    };
+            let recovered = match &fleet {
+                None => recover_snapshot(&dir, &tenants).await,
+                Some(fleet) => recover_copy(&dir, fleet, &tenants).await,
+            };
+            match recovered {
+                Ok(Some(snapshot)) => {
                     state.snapshots.insert(id, Arc::new(snapshot));
                 }
+                Ok(None) => tokio::fs::remove_dir_all(&dir).await?,
                 Err(error) => {
                     tracing::error!(path = %dir.display(), %error, "ignoring unreadable snapshot");
                 }
             }
+        }
+        if let Some(fleet) = &fleet {
+            drop_deleted_copies(&fleet.store, &mut state.snapshots).await;
         }
         for machine in state.machines.values() {
             if let Some(source) = machine.egress_source()
@@ -350,6 +431,7 @@ impl Machines {
             gateway,
             network,
             tenants,
+            fleet,
             seats: Arc::new(std::sync::Mutex::new(seats)),
             machines_dir,
             snapshots_dir,
@@ -367,11 +449,30 @@ impl Machines {
         }
         machines.boot_spares();
         tokio::spawn(flush_usage_periodically(Arc::downgrade(&machines)));
+        if machines.fleet.is_some() {
+            let seeding = machines.clone();
+            tokio::spawn(async move {
+                let Some(fleet) = &seeding.fleet else {
+                    return;
+                };
+                let files = seeding.image.saved_with();
+                if let Err(error) =
+                    seed_image_cache(&fleet.digests, &files, &fleet.images_dir).await
+                {
+                    tracing::warn!(%error, "this host's image was not offered to snapshot downloads");
+                }
+                fleet.store.sweep_abandoned_uploads().await;
+            });
+        }
         Ok(machines)
     }
 
     pub fn tenant(&self, id: &str) -> Option<Arc<Tenant>> {
-        self.tenants.get(id)
+        match &self.fleet {
+            Some(_) if is_tenant_id(id) => Some(self.tenants.owner(id)),
+            Some(_) => None,
+            None => self.tenants.get(id),
+        }
     }
 
     async fn replayed_machine(
@@ -448,6 +549,7 @@ impl Machines {
         if let Some(machine) = self.replayed_machine(tenant, attempt.as_ref()).await? {
             return Ok(machine);
         }
+        self.refuse_abandoned(tenant, attempt.as_ref()).await?;
         let snapshot = match &request.snapshot_id {
             None => None,
             Some(_) if request.vcpus.is_some() || request.memory_mib.is_some() => {
@@ -455,17 +557,13 @@ impl Machines {
                     "vcpus and memory_mib come from the snapshot".into(),
                 ));
             }
-            Some(id) => Some(
-                self.snapshot(tenant, id)
-                    .await
-                    .ok_or(MachineError::UnknownSnapshot)?,
-            ),
+            Some(id) => Some(self.restorable_snapshot(tenant, id).await?),
         };
         let (vcpus, memory_mib, inherited_hosts) = match &snapshot {
             Some(snapshot) => (
-                snapshot.info.vcpus,
-                snapshot.info.memory_mib,
-                snapshot.info.allowed_hosts.clone(),
+                snapshot.info().vcpus,
+                snapshot.info().memory_mib,
+                snapshot.info().allowed_hosts.clone(),
             ),
             None => (
                 request.vcpus.unwrap_or(DEFAULT_VCPUS),
@@ -527,16 +625,19 @@ impl Machines {
             let request_started = Instant::now();
             let booted = match snapshot {
                 None => machines.boot(&spec, charge).await,
-                Some(snapshot) => {
-                    let deleted = snapshot.deleted.read().await;
-                    if *deleted {
-                        Err(MachineError::UnknownSnapshot)
-                    } else {
-                        machines
-                            .restore(&snapshot.dir, Disk::Copy, &spec, charge)
-                            .await
+                Some(snapshot) => match machines.local_copy(snapshot).await {
+                    Err(error) => Err(error),
+                    Ok(snapshot) => {
+                        let deleted = snapshot.deleted.read().await;
+                        if *deleted {
+                            Err(MachineError::UnknownSnapshot)
+                        } else {
+                            machines
+                                .restore(&snapshot.dir, Disk::Copy, &spec, charge)
+                                .await
+                        }
                     }
-                }
+                },
             };
             let created = machines
                 .admit(
@@ -572,6 +673,7 @@ impl Machines {
         if let Some(machine) = self.replayed_machine(tenant, attempt.as_ref()).await? {
             return Ok(machine);
         }
+        self.refuse_abandoned(tenant, attempt.as_ref()).await?;
         let source = self
             .begin_use(tenant, id)
             .await
@@ -794,6 +896,7 @@ impl Machines {
             let id = machine.id().to_owned();
             state.machines.insert(id, machine.clone());
             drop(state);
+            self.changed();
             self.destroy_when_idle(&machine);
             Ok(machine)
         };
@@ -969,6 +1072,7 @@ impl Machines {
         let machines = self.clone();
         run_to_completion(async move {
             let paused = machine.exclusive().await.pause().await;
+            machines.changed();
             machines.boot_spares();
             log_outcome(
                 &paused,
@@ -1004,6 +1108,7 @@ impl Machines {
                 Ok(machine.info())
             };
             let resumed = resumed.await;
+            machines.changed();
             machines.boot_spares();
             log_outcome(
                 &resumed,
@@ -1043,6 +1148,7 @@ impl Machines {
 
     async fn destroy_unlisted(self: &Arc<Self>, machine: Arc<Machine>) -> io::Result<()> {
         let destroyed = machine.exclusive().await.destroy().await;
+        self.changed();
         log_outcome(
             &destroyed,
             machine.id(),
@@ -1073,6 +1179,25 @@ impl Machines {
         if let Some(info) = self.replayed_snapshot(tenant, attempt.as_ref()).await? {
             return Ok(info);
         }
+        let fleet_snapshot_id = match (&self.fleet, &attempt) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(MachineError::Invalid(
+                    "a fleet host takes snapshots only for operations with a key".into(),
+                ));
+            }
+            (Some(fleet), Some(attempt)) => match fleet.store.snapshot(attempt.key()).await {
+                Ok(Some(stored)) if stored.tenant == tenant.id() => return Ok(stored.info),
+                Ok(Some(_)) => {
+                    return Err(MachineError::Conflict(format!(
+                        "operation {} belongs to another tenant",
+                        attempt.key()
+                    )));
+                }
+                Ok(None) => Some(attempt.key().to_owned()),
+                Err(error) => return Err(MachineError::Store(error)),
+            },
+        };
         let machine = self
             .begin_use(tenant, &request.machine_id)
             .await
@@ -1086,13 +1211,14 @@ impl Machines {
                 let spec = machine.spec();
                 let provisional = tenant.reserve_disk(provisioned_disk_mib(spec.memory_mib))?;
                 let mut info = SnapshotInfo {
-                    id: new_id(),
+                    id: fleet_snapshot_id.unwrap_or_else(new_id),
                     machine_id: machine.id().to_owned(),
                     vcpus: spec.vcpus,
                     memory_mib: spec.memory_mib,
                     allowed_hosts: spec.egress.allowed_hosts(),
                     created_unix_ms: unix_ms(),
                     stored_bytes: 0,
+                    pool: machines.fleet.as_ref().map(|fleet| fleet.pool.clone()),
                 };
                 let dir = machines.snapshots_dir.join(&info.id);
                 tokio::fs::create_dir(&dir)
@@ -1104,24 +1230,38 @@ impl Machines {
                     Ok(()) => match stored_bytes(&dir).await {
                         Ok(stored) => {
                             info.stored_bytes = stored;
-                            let record = SnapshotRecord {
-                                info: info.clone(),
-                                tenant: tenant.id().to_owned(),
-                                idempotency: attempt.clone(),
-                            };
-                            files::commit(&dir, SNAPSHOT_RECORD, &record)
+                            machines
+                                .record_snapshot(&tenant, attempt.clone(), &info, &dir)
                                 .await
-                                .map_err(MachineError::Io)
                         }
                         Err(error) => Err(MachineError::Io(error)),
                     },
                     Err(error) => Err(error),
                 };
-                if let Err(error) = recorded {
-                    if let Err(error) = files::discard(&dir, SNAPSHOT_RECORD).await {
-                        tracing::error!(path = %dir.display(), %error, "snapshot cleanup failed");
+                let kept_locally = match recorded {
+                    Ok(kept_locally) => kept_locally,
+                    Err(error) => {
+                        if let Err(error) = files::discard(&dir, SNAPSHOT_RECORD).await {
+                            tracing::error!(path = %dir.display(), %error, "snapshot cleanup failed");
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
+                };
+                if machines.fleet.is_some() {
+                    machines.changed();
+                    if kept_locally {
+                        let copy = Snapshot {
+                            info: info.clone(),
+                            storage: std::sync::Mutex::new(None),
+                            tenant: tenant.clone(),
+                            idempotency: None,
+                            dir,
+                            deleted: RwLock::new(false),
+                        };
+                        let mut state = machines.state.lock().await;
+                        state.snapshots.insert(info.id.clone(), Arc::new(copy));
+                    }
+                    return Ok(info);
                 }
                 let mib = stored_mib(info.stored_bytes);
                 let kept = tenant.keep_disk(mib);
@@ -1153,7 +1293,55 @@ impl Machines {
         .await
     }
 
-    pub async fn snapshots(&self, tenant: &Tenant) -> Vec<SnapshotInfo> {
+    async fn record_snapshot(
+        &self,
+        tenant: &Tenant,
+        idempotency: Option<Idempotency>,
+        info: &SnapshotInfo,
+        dir: &Path,
+    ) -> Result<bool, MachineError> {
+        let Some(fleet) = &self.fleet else {
+            let record = SnapshotRecord {
+                info: info.clone(),
+                tenant: tenant.id().to_owned(),
+                idempotency,
+            };
+            files::commit(dir, SNAPSHOT_RECORD, &record)
+                .await
+                .map_err(MachineError::Io)?;
+            return Ok(true);
+        };
+        let stored = fleet
+            .store
+            .publish(tenant.id(), info, dir, &SAVED_FILES, &fleet.digests)
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::AlreadyExists => MachineError::Conflict(error.to_string()),
+                _ => MachineError::Store(error),
+            })?;
+        let kept = async {
+            stored.link_images_into(dir, &fleet.images_dir).await?;
+            files::commit(dir, COPY_RECORD, &fleet.copy_record(&stored)).await
+        };
+        if let Err(error) = kept.await {
+            tracing::warn!(snapshot_id = %info.id, %error, "the published snapshot was not kept on this host");
+            if let Err(error) = files::discard(dir, COPY_RECORD).await {
+                tracing::error!(path = %dir.display(), %error, "snapshot cleanup failed");
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub async fn snapshots(&self, tenant: &Tenant) -> Result<Vec<SnapshotInfo>, MachineError> {
+        if let Some(fleet) = &self.fleet {
+            let stored = fleet.store.snapshots().await.map_err(MachineError::Store)?;
+            return Ok(stored
+                .into_iter()
+                .filter(|stored| stored.tenant == tenant.id())
+                .map(|stored| stored.info)
+                .collect());
+        }
         let mut infos: Vec<_> = self
             .state
             .lock()
@@ -1164,11 +1352,28 @@ impl Machines {
             .map(|snapshot| snapshot.info.clone())
             .collect();
         infos.sort_by(|a, b| a.id.cmp(&b.id));
-        infos
+        Ok(infos)
     }
 
-    pub async fn snapshot_info(&self, tenant: &Tenant, id: &str) -> Option<SnapshotInfo> {
-        Some(self.snapshot(tenant, id).await?.info.clone())
+    pub async fn snapshot_info(
+        &self,
+        tenant: &Tenant,
+        id: &str,
+    ) -> Result<SnapshotInfo, MachineError> {
+        let found = match &self.fleet {
+            Some(fleet) => fleet
+                .store
+                .snapshot(id)
+                .await
+                .map_err(MachineError::Store)?
+                .filter(|stored| stored.tenant == tenant.id())
+                .map(|stored| stored.info),
+            None => self
+                .snapshot(tenant, id)
+                .await
+                .map(|snapshot| snapshot.info.clone()),
+        };
+        found.ok_or(MachineError::UnknownSnapshot)
     }
 
     pub async fn delete_snapshot(
@@ -1176,6 +1381,25 @@ impl Machines {
         tenant: &Tenant,
         id: &str,
     ) -> Result<(), MachineError> {
+        if let Some(fleet) = &self.fleet {
+            match fleet.store.snapshot(id).await {
+                Ok(Some(stored)) if stored.tenant == tenant.id() => {}
+                Ok(_) => return Err(MachineError::UnknownSnapshot),
+                Err(error) => return Err(MachineError::Store(error)),
+            }
+            let machines = self.clone();
+            let id = id.to_owned();
+            return run_to_completion(async move {
+                let fleet = machines.fleet()?;
+                if machines.delete_fleet_snapshot(fleet, &id).await? {
+                    tracing::info!(snapshot_id = %id, "snapshot deleted");
+                    Ok(())
+                } else {
+                    Err(MachineError::UnknownSnapshot)
+                }
+            })
+            .await;
+        }
         let snapshot = self
             .snapshot(tenant, id)
             .await
@@ -1372,6 +1596,338 @@ impl Machines {
     }
 }
 
+impl Machines {
+    fn fleet(&self) -> Result<&Fleet, MachineError> {
+        self.fleet
+            .as_ref()
+            .ok_or_else(|| MachineError::Conflict("this host is not part of a fleet".into()))
+    }
+
+    fn changed(&self) {
+        if let Some(fleet) = &self.fleet {
+            fleet.changes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn generation(&self) -> Generation {
+        match &self.fleet {
+            Some(fleet) => Generation {
+                boot: fleet.boot,
+                change: fleet.changes.load(Ordering::SeqCst),
+            },
+            None => Generation::default(),
+        }
+    }
+
+    pub fn pool(&self) -> Option<&str> {
+        self.fleet.as_ref().map(|fleet| fleet.pool.as_str())
+    }
+
+    pub fn store(&self) -> Option<&Store> {
+        self.fleet.as_ref().map(|fleet| &*fleet.store)
+    }
+
+    pub fn egress_addresses(&self) -> Vec<String> {
+        self.network
+            .egress_addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    pub async fn report(&self) -> (Generation, Vec<ReportedMachine>, Vec<ExecutionUsage>) {
+        self.changed();
+        let generation = self.generation();
+        let machines = self
+            .state
+            .lock()
+            .await
+            .machines
+            .values()
+            .map(|machine| ReportedMachine {
+                id: machine.id().to_owned(),
+                tenant: machine.tenant().id().to_owned(),
+                memory_mib: machine.info().memory_mib,
+                state: machine.state(),
+            })
+            .collect();
+        (generation, machines, self.tenants.recorded_executions())
+    }
+
+    pub async fn record_usage(&self) -> io::Result<()> {
+        self.tenants.flush().await
+    }
+
+    pub async fn forget_executions(&self, ids: &[String]) -> io::Result<()> {
+        self.tenants.forget_executions(ids).await
+    }
+
+    pub async fn room(&self) -> Room {
+        let state = self.state.lock().await;
+        if state.shutting_down {
+            return Room::default();
+        }
+        let spares = u32::try_from(state.spares.len() + state.spares_booting).unwrap_or(u32::MAX);
+        let spare_mib = spares.saturating_mul(DEFAULT_MEMORY_MIB + MACHINE_OVERHEAD_MIB);
+        let slots = u32::try_from(self.slots.available_permits())
+            .unwrap_or(u32::MAX)
+            .saturating_add(spares);
+        let budget_mib = u32::try_from(self.memory.available_permits())
+            .unwrap_or(u32::MAX)
+            .saturating_add(spare_mib);
+        let host_mib = available_memory_mib()
+            .unwrap_or(0)
+            .saturating_sub(HOST_RESERVE_MIB)
+            .saturating_add(spare_mib);
+        let memory_mib = budget_mib
+            .min(host_mib)
+            .saturating_sub(MACHINE_OVERHEAD_MIB)
+            .min(*MEMORY_MIB_RANGE.end());
+        if slots == 0 || memory_mib < *MEMORY_MIB_RANGE.start() {
+            return Room::default();
+        }
+        Room { slots, memory_mib }
+    }
+
+    fn abandoned_path(fleet: &Fleet, tenant: &Tenant, key: &str) -> PathBuf {
+        let name = blake3::hash(format!("{}\n{key}", tenant.id()).as_bytes()).to_hex();
+        fleet.abandoned_dir.join(name.as_str())
+    }
+
+    async fn refuse_abandoned(
+        &self,
+        tenant: &Tenant,
+        attempt: Option<&Idempotency>,
+    ) -> Result<(), MachineError> {
+        let (Some(fleet), Some(attempt)) = (&self.fleet, attempt) else {
+            return Ok(());
+        };
+        let path = Self::abandoned_path(fleet, tenant, attempt.key());
+        if tokio::fs::try_exists(&path)
+            .await
+            .map_err(MachineError::Io)?
+        {
+            return Err(MachineError::Conflict(format!(
+                "operation {} was settled as having made nothing",
+                attempt.key()
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn settle(
+        &self,
+        tenant: &Tenant,
+        key: IdempotencyKey,
+    ) -> Result<(Settlement, Generation), MachineError> {
+        let fleet = self.fleet()?;
+        let attempt = Idempotency::of(Some(key), String::new());
+        let _turn = tenant.take_turn(attempt.as_ref()).await;
+        let Some(attempt) = attempt else {
+            return Err(MachineError::Invalid("an operation has a key".into()));
+        };
+        let made = self
+            .state
+            .lock()
+            .await
+            .machines
+            .values()
+            .find(|machine| {
+                machine.belongs_to(tenant)
+                    && machine
+                        .idempotency()
+                        .is_some_and(|recorded| recorded.key() == attempt.key())
+            })
+            .map(|machine| machine.info());
+        let settlement = match made {
+            Some(info) => Settlement::Made(info),
+            None => {
+                let path = Self::abandoned_path(fleet, tenant, attempt.key());
+                tokio::fs::write(&path, attempt.key())
+                    .await
+                    .map_err(MachineError::Io)?;
+                files::sync(&path).await.map_err(MachineError::Io)?;
+                files::sync(&fleet.abandoned_dir)
+                    .await
+                    .map_err(MachineError::Io)?;
+                Settlement::Nothing
+            }
+        };
+        Ok((settlement, self.generation()))
+    }
+
+    async fn restorable_snapshot(
+        &self,
+        tenant: &Tenant,
+        id: &str,
+    ) -> Result<Restorable, MachineError> {
+        let Some(fleet) = &self.fleet else {
+            return self
+                .snapshot(tenant, id)
+                .await
+                .map(Restorable::Local)
+                .ok_or(MachineError::UnknownSnapshot);
+        };
+        let stored = match fleet.store.snapshot(id).await {
+            Ok(Some(stored)) if stored.tenant == tenant.id() => stored,
+            Ok(Some(_)) => return Err(MachineError::UnknownSnapshot),
+            Ok(None) => {
+                if let Some(copy) = self.snapshot(tenant, id).await {
+                    let deleted = copy.deleted.write().await;
+                    self.forget_copy(&copy, deleted).await;
+                }
+                return Err(MachineError::UnknownSnapshot);
+            }
+            Err(error) => return Err(MachineError::Store(error)),
+        };
+        if stored.info.pool.as_deref() != Some(fleet.pool.as_str()) {
+            return Err(MachineError::Conflict(format!(
+                "snapshot {id} was taken on CPU pool {:?} and this host is in {:?}",
+                stored.info.pool, fleet.pool
+            )));
+        }
+        Ok(Restorable::Stored(stored))
+    }
+
+    async fn local_copy(&self, restorable: Restorable) -> Result<Arc<Snapshot>, MachineError> {
+        let stored = match restorable {
+            Restorable::Local(snapshot) => return Ok(snapshot),
+            Restorable::Stored(stored) => stored,
+        };
+        let fleet = self.fleet()?;
+        let id = stored.info.id.clone();
+        let turn = fleet.turn(&id);
+        let copied = async {
+            let _turn = turn.lock().await;
+            if let Some(copy) = self.state.lock().await.snapshots.get(&id).cloned() {
+                return Ok(copy);
+            }
+            match fleet.store.snapshot(&id).await {
+                Ok(Some(_)) => self.fetch(fleet, stored).await,
+                Ok(None) => Err(MachineError::UnknownSnapshot),
+                Err(error) => Err(MachineError::Store(error)),
+            }
+        };
+        let copied = copied.await;
+        fleet.end_turn(&id, &turn);
+        copied
+    }
+
+    async fn fetch(
+        &self,
+        fleet: &Fleet,
+        stored: StoredSnapshot,
+    ) -> Result<Arc<Snapshot>, MachineError> {
+        let id = stored.info.id.clone();
+        let started = Instant::now();
+        let dir = self.snapshots_dir.join(&id);
+        let staging = self.snapshots_dir.join(format!("{id}.fetch"));
+        let record = fleet.copy_record(&stored);
+        let copied = async {
+            files::remove_dir_if_present(&staging).await?;
+            tokio::fs::create_dir(&staging).await?;
+            fleet
+                .store
+                .fetch(&stored, &staging, &fleet.images_dir)
+                .await?;
+            files::publish_dir(&staging, &dir).await?;
+            files::commit(&dir, COPY_RECORD, &record).await
+        };
+        if let Err(error) = copied.await {
+            files::remove_dir_logged(&staging).await;
+            files::remove_dir_logged(&dir).await;
+            tracing::warn!(snapshot_id = %id, %error, "snapshot download failed");
+            let gone = error.kind() == io::ErrorKind::NotFound
+                && matches!(fleet.store.snapshot(&id).await, Ok(None));
+            return Err(if gone {
+                MachineError::UnknownSnapshot
+            } else {
+                MachineError::Store(error)
+            });
+        }
+        let copy = Arc::new(Snapshot {
+            tenant: self.tenants.owner(&stored.tenant),
+            info: stored.info,
+            idempotency: None,
+            dir,
+            deleted: RwLock::new(false),
+            storage: std::sync::Mutex::new(None),
+        });
+        self.state
+            .lock()
+            .await
+            .snapshots
+            .insert(id.clone(), copy.clone());
+        tracing::info!(snapshot_id = %id, download_ms = started.elapsed().as_millis(), "snapshot downloaded");
+        Ok(copy)
+    }
+
+    async fn forget_copy(&self, copy: &Arc<Snapshot>, mut deleted: RwLockWriteGuard<'_, bool>) {
+        *deleted = true;
+        {
+            let mut state = self.state.lock().await;
+            if state
+                .snapshots
+                .get(&copy.info.id)
+                .is_some_and(|listed| Arc::ptr_eq(listed, copy))
+            {
+                state.snapshots.remove(&copy.info.id);
+            }
+        }
+        if let Err(error) = files::discard(&copy.dir, COPY_RECORD).await {
+            tracing::error!(snapshot_id = %copy.info.id, %error, "removing a deleted snapshot's copy failed");
+        }
+    }
+
+    async fn delete_fleet_snapshot(&self, fleet: &Fleet, id: &str) -> Result<bool, MachineError> {
+        let turn = fleet.turn(id);
+        let deleted = async {
+            let _no_download_in_flight = turn.lock().await;
+            let copy = self.state.lock().await.snapshots.get(id).cloned();
+            let deleted = match &copy {
+                Some(copy) => Some(copy.deleted.write().await),
+                None => None,
+            };
+            let existed = fleet
+                .store
+                .delete_snapshot(id)
+                .await
+                .map_err(MachineError::Store)?;
+            if let (Some(copy), Some(deleted)) = (&copy, deleted) {
+                self.forget_copy(copy, deleted).await;
+            }
+            Ok(existed)
+        };
+        let deleted = deleted.await;
+        fleet.end_turn(id, &turn);
+        deleted
+    }
+}
+
+impl Fleet {
+    fn copy_record(&self, stored: &StoredSnapshot) -> CopyRecord {
+        CopyRecord {
+            store: self.store.url().to_owned(),
+            info: stored.info.clone(),
+            tenant: stored.tenant.clone(),
+        }
+    }
+
+    fn turn(&self, id: &str) -> Arc<Mutex<()>> {
+        lock(&self.fetching)
+            .entry(id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    fn end_turn(&self, id: &str, turn: &Arc<Mutex<()>>) {
+        let mut fetching = lock(&self.fetching);
+        if Arc::strong_count(turn) == 2 {
+            fetching.remove(id);
+        }
+    }
+}
+
 impl State {
     fn unlist(&mut self, id: &str) -> Option<Arc<Machine>> {
         let machine = self.machines.remove(id)?;
@@ -1384,6 +1940,166 @@ impl State {
             .get(&preview.machine_id)
             .is_some_and(|machine| machine.belongs_to(tenant))
     }
+}
+
+async fn record_mode(state_dir: &Path, tenancy: &Tenancy) -> io::Result<u64> {
+    let wanted = match tenancy {
+        Tenancy::Local(_) => Mode::Standalone,
+        Tenancy::Fleet { .. } => Mode::Fleet,
+    };
+    let recorded = match files::read_record::<ModeRecord>(state_dir, MODE_RECORD).await {
+        Ok(recorded) => Some(recorded),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let boots = match recorded {
+        Some(recorded) if recorded.mode != wanted => {
+            return Err(io::Error::other(format!(
+                "{} was used {}; a state dir serves one mode",
+                state_dir.display(),
+                match recorded.mode {
+                    Mode::Standalone => "by a standalone machined",
+                    Mode::Fleet => "by a fleet host",
+                }
+            )));
+        }
+        Some(recorded) => recorded.boots,
+        None if wanted == Mode::Fleet && holds_state(state_dir).await? => {
+            return Err(io::Error::other(format!(
+                "{} holds machines or snapshots of a standalone machined; a fleet host needs a state dir of its own",
+                state_dir.display()
+            )));
+        }
+        None => 0,
+    };
+    let record = ModeRecord {
+        mode: wanted,
+        boots: boots + 1,
+    };
+    files::replace_record(state_dir, MODE_RECORD, &record).await?;
+    Ok(record.boots)
+}
+
+async fn holds_state(state_dir: &Path) -> io::Result<bool> {
+    for kept in ["machines", "snapshots"] {
+        if !subdirectories(&state_dir.join(kept)).await?.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn recover_snapshot(dir: &Path, tenants: &Tenants) -> io::Result<Option<Snapshot>> {
+    if !tokio::fs::try_exists(dir.join(SNAPSHOT_RECORD)).await? {
+        return Ok(None);
+    }
+    let record: SnapshotRecord = files::read_record(dir, SNAPSHOT_RECORD).await?;
+    let tenant = tenants.owner(&record.tenant);
+    let mib = stored_mib(record.info.stored_bytes);
+    let metered_since = record.info.created_unix_ms.max(tenants.recorded_as_of());
+    let storage = tenant.store(tenant.keep_disk(mib), mib, metered_since);
+    Ok(Some(Snapshot {
+        info: record.info,
+        tenant,
+        idempotency: record.idempotency,
+        dir: dir.to_owned(),
+        deleted: RwLock::new(false),
+        storage: std::sync::Mutex::new(Some(storage)),
+    }))
+}
+
+async fn recover_copy(
+    dir: &Path,
+    fleet: &Fleet,
+    tenants: &Tenants,
+) -> io::Result<Option<Snapshot>> {
+    if !tokio::fs::try_exists(dir.join(COPY_RECORD)).await? {
+        return Ok(None);
+    }
+    let copy: CopyRecord = files::read_record(dir, COPY_RECORD).await?;
+    if copy.store != fleet.store.url() {
+        return Ok(None);
+    }
+    Ok(Some(Snapshot {
+        info: copy.info,
+        tenant: tenants.owner(&copy.tenant),
+        idempotency: None,
+        dir: dir.to_owned(),
+        deleted: RwLock::new(false),
+        storage: std::sync::Mutex::new(None),
+    }))
+}
+
+async fn drop_deleted_copies(store: &Store, copies: &mut HashMap<String, Arc<Snapshot>>) {
+    let mut deleted = Vec::new();
+    for id in copies.keys() {
+        match store.snapshot(id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => deleted.push(id.clone()),
+            Err(error) => {
+                tracing::warn!(snapshot_id = %id, %error, "kept a snapshot copy the store could not confirm");
+            }
+        }
+    }
+    for id in deleted {
+        if let Some(copy) = copies.remove(&id)
+            && let Err(error) = files::discard(&copy.dir, COPY_RECORD).await
+        {
+            tracing::error!(snapshot_id = %id, %error, "removing a deleted snapshot's copy failed");
+        }
+    }
+}
+
+async fn remove_unused_images(images_dir: &Path) -> io::Result<()> {
+    let mut entries = tokio::fs::read_dir(images_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let partial = entry.file_name().to_string_lossy().contains(".partial-");
+        let unused = std::os::unix::fs::MetadataExt::nlink(&entry.metadata().await?) == 1;
+        if partial || unused {
+            files::remove_if_present(tokio::fs::remove_file(entry.path()).await)?;
+        }
+    }
+    files::sync(images_dir).await
+}
+
+async fn remove_old_files(dir: &Path, older_than: Duration) -> io::Result<()> {
+    let cutoff = std::time::SystemTime::now() - older_than;
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.metadata().await?.modified()? < cutoff {
+            files::remove_if_present(tokio::fs::remove_file(entry.path()).await)?;
+        }
+    }
+    files::sync(dir).await
+}
+
+pub fn cpu_pool() -> io::Result<String> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")?;
+    Ok(pool_of(&cpuinfo, std::env::consts::ARCH))
+}
+
+fn pool_of(cpuinfo: &str, arch: &str) -> String {
+    let first_cpu = cpuinfo.split("\n\n").next().unwrap_or_default();
+    let field = |name: &str| {
+        first_cpu.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == name).then(|| value.trim().to_owned())
+        })
+    };
+    let model = field("model name")
+        .or_else(|| {
+            Some(format!(
+                "{}/{}",
+                field("CPU implementer")?,
+                field("CPU part")?
+            ))
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let features = field("flags")
+        .or_else(|| field("Features"))
+        .unwrap_or_default();
+    let features = blake3::hash(features.as_bytes()).to_hex();
+    format!("{arch} {model} {}", &features[..12])
 }
 
 async fn flush_usage_periodically(machines: Weak<Machines>) {
@@ -1408,7 +2124,7 @@ async fn stored_bytes(dir: &Path) -> io::Result<u64> {
     Ok(total)
 }
 
-fn stored_mib(bytes: u64) -> u64 {
+pub fn stored_mib(bytes: u64) -> u64 {
     bytes.div_ceil(1 << 20)
 }
 
@@ -1527,6 +2243,14 @@ fn parse_available_memory(meminfo: &str) -> io::Result<u32> {
         .and_then(|value| value.parse::<u64>().ok())
         .and_then(|kib| u32::try_from(kib / 1024).ok())
         .ok_or_else(|| io::Error::other("/proc/meminfo has no valid MemAvailable"))
+}
+
+fn is_tenant_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 fn new_id() -> String {

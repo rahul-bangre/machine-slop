@@ -8,7 +8,7 @@ use std::{
 
 use slop_machines::{
     CreateMachine, CreateSnapshot, IdempotencyKey, Limits, MachineError, MachineInfo, MachineState,
-    Machines, Network, Quotas, SnapshotInfo, Tenant, TenantConfig, UpdateMachine,
+    Machines, Network, Quotas, SnapshotInfo, Store, Tenancy, Tenant, TenantConfig, UpdateMachine,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -40,6 +40,7 @@ fn owner(machines: &Machines) -> Arc<Tenant> {
 
 struct Host {
     root: PathBuf,
+    fleet: Option<(PathBuf, String)>,
 }
 
 impl Host {
@@ -77,7 +78,13 @@ cd "$base/$(basename "$exec_file")/$id/root" && exec "$exec_file" "$@"
             std::fs::set_permissions(image.join(program), std::fs::Permissions::from_mode(0o755))
                 .expect("make program executable");
         }
-        Self { root }
+        Self { root, fleet: None }
+    }
+
+    fn in_fleet(name: &str, store: &Path, pool: &str) -> Self {
+        let mut host = Self::new(name);
+        host.fleet = Some((store.to_owned(), pool.to_owned()));
+        host
     }
 
     async fn open(&self, capacity: usize) -> Arc<Machines> {
@@ -113,18 +120,28 @@ cd "$base/$(basename "$exec_file")/$id/root" && exec "$exec_file" "$@"
                 spare_machines: spares,
                 first_jail_uid: FIRST_JAIL_UID,
             };
-            let tenants = tenants
-                .iter()
-                .map(|tenant| TenantConfig {
-                    id: tenant.id.clone(),
-                    quotas: tenant.quotas.clone(),
-                })
-                .collect();
+            let tenancy = match &self.fleet {
+                Some((store, pool)) => Tenancy::Fleet {
+                    pool: pool.clone(),
+                    store: Arc::new(
+                        Store::open(&format!("file://{}", store.display())).expect("open store"),
+                    ),
+                },
+                None => Tenancy::Local(
+                    tenants
+                        .iter()
+                        .map(|tenant| TenantConfig {
+                            id: tenant.id.clone(),
+                            quotas: tenant.quotas.clone(),
+                        })
+                        .collect(),
+                ),
+            };
             match Machines::open(
                 image.clone(),
                 state.clone(),
                 limits,
-                tenants,
+                tenancy,
                 Network::default(),
             )
             .await
@@ -625,7 +642,10 @@ async fn a_restart_keeps_what_was_acknowledged_and_nothing_else() {
     }
     assert_eq!(machines.list(&owner(&machines),).await.len(), 3);
     assert!(!unrecorded.exists() && !staging.exists() && !partial_snapshot.exists());
-    let snapshots = machines.snapshots(&owner(&machines)).await;
+    let snapshots = machines
+        .snapshots(&owner(&machines))
+        .await
+        .expect("list snapshots");
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].id, kept.id);
 
@@ -678,7 +698,13 @@ async fn a_snapshot_outlives_its_source_and_its_deletion_spares_its_machines() {
         .await
         .expect("delete");
     assert!(!snapshot_dir.exists());
-    assert!(machines.snapshots(&owner(&machines),).await.is_empty());
+    assert!(
+        machines
+            .snapshots(&owner(&machines))
+            .await
+            .expect("list")
+            .is_empty()
+    );
     let request = CreateMachine {
         snapshot_id: Some(taken.id.clone()),
         ..CreateMachine::default()
@@ -837,7 +863,13 @@ async fn a_failed_fork_or_snapshot_leaves_the_machine_running_and_nothing_else()
     }
     assert!(agent_answers(&machines, &source).await);
     assert_eq!(machines.list(&owner(&machines),).await.len(), 1);
-    assert!(machines.snapshots(&owner(&machines),).await.is_empty());
+    assert!(
+        machines
+            .snapshots(&owner(&machines))
+            .await
+            .expect("list")
+            .is_empty()
+    );
     let leftovers = |dir: &str| std::fs::read_dir(host.root.join(dir)).expect("dir").count();
     assert_eq!(
         (leftovers("state/machines"), leftovers("state/snapshots")),
@@ -1524,7 +1556,7 @@ async fn memory_is_reserved_by_running_vms_and_given_up_by_spares() {
         image,
         state,
         limits,
-        vec![roomy_tenant()],
+        Tenancy::Local(vec![roomy_tenant()]),
         Network::default(),
     )
     .await
@@ -1823,7 +1855,13 @@ async fn saved_state_that_is_not_a_file_the_vm_wrote_is_refused_untouched() {
     assert_eq!(state(&machines, &id).await, MachineState::Running);
     let snapshot = snapshot(&machines, &id).await;
     assert!(snapshot.is_err(), "{snapshot:?}");
-    assert!(machines.snapshots(&owner(&machines)).await.is_empty());
+    assert!(
+        machines
+            .snapshots(&owner(&machines))
+            .await
+            .expect("list")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1856,8 +1894,8 @@ async fn tenants_see_and_change_only_their_own_machines_and_snapshots() {
     assert!(machines.get(&b, &machine).await.is_none());
     assert!(machines.begin_use(&b, &machine).await.is_none());
     assert!(machines.list(&b).await.is_empty());
-    assert!(machines.snapshots(&b).await.is_empty());
-    assert!(machines.snapshot_info(&b, &snapshot.id).await.is_none());
+    assert!(machines.snapshots(&b).await.expect("list").is_empty());
+    assert!(machines.snapshot_info(&b, &snapshot.id).await.is_err());
     for refused in [
         machines.pause(&b, &machine).await.map(|_| ()),
         machines.resume(&b, &machine).await.map(|_| ()),
@@ -2371,4 +2409,354 @@ async fn answer_api(stream: UnixStream, vm: &std::sync::Mutex<FakeVm>, fail: &Pa
     if outcome.is_err() && request == "PUT /snapshot/load" {
         std::process::exit(1);
     }
+}
+
+const POOL: &str = "test pool";
+
+struct SharedStore(PathBuf);
+
+impl SharedStore {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("slop-{}-{name}-store", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create store");
+        Self(dir)
+    }
+
+    fn open(&self) -> Store {
+        Store::open(&format!("file://{}", self.0.display())).expect("open store")
+    }
+
+    fn snapshot_objects(&self, id: &str) -> PathBuf {
+        self.0.join("snapshots").join(id)
+    }
+}
+
+impl Drop for SharedStore {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn keyed_snapshot(
+    machines: &Arc<Machines>,
+    machine_id: &str,
+    operation: &str,
+) -> Result<SnapshotInfo, MachineError> {
+    let request = CreateSnapshot {
+        machine_id: machine_id.to_owned(),
+    };
+    machines
+        .create_snapshot(&owner(machines), request, key(operation))
+        .await
+}
+
+async fn create_from_snapshot(
+    machines: &Arc<Machines>,
+    snapshot: &str,
+) -> Result<String, MachineError> {
+    let request = CreateMachine {
+        snapshot_id: Some(snapshot.to_owned()),
+        ..CreateMachine::default()
+    };
+    let machine = machines.create(&owner(machines), request, None).await?;
+    Ok(machine.id().to_owned())
+}
+
+fn entries(dir: PathBuf) -> usize {
+    std::fs::read_dir(dir).map_or(0, Iterator::count)
+}
+
+#[tokio::test]
+async fn a_snapshot_taken_on_one_fleet_host_starts_machines_on_another() {
+    let store = SharedStore::new("across");
+    let first = Host::in_fleet("across-first", &store.0, POOL);
+    let second = Host::in_fleet("across-second", &store.0, POOL);
+    let (on_first, on_second) = (first.open(4).await, second.open(4).await);
+    let source = create(&on_first).await;
+    let taken = keyed_snapshot(&on_first, &source, "operation-1")
+        .await
+        .expect("snapshot");
+    assert_eq!(taken.id, "operation-1");
+    assert_eq!(taken.pool.as_deref(), Some(POOL));
+    assert!(
+        store
+            .snapshot_objects(&taken.id)
+            .join("record.json")
+            .is_file()
+    );
+    let replayed = keyed_snapshot(&on_first, &source, "operation-1")
+        .await
+        .expect("replay");
+    assert_eq!(replayed.created_unix_ms, taken.created_unix_ms);
+
+    let images = second.root.join("state/images");
+    eventually("offered this host's image to downloads", || async {
+        entries(images.clone()) == 2
+    })
+    .await;
+    let listed = on_second
+        .snapshots(&owner(&on_second))
+        .await
+        .expect("list snapshots");
+    assert_eq!(listed.len(), 1);
+    let (a, b) = tokio::join!(
+        create_from_snapshot(&on_second, &taken.id),
+        create_from_snapshot(&on_second, &taken.id)
+    );
+    let (a, b) = (a.expect("first copy"), b.expect("second copy"));
+    assert_ne!(a, b);
+    assert!(second.snapshot_dir(&taken.id).join("copy.json").is_file());
+    assert_eq!(entries(second.root.join("state/snapshots")), 1);
+    let own_rootfs = std::fs::metadata(second.root.join("image/rootfs.ext4"))
+        .expect("rootfs")
+        .ino();
+    let cached: Vec<_> = std::fs::read_dir(&images)
+        .expect("images dir")
+        .map(|entry| entry.expect("entry").metadata().expect("metadata").ino())
+        .collect();
+    assert_eq!(
+        cached.len(),
+        3,
+        "both own image files and the source's firecracker"
+    );
+    assert!(
+        cached.contains(&own_rootfs),
+        "the same rootfs is not downloaded"
+    );
+
+    on_first
+        .delete_snapshot(&owner(&on_first), &taken.id)
+        .await
+        .expect("delete snapshot");
+    assert!(
+        on_second
+            .snapshots(&owner(&on_second))
+            .await
+            .expect("list")
+            .is_empty()
+    );
+    assert!(matches!(
+        create_from_snapshot(&on_second, &taken.id).await,
+        Err(MachineError::UnknownSnapshot)
+    ));
+    assert!(!second.snapshot_dir(&taken.id).exists());
+    assert_eq!(state(&on_second, &a).await, MachineState::Running);
+}
+
+#[tokio::test]
+async fn a_fleet_snapshot_is_refused_to_other_pools_tenants_and_corrupted_downloads() {
+    let store = SharedStore::new("refusals");
+    let first = Host::in_fleet("refusals-first", &store.0, POOL);
+    let elsewhere = Host::in_fleet("refusals-elsewhere", &store.0, "another pool");
+    let second = Host::in_fleet("refusals-second", &store.0, POOL);
+    let on_first = first.open(4).await;
+    let source = create(&on_first).await;
+    let taken = keyed_snapshot(&on_first, &source, "operation-2")
+        .await
+        .expect("snapshot");
+
+    let on_elsewhere = elsewhere.open(4).await;
+    let refused = create_from_snapshot(&on_elsewhere, &taken.id).await;
+    assert!(
+        matches!(refused, Err(MachineError::Conflict(_))),
+        "{refused:?}"
+    );
+    assert!(!elsewhere.snapshot_dir(&taken.id).exists());
+
+    let on_second = second.open(4).await;
+    let stranger = on_second.tenant("stranger").expect("fleet tenant");
+    assert!(matches!(
+        on_second
+            .create(
+                &stranger,
+                CreateMachine {
+                    snapshot_id: Some(taken.id.clone()),
+                    ..CreateMachine::default()
+                },
+                None,
+            )
+            .await,
+        Err(MachineError::UnknownSnapshot)
+    ));
+    assert!(
+        on_second
+            .snapshots(&stranger)
+            .await
+            .expect("list")
+            .is_empty()
+    );
+
+    std::fs::write(store.snapshot_objects(&taken.id).join("memory"), "memorX").expect("tamper");
+    let refused = create_from_snapshot(&on_second, &taken.id).await;
+    assert!(
+        matches!(refused, Err(MachineError::Store(_))),
+        "{refused:?}"
+    );
+    assert_eq!(entries(second.root.join("state/snapshots")), 0);
+}
+
+#[tokio::test]
+async fn a_fleet_host_restart_drops_copies_of_snapshots_deleted_meanwhile() {
+    let store = SharedStore::new("restart-copies");
+    let first = Host::in_fleet("restart-copies-first", &store.0, POOL);
+    let second = Host::in_fleet("restart-copies-second", &store.0, POOL);
+    let on_first = first.open(4).await;
+    let source = create(&on_first).await;
+    let kept = keyed_snapshot(&on_first, &source, "kept")
+        .await
+        .expect("kept");
+    let deleted = keyed_snapshot(&on_first, &source, "deleted")
+        .await
+        .expect("deleted");
+    let on_second = second.open(4).await;
+    create_from_snapshot(&on_second, &kept.id)
+        .await
+        .expect("kept copy");
+    create_from_snapshot(&on_second, &deleted.id)
+        .await
+        .expect("deleted copy");
+    on_second.shutdown().await;
+    drop(on_second);
+    on_first
+        .delete_snapshot(&owner(&on_first), &deleted.id)
+        .await
+        .expect("delete");
+    let _on_second = second.open(4).await;
+    assert!(second.snapshot_dir(&kept.id).is_dir());
+    assert!(!second.snapshot_dir(&deleted.id).exists());
+}
+
+#[tokio::test]
+async fn settling_an_operation_returns_what_it_made_or_fences_it_forever() {
+    let store = SharedStore::new("settle");
+    let host = Host::in_fleet("settle", &store.0, POOL);
+    let machines = host.open(4).await;
+    let tenant = owner(&machines);
+    let made = machines
+        .create(&tenant, CreateMachine::default(), key("made"))
+        .await
+        .expect("create");
+    let (settled, _) = machines
+        .settle(&tenant, IdempotencyKey::parse("made").expect("key"))
+        .await
+        .expect("settle");
+    assert!(
+        matches!(&settled, slop_machines::Settlement::Made(info) if info.id == made.id()),
+        "the made machine is found"
+    );
+    let (settled, _) = machines
+        .settle(&tenant, IdempotencyKey::parse("lost").expect("key"))
+        .await
+        .expect("settle");
+    assert!(matches!(settled, slop_machines::Settlement::Nothing));
+    let late = machines
+        .create(&tenant, CreateMachine::default(), key("lost"))
+        .await;
+    assert!(matches!(late, Err(MachineError::Conflict(_))));
+    let late_fork = machines.fork(&tenant, made.id(), key("lost")).await;
+    assert!(matches!(late_fork, Err(MachineError::Conflict(_))));
+    assert_eq!(machines.list(&tenant).await.len(), 1);
+    machines.shutdown().await;
+    drop(machines);
+    let machines = host.open(4).await;
+    let late = machines
+        .create(&owner(&machines), CreateMachine::default(), key("lost"))
+        .await;
+    assert!(
+        matches!(late, Err(MachineError::Conflict(_))),
+        "the fence survives a restart"
+    );
+
+    let source = create(&machines).await;
+    match store
+        .open()
+        .settle_snapshot("abandoned")
+        .await
+        .expect("settle")
+    {
+        slop_machines::Settled::Abandoned => {}
+        slop_machines::Settled::Published(_) => panic!("nothing was published"),
+    }
+    let late = keyed_snapshot(&machines, &source, "abandoned").await;
+    assert!(matches!(late, Err(MachineError::Conflict(_))), "{late:?}");
+    let published = keyed_snapshot(&machines, &source, "published")
+        .await
+        .expect("snapshot");
+    match store
+        .open()
+        .settle_snapshot("published")
+        .await
+        .expect("settle")
+    {
+        slop_machines::Settled::Published(stored) => assert_eq!(stored.info.id, published.id),
+        slop_machines::Settled::Abandoned => panic!("the snapshot was published"),
+    }
+}
+
+#[tokio::test]
+async fn a_fleet_host_reports_each_execution_until_it_is_acknowledged() {
+    let store = SharedStore::new("executions");
+    let host = Host::in_fleet("executions", &store.0, POOL);
+    let machines = host.open(4).await;
+    let before = machines.generation();
+    let id = create(&machines).await;
+    assert!(machines.generation() > before);
+    machines.record_usage().await.expect("record usage");
+    let (_, reported, executions) = machines.report().await;
+    assert_eq!(reported.len(), 1);
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].machine_id, id);
+    assert!(!executions[0].ended);
+    machines
+        .destroy(&owner(&machines), &id)
+        .await
+        .expect("destroy");
+    eventually("the execution ended", || async {
+        machines.record_usage().await.is_ok()
+            && machines
+                .report()
+                .await
+                .2
+                .iter()
+                .all(|execution| execution.ended)
+    })
+    .await;
+    let ended = machines.report().await.2;
+    assert_eq!(ended.len(), 1);
+    machines
+        .forget_executions(&[ended[0].id.clone()])
+        .await
+        .expect("forget");
+    assert!(machines.report().await.2.is_empty());
+    let recorded = std::fs::read_to_string(host.root.join("state/usage.json")).expect("ledger");
+    assert!(!recorded.contains(&ended[0].id));
+}
+
+#[tokio::test]
+async fn a_state_dir_serves_one_mode() {
+    let store = SharedStore::new("modes");
+    let standalone = Host::new("modes");
+    let machines = standalone.open(4).await;
+    create(&machines).await;
+    machines.shutdown().await;
+    drop(machines);
+    let limits = Limits {
+        running_vms: 4,
+        memory_mib: MEMORY_BUDGET_MIB,
+        spare_machines: 0,
+        first_jail_uid: FIRST_JAIL_UID,
+    };
+    let refused = Machines::open(
+        standalone.root.join("image"),
+        standalone.root.join("state"),
+        limits,
+        Tenancy::Fleet {
+            pool: POOL.into(),
+            store: Arc::new(store.open()),
+        },
+        Network::default(),
+    )
+    .await;
+    assert!(refused.is_err());
 }

@@ -36,6 +36,7 @@ owned by a tenant; the VM's API key is in `~/machine-slop/api-key` inside it.
 - [apps/agentd](apps/agentd/README.md): files, archives and ports
 - [crates/process](crates/process/README.md): process execution
 - [crates/machines](crates/machines/README.md): machines and egress
+- [apps/controld](apps/controld/README.md): machines across many hosts
 - [bench/agent](bench/agent/README.md): coding agent across sandboxes
 - [bench/browser](bench/browser/README.md): browser and observation cost
 - [bench/browser-agent](bench/browser-agent/README.md): browser runtimes for a

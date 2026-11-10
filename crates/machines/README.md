@@ -81,11 +81,12 @@ returns 401, an invalid request 422, an unknown machine or snapshot 404, a
 request that does not apply to the machine's state 409, a request beyond the
 tenant's quotas or create rate 429, a host with no room for another VM or a
 shutting-down `machined` 503, a failed boot 500 with the console tail, a failed
-save or restore 500, and an unreachable `agentd` 502. Forwarding to a paused
-machine is a 409; pausing, resuming, forking or snapshotting an exited one is
-a 409. An exited machine can only be deleted or left to expire. A machine
-becomes exited when its VM exits on its own, when a resume fails after its
-checkpoint was given up, and when `machined` stops without saving it.
+save or restore 500, an unreachable `agentd` 502, and a failing snapshot store
+502. Forwarding to a paused machine is a 409; pausing, resuming, forking or
+snapshotting an exited one is a 409. An exited machine can only be deleted or
+left to expire. A machine becomes exited when its VM exits on its own, when a
+resume fails after its checkpoint was given up, and when `machined` stops
+without saving it.
 
 At most 16 VMs run at once, and each running VM reserves its guest memory plus
 64 MiB of host overhead from a memory budget before it launches. The budget is
@@ -229,10 +230,11 @@ created from it; machines already created from it keep running and can still be
 paused, resumed and forked. A delete waits for creates that are reading the
 snapshot.
 
-Saved state restores on the host that made it. Firecracker does not support
-restoring on a different CPU model, and does not promise it across host kernel
-versions; a restore that Firecracker rejects fails and leaves the snapshot, or
-the paused machine, as it was.
+A standalone host restores saved state only where it was made; a
+[fleet host](#fleet-hosts) restores a snapshot from any host in its CPU pool.
+Firecracker does not support restoring on a different CPU model, and does not
+promise it across host kernel versions; a restore that Firecracker rejects fails
+and leaves the snapshot, or the paused machine, as it was.
 
 ## Machine
 
@@ -551,9 +553,72 @@ other machine or snapshot shares it. The state dir's `machines` and `snapshots`
 are readable only by root. `machined` removes the API key from requests it
 forwards to a machine, so the key never enters a guest.
 
+## Fleet hosts
+
+Without a tenants file, `machined` is a fleet host: it serves
+[`controld`](../../apps/controld/README.md) instead of tenants, and shares its
+snapshots with every other host on the same object store.
+
+```sh
+SLOP_STORE=s3://bucket/slop \
+SLOP_CONTROL_URL=http://controld:4000 \
+SLOP_ADVERTISE_URL=http://host-a:4001 \
+SLOP_CONTROL_KEY_FILE=/etc/slop/control.key \
+  machined 0.0.0.0:4001 <image dir> <state dir>
+```
+
+`SLOP_STORE` is `s3://bucket/prefix`, with credentials and region from the usual
+`AWS_*` variables, or `file:///path` on a filesystem every host mounts. The
+store must support writes that fail if the object exists (`If-None-Match`),
+which AWS S3 does. A fleet host accepts only requests that present the control
+key, and acts for the tenant `controld` names in the `Slop-Tenant` header. It
+applies no quotas or create rate of its own; `controld` does, across the fleet.
+Capacity, jails and cgroups work as on a standalone host. A state dir records
+its mode at first start, and `machined` refuses to start in the other mode, so a
+standalone host's machines and snapshots never join a fleet.
+
+Snapshots live in the store. A snapshot's id is the key `controld` sends with
+the request, and it exists once its record is written to the store with a write
+that fails if any record is there, after every object it names is complete and,
+for `file://`, synced. Each object is checked against its BLAKE3 digest when a
+host downloads it. Only 4 KiB blocks that are not all zeros are moved. Root
+images and Firecracker binaries are stored once per content and never removed;
+each host offers its own image files to downloads, so a host never fetches a
+root image it already has. `SnapshotInfo.pool` names the CPU model and a hash of
+the CPU features; a create from another pool's snapshot returns 409 before
+anything is downloaded.
+
+A fleet host keeps a complete copy of each snapshot it has started a machine
+from, tagged with the store's URL, and looks the snapshot up in the store on
+every create from it, so a deletion takes effect on every host at once and a
+store outage fails those creates with 502. It removes a copy when it sees the
+snapshot is gone, at its next create from it or its next start, and removes
+copies from another store at start. Concurrent creates on one host download a
+snapshot once, and a delete through this host waits for that download. Copies
+are not charged to tenants. Objects of an upload or delete that never finished
+are swept by any host that starts more than 24 hours later; an upload that takes
+more than an hour records nothing. On S3, expire incomplete multipart uploads
+with a lifecycle rule.
+
+Every 2 seconds the host reports to `controld`: its pool, room, egress
+addresses, each machine with its tenant, size and state, a generation, and the
+usage of each VM execution. A generation is the host's start count and a count
+of changes since, and every answer carries it as `Slop-Generation`, so
+`controld` can tell a report written before an answer from one written after. An
+execution is one run of a VM between when it is recorded or resumed and when its
+process exits, with a fresh id; its vCPU and memory usage is kept in
+`usage.json` until `controld` says it has recorded the execution's end. The host
+then forgets it and records that at once, before it reports again.
+
+`POST /operations/{key}/settle` answers with the machine a create or fork with
+that key made, or, if there is none, records that the key made nothing and
+answers 404. From then on a create or fork with that key returns 409 and makes
+nothing, across restarts, for 7 days. That is how `controld` resolves a request
+whose answer was lost.
+
 ## Host
 
-`machined <listen address> <image dir> <state dir> <tenants file>`
+`machined <listen address> <image dir> <state dir> [tenants file]`
 
 | Variable                | Effect                                            |
 | ----------------------- | ------------------------------------------------- |

@@ -62,7 +62,7 @@ pub struct UpdateMachine {
     pub egress_credentials: Option<Vec<EgressCredential>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, TS)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum MachineState {
     Running,
@@ -70,7 +70,7 @@ pub enum MachineState {
     Exited { message: String },
 }
 
-#[derive(Clone, Debug, Serialize, TS)]
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct MachineInfo {
     pub id: String,
     pub state: MachineState,
@@ -101,6 +101,9 @@ pub struct SnapshotInfo {
     pub created_unix_ms: u64,
     #[ts(type = "number")]
     pub stored_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pool: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -113,6 +116,15 @@ pub struct Quotas {
 }
 
 impl Quotas {
+    pub fn unenforced() -> Self {
+        Self {
+            running_machines: u32::MAX,
+            memory_mib: u32::MAX,
+            disk_gib: u32::MAX,
+            creates_per_second: u32::MAX,
+        }
+    }
+
     pub fn none() -> Self {
         Self {
             running_machines: 0,
@@ -147,7 +159,7 @@ pub struct CreatePreview {
     pub ttl_secs: Option<u32>,
 }
 
-#[derive(Clone, Debug, Serialize, TS)]
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct PreviewInfo {
     pub id: String,
     pub machine_id: String,
@@ -155,4 +167,67 @@ pub struct PreviewInfo {
     pub url: String,
     #[ts(type = "number")]
     pub expires_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, TS)]
+pub struct ExecutionUsage {
+    pub id: String,
+    pub tenant: String,
+    pub machine_id: String,
+    #[ts(type = "number")]
+    pub vcpu_ms: u64,
+    #[ts(type = "number")]
+    pub memory_mib_ms: u64,
+    pub ended: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, TS)]
+pub struct Room {
+    pub slots: u32,
+    pub memory_mib: u32,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, TS,
+)]
+pub struct Generation {
+    #[ts(type = "number")]
+    pub boot: u64,
+    #[ts(type = "number")]
+    pub change: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+pub struct ReportedMachine {
+    pub id: String,
+    pub tenant: String,
+    pub memory_mib: u32,
+    pub state: MachineState,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+pub struct HostReport {
+    pub url: String,
+    pub pool: String,
+    pub store: String,
+    pub room: Room,
+    pub egress_addresses: Vec<String>,
+    pub generation: Generation,
+    pub machines: Vec<ReportedMachine>,
+    pub executions: Vec<ExecutionUsage>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, TS)]
+pub struct HostReportReply {
+    pub recorded_executions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+pub struct HostInfo {
+    pub url: String,
+    pub pool: Option<String>,
+    pub room: Room,
+    #[ts(type = "number | null")]
+    pub reported_ms_ago: Option<u64>,
+    pub reporting: bool,
 }
