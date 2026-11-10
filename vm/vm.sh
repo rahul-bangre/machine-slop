@@ -57,6 +57,7 @@ vm_agentd_is_healthy() {
 wait_until_vm_agentd_is_healthy() {
   deadline=$(($(date +%s) + 900))
   until vm_agentd_is_healthy; do
+    require_host_port_free_for_this_vm
     if guest systemctl is-failed --quiet agentd; then
       guest sudo journalctl -u agentd -n 50 --no-pager >&2
       die "agentd failed"
