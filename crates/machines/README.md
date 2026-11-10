@@ -534,9 +534,10 @@ Every VM runs under Firecracker's `jailer`, which `machined` runs as root:
   from `SLOP_FIRST_JAIL_UID` (default 1000000000) up, so no two running VMs
   share one, and an id is reused only after its VM has exited;
 - a cgroup under `/sys/fs/cgroup/machine-slop-<state dir device>-<inode>` with
-  `memory.max` at the admitted reservation (guest memory plus 64 MiB),
-  `memory.swap.max` 0, `cpu.max` at its vCPUs and `pids.max` at its vCPUs plus
-  32;
+  `memory.max` at the admitted reservation (guest memory plus 64 MiB) plus
+  another guest memory's worth for the memory file a pause, fork or snapshot
+  writes, `memory.swap.max` 0, `cpu.max` at its vCPUs and `pids.max` at its
+  vCPUs plus 32;
 - Firecracker's own seccomp filters.
 
 The machine's scratch disk is writable inside its jail; the root image, kernel

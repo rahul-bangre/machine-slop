@@ -1689,7 +1689,8 @@ fn jail_argument<'a>(jail: &'a str, flag: &str) -> Vec<&'a str> {
 }
 
 #[tokio::test]
-async fn every_running_vm_is_jailed_as_its_own_user_with_its_reservation_as_limits() {
+async fn every_running_vm_is_jailed_as_its_own_user_with_limits_sized_for_its_reservation_and_a_save()
+ {
     let host = Host::new("jail");
     let machines = host.open(2).await;
     let first = create(&machines).await;
@@ -1719,9 +1720,9 @@ async fn every_running_vm_is_jailed_as_its_own_user_with_its_reservation_as_limi
         assert_eq!(jail_argument(jail, "--cgroup-version"), ["2"]);
     }
     let limits = |jail: &str| jail_argument(jail, "--cgroup").join(" ");
-    assert!(limits(&jails[0]).contains(&format!("memory.max={}", 576u64 << 20)));
+    assert!(limits(&jails[0]).contains(&format!("memory.max={}", (512u64 + 64 + 512) << 20)));
     assert!(limits(&jails[0]).contains("cpu.max=200000"));
-    assert!(limits(&jails[1]).contains(&format!("memory.max={}", 320u64 << 20)));
+    assert!(limits(&jails[1]).contains(&format!("memory.max={}", (256u64 + 64 + 256) << 20)));
     assert!(limits(&jails[1]).contains("cpu.max=100000"));
 
     let root = host.jail_root(&first);
