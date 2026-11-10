@@ -5,8 +5,6 @@ export type ProcessRow = {
     cpu_seconds: number;
 };
 
-export type UsageMark = { cpu_seconds: number; peak_rss_sum_bytes: number };
-
 export function parsePsCpuTime(text: string): number {
     const [clock = "", days] = text.split("-").reverse();
     const seconds = clock.split(":").reduce(
@@ -110,8 +108,7 @@ export const cpu_time_resolution_seconds = 0.01;
 
 export class UsageMeter {
     private readonly cpu_by_pid = new Map<number, number>();
-    private lifetime_peak = 0;
-    private window_peak = 0;
+    private peak_rss_sum = 0;
     private timer: ReturnType<typeof setInterval> | undefined;
 
     constructor(
@@ -136,27 +133,17 @@ export class UsageMeter {
             const seen = this.cpu_by_pid.get(row.pid) ?? 0;
             this.cpu_by_pid.set(row.pid, Math.max(seen, row.cpu_seconds));
         }
-        this.window_peak = Math.max(this.window_peak, rss_sum);
-        this.lifetime_peak = Math.max(this.lifetime_peak, rss_sum);
+        this.peak_rss_sum = Math.max(this.peak_rss_sum, rss_sum);
     }
 
-    async mark(): Promise<UsageMark> {
+    async cpuSecondsNow(): Promise<number> {
         await this.sample();
-        const mark = {
-            cpu_seconds: this.totalCpuSeconds(),
-            peak_rss_sum_bytes: this.window_peak,
-        };
-        this.window_peak = 0;
-        return mark;
-    }
-
-    totalCpuSeconds(): number {
         let total = 0;
         for (const seconds of this.cpu_by_pid.values()) total += seconds;
         return total;
     }
 
-    lifetimePeakRssSumBytes(): number {
-        return this.lifetime_peak;
+    peakRssSumBytes(): number {
+        return this.peak_rss_sum;
     }
 }

@@ -68,6 +68,12 @@ const metrics: {
         read: (attempt) => sum(attempt.steps.map((step) => step.readiness_ms)),
     },
     {
+        label: "readiness confirmation ms",
+        digits: 0,
+        read: (attempt) =>
+            sum(attempt.steps.map((step) => step.readiness_confirmation_ms)),
+    },
+    {
         label: "observation ms",
         digits: 0,
         read: (attempt) =>
@@ -128,7 +134,7 @@ export function renderSummary(
     const sections: string[] = [];
 
     sections.push(
-        "## Reliability\n\nEvery attempt is counted, including failed ones and retries.\n\n" +
+        "## Reliability\n\nEvery attempt is counted, including failed ones and retries. A pass means the outcome check held; the last column shows how many observations in passing attempts were also checked for expected content.\n\n" +
             table(
                 [
                     "task",
@@ -137,12 +143,21 @@ export function renderSummary(
                     "passed first attempt",
                     "passed after retries",
                     "failed attempts by kind",
+                    "observations content-checked",
                 ],
                 task_ids.flatMap((task) =>
                     arm_names.map((arm) => {
                         const result = reliability(select(arm, task));
+                        const steps = passing(arm, task).flatMap((attempt) =>
+                            attempt.steps
+                        );
+                        const checked = steps.filter((step) =>
+                            step.observation_content_checked
+                        ).length;
                         const failures = Object.entries(result.failed_attempts)
-                            .map(([kind, count]) => `${kind} ${count}`)
+                            .map(([kind, count]) =>
+                                `${kind} ${count}`
+                            )
                             .join(", ");
                         return [
                             task,
@@ -151,6 +166,7 @@ export function renderSummary(
                             String(result.passed_first_attempt),
                             String(result.passed_after_retries),
                             failures || "none",
+                            `${checked} of ${steps.length}`,
                         ];
                     })
                 ),

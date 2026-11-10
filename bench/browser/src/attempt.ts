@@ -1,18 +1,23 @@
 import {
     Browser,
+    BrowserExited,
     type BrowserProfile,
-    PinMismatch,
     type Startup,
 } from "./browser.ts";
-import { TimeoutError, withDeadline } from "./cdp.ts";
+import { CdpError, TimeoutError, withDeadline } from "./cdp.ts";
 import type { FixtureServer } from "./fixtures/server.ts";
 import { sha256Hex } from "./hex.ts";
-import { type Observer, observers } from "./observers.ts";
+import type { Observation, Observer } from "./observers.ts";
 import { ActionError, Page } from "./page.ts";
 import type { Step, Task } from "./tasks.ts";
 import { UsageMeter } from "./usage.ts";
 
-export type Arm = { name: string; browser: BrowserProfile; observer: string };
+export type Arm = {
+    name: string;
+    browser: BrowserProfile;
+    observer_name: string;
+    observer: Observer;
+};
 
 export type Conditions = {
     rounds: number;
@@ -33,16 +38,16 @@ export type StepRecord = {
     name: string;
     action_ms: number;
     readiness_ms: number;
+    readiness_confirmation_ms: number;
     observation_ms: number;
     observation_tokens: number;
     observation_bytes: number;
     observation_sha256: string;
     observation_file: string;
-    observation_delivery: "full" | "delta";
+    observation_delivery: Observation["delivery"];
     observation_content_checked: boolean;
     active_cpu_seconds: number;
     think_cpu_seconds: number;
-    peak_rss_sum_bytes: number;
 };
 
 export type AttemptRecord = {
@@ -63,15 +68,50 @@ export type AttemptRecord = {
 
 const hang_backstop_factor = 1.5;
 
-class ObservationIncomplete extends Error {}
+export class ObservationRejected extends Error {}
 class OutcomeFailed extends Error {}
 
-function failureKind(error: unknown): FailureKind {
+function browserFailureKind(error: unknown): FailureKind | null {
     if (error instanceof TimeoutError) return "timeout";
     if (error instanceof ActionError) return "action";
-    if (error instanceof ObservationIncomplete) return "observation";
+    if (error instanceof ObservationRejected) return "observation";
     if (error instanceof OutcomeFailed) return "outcome";
-    return "crash";
+    if (error instanceof CdpError || error instanceof BrowserExited) {
+        return "crash";
+    }
+    return null;
+}
+
+export function observedState(
+    observer: Observer,
+    previous_state: string | null,
+    observation: { delivery: Observation["delivery"]; text: string },
+    expected: string[],
+): string {
+    let state = observation.text;
+    if (observation.delivery === "delta") {
+        if (!observer.rebuild || previous_state === null) {
+            throw new ObservationRejected(
+                "delta sent with no previous state to apply it to",
+            );
+        }
+        try {
+            state = observer.rebuild(previous_state, observation.text);
+        } catch (error) {
+            throw new ObservationRejected(
+                `delta does not apply to the previous state: ${
+                    error instanceof Error ? error.message : error
+                }`,
+            );
+        }
+    }
+    const missing = expected.filter((text) => !state.includes(text));
+    if (missing.length > 0) {
+        throw new ObservationRejected(
+            `observed state lacks ${JSON.stringify(missing)}`,
+        );
+    }
+    return state;
 }
 
 export type AttemptContext = {
@@ -89,8 +129,6 @@ export async function runAttempt(
     context: AttemptContext,
 ): Promise<AttemptRecord> {
     const { arm, task, conditions, server } = context;
-    const observer = observers[arm.observer]!();
-    const observed_state: ObservedState = { text: null };
     const record: AttemptRecord = {
         arm: arm.name,
         task: task.id,
@@ -110,6 +148,7 @@ export async function runAttempt(
     let browser: Browser | null = null;
     let meter: UsageMeter | null = null;
     let current_step: string | null = null;
+    let state: string | null = null;
 
     try {
         server.startRecording();
@@ -120,22 +159,21 @@ export async function runAttempt(
 
         const page = await Page.prepare(browser.page);
         const prepare_started_at = performance.now();
-        await observer.prepare?.(page);
+        await arm.observer.prepare?.(page);
         record.observer_prepare_ms = performance.now() - prepare_started_at;
 
         for (const [index, step] of task.steps.entries()) {
             current_step = step.name;
-            record.steps.push(
-                await runStep(
-                    context,
-                    observer,
-                    observed_state,
-                    page,
-                    meter,
-                    step,
-                    index,
-                ),
+            const observed = await runStep(
+                context,
+                state,
+                page,
+                meter,
+                step,
+                index,
             );
+            state = observed.state;
+            record.steps.push(observed.record);
         }
         current_step = null;
 
@@ -147,18 +185,18 @@ export async function runAttempt(
         }
         record.status = "passed";
     } catch (error) {
-        if (error instanceof PinMismatch) throw error;
+        const kind = browserFailureKind(error);
+        if (!kind) throw error;
         record.failure = {
-            kind: failureKind(error),
+            kind,
             step: current_step,
-            message: error instanceof Error ? error.message : String(error),
+            message: (error as Error).message,
         };
     } finally {
         if (meter) {
-            await meter.sample();
+            record.cpu_seconds = await meter.cpuSecondsNow();
+            record.peak_rss_sum_bytes = meter.peakRssSumBytes();
             meter.stop();
-            record.cpu_seconds = meter.totalCpuSeconds();
-            record.peak_rss_sum_bytes = meter.lifetimePeakRssSumBytes();
         }
         await browser?.close();
         record.wall_ms = performance.now() - started_at;
@@ -166,36 +204,17 @@ export async function runAttempt(
     return record;
 }
 
-type ObservedState = { text: string | null };
-
-function rebuiltState(
-    observer: Observer,
-    previous_state: string | null,
-    sent: string,
-): string {
-    if (!observer.rebuild || previous_state === null) return sent;
-    try {
-        return observer.rebuild(previous_state, sent);
-    } catch (error) {
-        throw new ObservationIncomplete(
-            `delta cannot be applied to the previous state: ${
-                error instanceof Error ? error.message : error
-            }`,
-        );
-    }
-}
-
 async function runStep(
     context: AttemptContext,
-    observer: Observer,
-    observed_state: ObservedState,
+    previous_state: string | null,
     page: Page,
     meter: UsageMeter,
     step: Step,
     index: number,
-): Promise<StepRecord> {
+): Promise<{ record: StepRecord; state: string | null }> {
     const { conditions } = context;
-    const before = await meter.mark();
+    const { observer } = context.arm;
+    const cpu_before = await meter.cpuSecondsNow();
 
     const measured = await withDeadline(
         `step "${step.name}"`,
@@ -204,21 +223,27 @@ async function runStep(
             const action_started_at = performance.now();
             await page.act(step.act);
             const action_ended_at = performance.now();
-            const settled_at = await page.settle(
+            const settled = await page.settle(
                 step.ready,
                 conditions.step_timeout_ms,
             );
             const observation_started_at = performance.now();
-            const observation = await observer.observe(page);
+            const observation = await observer.observe(page, previous_state);
+            const readiness_ms = Math.max(
+                0,
+                settled.ready_at - action_ended_at,
+            );
             return {
                 action_ms: action_ended_at - action_started_at,
-                readiness_ms: Math.max(0, settled_at - action_ended_at),
+                readiness_ms,
+                readiness_confirmation_ms: settled.confirmed_at -
+                    action_ended_at - readiness_ms,
                 observation_ms: performance.now() - observation_started_at,
                 observation,
             };
         })(),
     );
-    const after_active = await meter.mark();
+    const cpu_after_active = await meter.cpuSecondsNow();
 
     const { observation } = measured;
     const file = [
@@ -231,46 +256,39 @@ async function runStep(
     await Deno.mkdir(path.slice(0, path.lastIndexOf("/")), { recursive: true });
     await Deno.writeFile(path, observation.bytes);
 
+    const expected = step.observed ?? [];
+    let state: string | null = null;
     if (observation.text !== null) {
-        const state = rebuiltState(
+        state = observedState(
             observer,
-            observed_state.text,
-            observation.text,
+            previous_state,
+            { delivery: observation.delivery, text: observation.text },
+            expected,
         );
-        observed_state.text = state;
-        if (observer.rebuild) {
+        if (observation.delivery === "delta") {
             await Deno.writeTextFile(`${path}.rebuilt-state.txt`, state);
-        }
-        const missing = (step.observed ?? []).filter((expected) =>
-            !state.includes(expected)
-        );
-        if (missing.length > 0) {
-            throw new ObservationIncomplete(
-                `observed state lacks ${JSON.stringify(missing)} (${file})`,
-            );
         }
     }
 
     await new Promise((resolve) => setTimeout(resolve, conditions.think_ms));
-    const after_think = await meter.mark();
+    const cpu_after_think = await meter.cpuSecondsNow();
 
     return {
-        name: step.name,
-        action_ms: measured.action_ms,
-        readiness_ms: measured.readiness_ms,
-        observation_ms: measured.observation_ms,
-        observation_tokens: observation.tokens,
-        observation_bytes: observation.bytes.length,
-        observation_sha256: await sha256Hex(observation.bytes),
-        observation_file: file,
-        observation_delivery: observer.rebuild ? "delta" : "full",
-        observation_content_checked: observation.text !== null &&
-            (step.observed?.length ?? 0) > 0,
-        active_cpu_seconds: after_active.cpu_seconds - before.cpu_seconds,
-        think_cpu_seconds: after_think.cpu_seconds - after_active.cpu_seconds,
-        peak_rss_sum_bytes: Math.max(
-            after_active.peak_rss_sum_bytes,
-            after_think.peak_rss_sum_bytes,
-        ),
+        state,
+        record: {
+            name: step.name,
+            action_ms: measured.action_ms,
+            readiness_ms: measured.readiness_ms,
+            readiness_confirmation_ms: measured.readiness_confirmation_ms,
+            observation_ms: measured.observation_ms,
+            observation_tokens: observation.tokens,
+            observation_bytes: observation.bytes.length,
+            observation_sha256: await sha256Hex(observation.bytes),
+            observation_file: file,
+            observation_delivery: observation.delivery,
+            observation_content_checked: state !== null && expected.length > 0,
+            active_cpu_seconds: cpu_after_active - cpu_before,
+            think_cpu_seconds: cpu_after_think - cpu_after_active,
+        },
     };
 }

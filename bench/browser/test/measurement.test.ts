@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 
-import type { AttemptRecord } from "../src/attempt.ts";
+import {
+    type AttemptRecord,
+    ObservationRejected,
+    observedState,
+} from "../src/attempt.ts";
 import { renderAxTree } from "../src/ax.ts";
 import { applyDelta, diffLines } from "../src/delta.ts";
+import { observers } from "../src/observers.ts";
 import { armOrder } from "../src/schedule.ts";
 import { reliability, spread } from "../src/summary.ts";
+import { tasks } from "../src/tasks.ts";
 import {
     parseLinuxStat,
     parsePsRows,
@@ -40,7 +46,7 @@ Deno.test("linux stat parsing survives spaces and parentheses in the command nam
     });
 });
 
-Deno.test("usage covers only the browser tree, keeps cpu of exited children and resets step peaks", async () => {
+Deno.test("usage covers only the browser tree and keeps cpu of exited children", async () => {
     const mib = 2 ** 20;
     const samples: ProcessRow[][] = [
         [
@@ -56,15 +62,9 @@ Deno.test("usage covers only the browser tree, keeps cpu of exited children and 
     ];
     const meter = new UsageMeter(10, () => Promise.resolve(samples.shift()!));
 
-    assert.deepEqual(await meter.mark(), {
-        cpu_seconds: 3.5,
-        peak_rss_sum_bytes: 180 * mib,
-    });
-    assert.deepEqual(await meter.mark(), {
-        cpu_seconds: 4,
-        peak_rss_sum_bytes: 110 * mib,
-    });
-    assert.equal(meter.lifetimePeakRssSumBytes(), 180 * mib);
+    assert.equal(await meter.cpuSecondsNow(), 3.5);
+    assert.equal(await meter.cpuSecondsNow(), 4);
+    assert.equal(meter.peakRssSumBytes(), 180 * mib);
 });
 
 Deno.test("every arm runs in every position equally often", () => {
@@ -221,4 +221,78 @@ Deno.test("a delta that does not fit the previous state is rejected instead of r
     assert.throws(() => applyDelta("a\nb", "@@ -5,1\n+c"));
     assert.throws(() => applyDelta("a\nb", "@@ -2,4\n+c"));
     assert.throws(() => applyDelta("a\nb", "stray line"));
+});
+
+Deno.test("a delta observation is judged on the state rebuilt from it, and rejected when it cannot be rebuilt or lacks expected content", () => {
+    const delta_observer = observers["ax-diff"]!;
+    const previous = `heading "Cart"\nbutton "Checkout"`;
+    const delta = {
+        delivery: "delta" as const,
+        text: `@@ -2,1\n+status "Order confirmed"`,
+    };
+
+    assert.equal(
+        observedState(delta_observer, previous, delta, [
+            "Cart",
+            "Order confirmed",
+        ]),
+        `heading "Cart"\nstatus "Order confirmed"`,
+    );
+    assert.throws(
+        () => observedState(delta_observer, previous, delta, ["Checkout"]),
+        ObservationRejected,
+    );
+    assert.throws(
+        () => observedState(delta_observer, null, delta, []),
+        ObservationRejected,
+    );
+    assert.throws(
+        () => observedState(observers["ax-tree"]!, previous, delta, []),
+        ObservationRejected,
+    );
+    assert.throws(
+        () =>
+            observedState(
+                delta_observer,
+                previous,
+                { delivery: "delta", text: "@@ -9,1" },
+                [],
+            ),
+        ObservationRejected,
+    );
+    assert.equal(
+        observedState(
+            delta_observer,
+            previous,
+            { delivery: "full", text: "replaced" },
+            ["replaced"],
+        ),
+        "replaced",
+    );
+});
+
+Deno.test("the checkout outcome accepts only the one correct order the server received", () => {
+    const outcome = tasks.find((task) => task.id === "shop-checkout")!.outcome;
+    assert.ok(outcome.source === "server-request-log");
+    const order = (body: unknown) => ({
+        method: "POST",
+        path: "/api/orders",
+        body,
+    });
+    const correct = {
+        items: [{ id: "p21", quantity: 1 }],
+        name: "Ada Lovelace",
+        email: "ada@example.com",
+        accepted_terms: true,
+    };
+
+    assert.equal(outcome.failure([order(correct)]), null);
+    assert.ok(outcome.failure([]));
+    assert.ok(outcome.failure([order(correct), order(correct)]));
+    assert.ok(
+        outcome.failure([
+            order({ ...correct, items: [{ id: "p20", quantity: 1 }] }),
+        ]),
+    );
+    assert.ok(outcome.failure([order({ ...correct, accepted_terms: false })]));
 });

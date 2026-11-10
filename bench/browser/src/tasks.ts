@@ -1,9 +1,10 @@
 import {
+    fixture_origin,
     formatPrice,
     highest_revenue_account,
     products,
+    type RequestRecord,
 } from "./fixtures/data.ts";
-import { fixture_origin, type RequestRecord } from "./fixtures/server.ts";
 import type { Action } from "./page.ts";
 
 export type Step = {

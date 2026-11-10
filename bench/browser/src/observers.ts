@@ -6,6 +6,7 @@ import { applyDelta, diffLines } from "./delta.ts";
 import type { Page } from "./page.ts";
 
 export type Observation = {
+    delivery: "full" | "delta";
     extension: string;
     bytes: Uint8Array<ArrayBuffer>;
     text: string | null;
@@ -15,16 +16,20 @@ export type Observation = {
 export type Observer = {
     format: string;
     tokenizer: string;
-    rebuild?(previous_state: string, sent: string): string;
+    rebuild?(previous_state: string, delta: string): string;
     prepare?(page: Page): Promise<void>;
-    observe(page: Page): Promise<Observation>;
+    observe(page: Page, previous_state: string | null): Promise<Observation>;
 };
 
 const text_tokenizer = "o200k_base (gpt-tokenizer 4.1.0)";
 const image_tokenizer = "estimate: ceil(width * height / 750)";
 
-function textObservation(text: string): Observation {
+function textObservation(
+    delivery: Observation["delivery"],
+    text: string,
+): Observation & { text: string } {
     return {
+        delivery,
         extension: "txt",
         bytes: new TextEncoder().encode(text),
         text,
@@ -43,45 +48,44 @@ async function fullAxText(page: Page): Promise<string> {
     return renderAxTree(nodes);
 }
 
-export const observers: Record<string, () => Observer> = {
-    "ax-tree": () => ({
+export const observers: Record<string, Observer> = {
+    "ax-tree": {
         format: "ax-tree/indented-v1 (Accessibility.getFullAXTree)",
         tokenizer: text_tokenizer,
         prepare: enableAccessibility,
         async observe(page) {
-            return textObservation(await fullAxText(page));
+            return textObservation("full", await fullAxText(page));
         },
-    }),
-    "ax-diff": () => {
-        let previous: string | null = null;
-        return {
-            format:
-                "ax-tree/indented-v1 first, then line-delta-v1 against the previous observation, diffed from a full Accessibility.getFullAXTree capture",
-            tokenizer: text_tokenizer,
-            prepare: enableAccessibility,
-            rebuild: applyDelta,
-            async observe(page) {
-                const current = await fullAxText(page);
-                const sent = previous === null
-                    ? current
-                    : diffLines(previous, current);
-                previous = current;
-                return textObservation(sent);
-            },
-        };
     },
-    html: () => ({
+    "ax-diff": {
+        format:
+            "ax-tree/indented-v1, or line-delta-v1 against the previous state when that is fewer tokens; diffed from a full Accessibility.getFullAXTree capture",
+        tokenizer: text_tokenizer,
+        prepare: enableAccessibility,
+        rebuild: applyDelta,
+        async observe(page, previous_state) {
+            const full = textObservation("full", await fullAxText(page));
+            if (previous_state === null) return full;
+            const delta = textObservation(
+                "delta",
+                diffLines(previous_state, full.text),
+            );
+            return delta.tokens < full.tokens ? delta : full;
+        },
+    },
+    html: {
         format: "dom/outer-html",
         tokenizer: text_tokenizer,
         async observe(page) {
             return textObservation(
+                "full",
                 await page.evaluate<string>(
                     "document.documentElement.outerHTML",
                 ),
             );
         },
-    }),
-    screenshot: () => ({
+    },
+    screenshot: {
         format: `image/png viewport ${viewport.width}x${viewport.height}`,
         tokenizer: image_tokenizer,
         async observe(page) {
@@ -90,6 +94,7 @@ export const observers: Record<string, () => Observer> = {
                 { format: "png" },
             );
             return {
+                delivery: "full",
                 extension: "png",
                 bytes: Uint8Array.from(
                     atob(data),
@@ -99,5 +104,5 @@ export const observers: Record<string, () => Observer> = {
                 tokens: Math.ceil(viewport.width * viewport.height / 750),
             };
         },
-    }),
+    },
 };

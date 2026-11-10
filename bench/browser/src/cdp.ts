@@ -63,7 +63,7 @@ export class Cdp {
             socket.addEventListener("open", () => resolve(new Cdp(socket)));
             socket.addEventListener(
                 "error",
-                () => reject(new Error(`cannot connect to ${url}`)),
+                () => reject(new CdpError("connect", `cannot reach ${url}`)),
             );
         });
     }

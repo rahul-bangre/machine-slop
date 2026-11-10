@@ -1,9 +1,11 @@
-import { accounts, changelog, products } from "./data.ts";
+import {
+    accounts,
+    changelog,
+    fixture_origin,
+    products,
+    type RequestRecord,
+} from "./data.ts";
 import { renderDocs } from "./docs.ts";
-
-export type RequestRecord = { method: string; path: string; body: unknown };
-
-export const fixture_origin = "http://127.0.0.1:41730";
 
 const pages: Record<string, string> = {
     "/shop/": await Deno.readTextFile(new URL("shop.html", import.meta.url)),

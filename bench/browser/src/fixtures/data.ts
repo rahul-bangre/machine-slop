@@ -1,3 +1,7 @@
+export const fixture_origin = "http://127.0.0.1:41730";
+
+export type RequestRecord = { method: string; path: string; body: unknown };
+
 export type Product = { id: string; name: string; price_cents: number };
 export type Account = {
     id: string;

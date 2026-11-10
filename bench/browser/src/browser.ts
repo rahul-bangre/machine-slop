@@ -43,12 +43,18 @@ export class PinMismatch extends Error {
     }
 }
 
+export class BrowserExited extends Error {
+    constructor(stderr: string) {
+        super(`browser exited before DevTools was ready: ${stderr}`);
+        this.name = "BrowserExited";
+    }
+}
+
 export class Browser {
     private constructor(
         readonly pid: number,
         readonly page: CdpSession,
         readonly startup: Startup,
-        readonly product: string,
         private readonly cdp: Cdp,
         private readonly child: Deno.ChildProcess,
         private readonly profile_directory: string,
@@ -100,7 +106,6 @@ export class Browser {
                 child.pid,
                 page,
                 { devtools_ms, usable_page_ms: performance.now() - spawned_at },
-                product,
                 cdp,
                 child,
                 profile_directory,
@@ -158,9 +163,7 @@ async function drainStderr(
         }
     }
     if (!found) {
-        endpoint.reject(
-            new Error(`browser exited before DevTools was ready: ${head}`),
-        );
+        endpoint.reject(new BrowserExited(head));
     }
 }
 

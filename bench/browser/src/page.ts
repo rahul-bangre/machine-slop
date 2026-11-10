@@ -16,6 +16,8 @@ export class ActionError extends Error {
 
 export const readiness = { poll_ms: 20, quiet_ms: 250 };
 
+export type Settled = { ready_at: number; confirmed_at: number };
+
 const keys = {
     Enter: {
         key: "Enter",
@@ -101,20 +103,22 @@ export class Page {
         }
     }
 
-    async settle(predicate: string, timeout_ms: number): Promise<number> {
+    async settle(predicate: string, timeout_ms: number): Promise<Settled> {
         const deadline = performance.now() + timeout_ms;
         const check =
             `document.readyState === "complete" && Boolean(${predicate})`;
-        let settled_at: number | null = null;
+        let ready_at: number | null = null;
         while (performance.now() < deadline) {
             const now = performance.now();
             const holds = this.inflight.size === 0 &&
                 await this.evaluate<boolean>(check).catch(() => false);
             if (!holds) {
-                settled_at = null;
+                ready_at = null;
             } else {
-                settled_at ??= now;
-                if (now - settled_at >= readiness.quiet_ms) return settled_at;
+                ready_at ??= now;
+                if (now - ready_at >= readiness.quiet_ms) {
+                    return { ready_at, confirmed_at: now };
+                }
             }
             await new Promise((resolve) =>
                 setTimeout(resolve, readiness.poll_ms)

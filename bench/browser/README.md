@@ -50,12 +50,17 @@ Per step, timed separately:
 - action: dispatching the input
 - readiness: from the end of the action until the step's condition holds, the
   document is complete and no request is in flight
-- observation: capturing the observation
+- readiness confirmation: the harness then waits for that to stay true for 250
+  ms before observing. This is harness policy, not browser cost, and is reported
+  on its own line so the phases add up to the time actually waited
+- observation: capturing the observation, including tokenizing it
 - think: a fixed idle pause standing in for model inference, with the CPU the
   browser burns during it
 
 Memory is the peak of summed RSS across the process tree, sampled every 200 ms.
-Shared pages are counted once per process, so it overstates absolute use.
+Shared pages are counted once per process, so it overstates absolute use. CPU is
+the summed CPU time of the same tree; time a process uses after its last sample
+is not counted.
 
 Token counts are recorded with the observation format and the tokenizer that
 produced them. Screenshot tokens are an estimate from pixel area.
@@ -72,22 +77,32 @@ drops content does not pass. Screenshots are not content-checked.
 
 ## Delta observations
 
-An observer may send only what changed since its previous observation. It then
-supplies `rebuild(previous_state, sent)`, a pure function. The harness applies
-it to the state it holds itself, runs the content check against that rebuilt
-state, and counts tokens on what was sent. A delta that does not apply fails the
-attempt. Both the sent delta and the rebuilt state are saved.
+Each observation says whether it is the full state or a delta against the state
+the harness already holds. For a delta, the observer supplies a pure
+`rebuild(previous_state, delta)`. The harness applies it to its own copy of the
+state, runs the content check against the rebuilt state, and counts tokens on
+what was sent. A delta that does not apply fails the attempt. Both the sent
+delta and the rebuilt state are saved.
 
-`ax-diff` is the reference: a full accessibility tree first, then a line delta
-diffed from a full capture. It saves tokens, not capture work, so it shows what
-delta delivery is worth before a native implementation exists.
+`ax-diff` is the reference: it captures the full accessibility tree every step
+and sends either that or a line delta, whichever is fewer tokens. It saves
+tokens, not capture work, so it shows what delta delivery is worth before a
+native implementation exists.
 
 The rebuilt state is checked for the expected text only. It is not compared line
 for line with a fresh full capture.
 
 Failed attempts are kept. Timings are summarised over passing attempts only, and
 the reliability table reports how many runs passed first time, how many passed
-after retries, and every failed attempt by kind.
+after retries, every failed attempt by kind, and how many observations were
+content-checked.
+
+Only failures of the browser or the task count against an arm: timeouts, failed
+actions, rejected observations, wrong outcomes and browser crashes. An error in
+the harness itself stops the run.
+
+Only one run can use the fixture origin at a time; a second run exits at
+startup.
 
 ## Order
 

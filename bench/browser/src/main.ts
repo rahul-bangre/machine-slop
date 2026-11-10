@@ -18,7 +18,8 @@ import {
     pinned_product,
     pinnedExecutable,
 } from "./chromium.ts";
-import { fixture_origin, FixtureServer } from "./fixtures/server.ts";
+import { fixture_origin } from "./fixtures/data.ts";
+import { FixtureServer } from "./fixtures/server.ts";
 import { observers } from "./observers.ts";
 import { readiness } from "./page.ts";
 import { armOrder } from "./schedule.ts";
@@ -51,18 +52,30 @@ const { values: flags } = parseArgs({
     },
 });
 
-function describeObservation(observer_name: string) {
-    const observer = observers[observer_name]!();
-    return {
-        format: observer.format,
-        tokenizer: observer.tokenizer,
-        delivery: observer.rebuild ? "delta" : "full",
-    };
-}
-
 function fail(message: string): never {
     console.error(message);
     Deno.exit(2);
+}
+
+function wholeNumber(flag: string, value: string, minimum: number): number {
+    const number = Number(value);
+    if (!Number.isInteger(number) || number < minimum) {
+        fail(`--${flag} must be a whole number of at least ${minimum}`);
+    }
+    return number;
+}
+
+function startFixtureServer(): FixtureServer {
+    try {
+        return new FixtureServer();
+    } catch (error) {
+        if (error instanceof Deno.errors.AddrInUse) {
+            fail(
+                `${fixture_origin} is in use; another bench run is probably active`,
+            );
+        }
+        throw error;
+    }
 }
 
 function selection(flag: string | undefined): string[] | null {
@@ -76,12 +89,12 @@ function resolveArm(name: string): Arm {
         fail(`unknown arm "${name}"`);
     const browser = config.browsers[arm.browser] ??
         fail(`arm "${name}" names unknown browser "${arm.browser}"`);
-    if (!observers[arm.observer]) {
+    const observer = observers[arm.observer] ??
         fail(`arm "${name}" names unknown observer "${arm.observer}"`);
-    }
     return {
         name,
-        observer: arm.observer,
+        observer_name: arm.observer,
+        observer,
         browser: {
             name: arm.browser,
             executable: browser.executable === "pinned"
@@ -114,12 +127,18 @@ if (uses_pinned_chromium && !await isPinnedChromiumInstalled()) {
 }
 
 const conditions: Conditions = {
-    rounds: Number(flags.rounds),
-    retries: Number(flags.retries),
-    think_ms: Number(flags["think-ms"]),
-    step_timeout_ms: Number(flags["step-timeout-ms"]),
+    rounds: wholeNumber("rounds", flags.rounds, 1),
+    retries: wholeNumber("retries", flags.retries, 0),
+    think_ms: wholeNumber("think-ms", flags["think-ms"], 0),
+    step_timeout_ms: wholeNumber(
+        "step-timeout-ms",
+        flags["step-timeout-ms"],
+        1,
+    ),
     usage_sample_ms: 200,
 };
+
+const server = startFixtureServer();
 
 const distinct_browsers = new Map(
     arms.map((arm) => [arm.browser.name, arm.browser]),
@@ -164,10 +183,16 @@ await Deno.writeTextFile(
                 cpu_time_resolution_seconds,
                 memory_metric:
                     "peak of summed RSS across the browser process tree; shared pages are counted once per process",
+                cpu_metric:
+                    "summed CPU time of the browser process tree; time a process uses after its last sample is not counted",
             },
-            arms: arms.map((arm) => ({
+            arms: arms.map(({ observer, ...arm }) => ({
                 ...arm,
-                observation: describeObservation(arm.observer),
+                observation: {
+                    format: observer.format,
+                    tokenizer: observer.tokenizer,
+                    may_send_deltas: observer.rebuild !== undefined,
+                },
             })),
             tasks: tasks.map((task) => ({
                 id: task.id,
@@ -181,7 +206,6 @@ await Deno.writeTextFile(
     ),
 );
 
-const server = new FixtureServer();
 const attempts: AttemptRecord[] = [];
 const attempt_log = await Deno.open(`${output_directory}/attempts.jsonl`, {
     create: true,
