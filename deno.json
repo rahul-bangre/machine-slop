@@ -1,0 +1,19 @@
+{
+  "workspace": ["./packages/sdk"],
+  "exclude": ["target", "node_modules", "**/dist"],
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "tasks": {
+    "check": "deno check --frozen-lockfile packages/sdk/src/mod.ts",
+    "lint": "deno lint",
+    "format": "deno fmt",
+    "format:check": "deno fmt --check"
+  }
+}

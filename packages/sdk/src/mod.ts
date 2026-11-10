@@ -1,1 +1,1 @@
-export { Machine } from "./machine.js";
+export { Machine } from "./machine.ts";
