@@ -602,3 +602,42 @@ async fn files_and_ports_reach_the_machine_through_the_host() {
     assert_eq!(status, 204);
     std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
 }
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn an_open_port_tunnel_keeps_a_machine_from_expiring() {
+    let host = Host::start("tunnel-in-use").await;
+    let info = host
+        .create_with(Some(json!({ "idle_timeout_secs": 1 })))
+        .await;
+    let machine = info["id"].as_str().expect("machine id");
+    host.start_process(
+        machine,
+        "exec python3 -c 'import socket; s = socket.create_server((\"127.0.0.1\", 8200)); c, _ = s.accept(); c.recv(1)'",
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let tunnel = loop {
+        if let Some(tunnel) = host.tunnel(machine, 8200).await {
+            break tunnel;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "listener in the machine never accepted a tunnel"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (status, info) = host
+        .request("GET", &format!("/machines/{machine}"), None)
+        .await;
+    assert_eq!(
+        status, 200,
+        "machine expired while a tunnel was open: {info}"
+    );
+
+    drop(tunnel);
+    host.wait_until_gone(machine, Duration::from_secs(10)).await;
+    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+}

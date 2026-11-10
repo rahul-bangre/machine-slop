@@ -38,11 +38,11 @@ find the machine with `GET /machines` instead of retrying. A host runs at most
 A machine expires after `idle_timeout_secs` (default 600, at most 86400) without
 an open request to its `agentd`, and is then destroyed as if deleted. The clock
 starts when boot finishes and restarts when the last open request to
-`/machines/{id}/...` ends, so a long `wait()` or event stream keeps the machine
-alive. Requests to `machined` itself, such as `GET /machines/{id}`, do not.
-Processes still running inside an expired machine are killed with it. To keep an
-unattended machine, send any request to it, such as `machine.health()`, within
-each timeout.
+`/machines/{id}/...` ends, so a long `wait()`, an event stream or an open port
+tunnel keeps the machine alive. Requests to `machined` itself, such as
+`GET /machines/{id}`, do not. Processes still running inside an expired machine
+are killed with it. To keep an unattended machine, send any request to it, such
+as `machine.health()`, within each timeout.
 
 ## Machine
 
