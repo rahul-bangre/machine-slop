@@ -12,13 +12,14 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     process::{Child, Command},
-    sync::{Mutex, OwnedSemaphorePermit, oneshot, watch},
+    sync::{Mutex, oneshot, watch},
     time::Instant,
 };
 
 use crate::{
     contract::{MachineInfo, MachineState},
     egress::{self, EGRESS_PORT, EgressPolicy},
+    machines::Admission,
 };
 
 pub const AGENTD_PORT: u32 = 3000;
@@ -79,6 +80,15 @@ impl std::fmt::Display for BootError {
     }
 }
 
+impl std::error::Error for BootError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 impl From<io::Error> for BootError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
@@ -102,8 +112,12 @@ pub struct Machine {
     idle_timeout_secs: u32,
     activity: watch::Sender<Activity>,
     exit: watch::Receiver<Option<String>>,
-    kill: Mutex<Option<oneshot::Sender<()>>>,
-    _slot: OwnedSemaphorePermit,
+    cleanup: Mutex<Option<Cleanup>>,
+}
+
+struct Cleanup {
+    _admission: Admission,
+    kill: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -145,7 +159,7 @@ impl Machine {
         dir: PathBuf,
         image: &Image,
         spec: MachineSpec,
-        slot: OwnedSemaphorePermit,
+        admission: Admission,
     ) -> Result<Self, BootError> {
         let MachineSpec {
             vcpus,
@@ -161,7 +175,7 @@ impl Machine {
                 return Err(error.into());
             }
         };
-        let (exit, kill) = supervise(child);
+        let (exit, kill) = supervise(child, id.clone());
         let (egress, egress_policy) = watch::channel(egress);
         serve_egress_until_exit(egress_listener, egress_policy, exit.clone());
         let mut machine = Self {
@@ -177,8 +191,10 @@ impl Machine {
                 idle_since: started,
             }),
             exit,
-            kill: Mutex::new(Some(kill)),
-            _slot: slot,
+            cleanup: Mutex::new(Some(Cleanup {
+                _admission: admission,
+                kill: Some(kill),
+            })),
         };
         if let Err(error) = machine.wait_until_ready().await {
             machine.destroy().await;
@@ -247,7 +263,11 @@ impl Machine {
     }
 
     pub async fn destroy(&self) {
-        if let Some(kill) = self.kill.lock().await.take() {
+        let mut cleanup = self.cleanup.lock().await;
+        let Some(pending) = cleanup.as_mut() else {
+            return;
+        };
+        if let Some(kill) = pending.kill.take() {
             let _ = kill.send(());
         }
         let mut exit = self.exit.clone();
@@ -255,8 +275,10 @@ impl Machine {
         if let Err(error) = tokio::fs::remove_dir_all(&self.dir).await
             && error.kind() != io::ErrorKind::NotFound
         {
-            eprintln!("failed to remove {}: {error}", self.dir.display());
+            tracing::error!(machine_id = %self.id, path = %self.dir.display(), %error, "machine cleanup failed");
         }
+        tracing::info!(machine_id = %self.id, "machine destroyed");
+        cleanup.take();
     }
 
     async fn wait_until_ready(&self) -> Result<(), BootError> {
@@ -317,9 +339,13 @@ async fn launch(
         firecracker_config(image, vcpus, memory_mib).to_string(),
     )
     .await?;
-    let child = spawn_firecracker(image, dir)?;
-    if let Some(pid) = child.id() {
-        tokio::fs::write(dir.join("firecracker.pid"), pid.to_string()).await?;
+    let mut child = spawn_firecracker(image, dir)?;
+    if let Some(pid) = child.id()
+        && let Err(error) = tokio::fs::write(dir.join("firecracker.pid"), pid.to_string()).await
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(error);
     }
     Ok((child, egress_listener))
 }
@@ -382,7 +408,10 @@ fn spawn_firecracker(image: &Image, dir: &Path) -> io::Result<Child> {
         .spawn()
 }
 
-fn supervise(mut child: Child) -> (watch::Receiver<Option<String>>, oneshot::Sender<()>) {
+fn supervise(
+    mut child: Child,
+    machine_id: String,
+) -> (watch::Receiver<Option<String>>, oneshot::Sender<()>) {
     let (exit_sender, exit) = watch::channel(None);
     let (kill, kill_requested) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -397,6 +426,7 @@ fn supervise(mut child: Child) -> (watch::Receiver<Option<String>>, oneshot::Sen
             Ok(status) => status.to_string(),
             Err(error) => format!("failed to wait for firecracker: {error}"),
         };
+        tracing::info!(%machine_id, %message, "firecracker exited");
         exit_sender.send_replace(Some(message));
     });
     (exit, kill)
@@ -461,4 +491,38 @@ pub fn kill_stale_firecracker(dir: &Path) {
     if running_in_dir {
         let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn controlled_machine(
+    id: &str,
+    dir: PathBuf,
+    admission: Admission,
+) -> (
+    Arc<Machine>,
+    oneshot::Receiver<()>,
+    watch::Sender<Option<String>>,
+) {
+    let (exit_sender, exit) = watch::channel(None);
+    let (kill, killed) = oneshot::channel();
+    let (egress, _) = watch::channel(EgressPolicy::parse(&[]).unwrap());
+    let machine = Arc::new(Machine {
+        id: id.into(),
+        dir,
+        vcpus: 1,
+        memory_mib: 128,
+        egress,
+        boot_ms: 0,
+        idle_timeout_secs: 600,
+        activity: watch::Sender::new(Activity {
+            in_use: 0,
+            idle_since: Instant::now(),
+        }),
+        exit,
+        cleanup: Mutex::new(Some(Cleanup {
+            _admission: admission,
+            kill: Some(kill),
+        })),
+    });
+    (machine, killed, exit_sender)
 }

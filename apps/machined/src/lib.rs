@@ -16,10 +16,22 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 pub fn app(machines: Arc<Machines>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/metrics", get(metrics))
         .route("/machines", get(list).post(create))
         .route("/machines/{id}", get(info).patch(update).delete(destroy))
         .route("/machines/{id}/{*path}", any(proxy))
         .with_state(machines)
+}
+
+async fn metrics(State(machines): State<Arc<Machines>>) -> impl IntoResponse {
+    let (active, reserved, budget) = machines.resource_usage();
+    let (successes, failures) = machines.create_counts();
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        format!(
+            "# TYPE machined_machines_active gauge\nmachined_machines_active {active}\n# TYPE machined_memory_reserved_mib gauge\nmachined_memory_reserved_mib {reserved}\n# TYPE machined_memory_budget_mib gauge\nmachined_memory_budget_mib {budget}\n# TYPE machined_creates_total counter\nmachined_creates_total{{result=\"success\"}} {successes}\nmachined_creates_total{{result=\"failure\"}} {failures}\n"
+        ),
+    )
 }
 
 async fn create(

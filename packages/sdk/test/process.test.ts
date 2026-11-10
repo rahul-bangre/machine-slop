@@ -324,3 +324,32 @@ Deno.test("SIGTERM reaps the active child and delivers its final event before sh
             await stream.return(undefined);
         }
     }));
+
+Deno.test("process metrics distinguish running children from retained replay records", () =>
+    withMachine(async (machine, _terminate, url) => {
+        const metrics = async () => {
+            const response = await fetch(`${url}/metrics`);
+            assert.equal(response.status, 200);
+            assert.match(
+                response.headers.get("content-type") ?? "",
+                /^text\/plain/,
+            );
+            return await response.text();
+        };
+        assert.match(await metrics(), /agentd_processes_retained 0\n/);
+        const process = await machine.startProcess({
+            program: "/bin/sleep",
+            args: ["30"],
+        });
+        try {
+            const running = await metrics();
+            assert.match(running, /agentd_processes_running 1\n/);
+            assert.match(running, /agentd_processes_retained 1\n/);
+        } finally {
+            await process.kill();
+            await process.wait();
+        }
+        const finished = await metrics();
+        assert.match(finished, /agentd_processes_running 0\n/);
+        assert.match(finished, /agentd_processes_retained 1\n/);
+    }));

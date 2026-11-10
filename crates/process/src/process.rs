@@ -50,7 +50,7 @@ pub enum ProcessError {
 
 #[derive(Default)]
 pub struct Processes {
-    registry: Mutex<Registry>,
+    registry: Arc<Mutex<Registry>>,
 }
 
 #[derive(Default)]
@@ -114,6 +114,7 @@ impl Processes {
         if let Some(id) = evict {
             registry.entries.remove(&id);
         }
+        tracing::debug!(process_id = %process.id, "process started");
         registry.entries.insert(process.id.clone(), process.clone());
         tokio::spawn(supervise(
             process.clone(),
@@ -126,6 +127,18 @@ impl Processes {
         Ok(process)
     }
 
+    pub fn counts(&self) -> (usize, usize) {
+        let registry = self.registry.lock().expect("process registry poisoned");
+        (
+            registry
+                .entries
+                .values()
+                .filter(|process| !process.is_finished())
+                .count(),
+            registry.entries.len(),
+        )
+    }
+
     pub fn get(&self, id: &str) -> Option<Arc<Process>> {
         self.registry
             .lock()
@@ -136,14 +149,18 @@ impl Processes {
     }
 
     pub async fn shutdown(&self) {
-        let processes: Vec<_> = {
-            let mut registry = self.registry.lock().expect("process registry poisoned");
+        let registry = self.registry.clone();
+        let processes: Vec<_> = tokio::task::spawn_blocking(move || {
+            let mut registry = registry.lock().expect("process registry poisoned");
             registry.closed = true;
-            registry.entries.values().cloned().collect()
-        };
-        for process in &processes {
-            process.kill();
-        }
+            let processes: Vec<_> = registry.entries.values().cloned().collect();
+            for process in &processes {
+                process.kill();
+            }
+            processes
+        })
+        .await
+        .expect("process shutdown task panicked");
         for process in processes {
             process.wait().await;
         }
@@ -364,6 +381,7 @@ impl Process {
     }
 
     fn finish(&self, result: ProcessResult) {
+        tracing::debug!(process_id = %self.id, ?result, "process finished");
         let mut log = self.log.lock().expect("process log poisoned");
         if let Some(terminal) = log.terminal.as_mut() {
             terminal.control = None;

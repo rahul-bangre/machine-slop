@@ -80,3 +80,14 @@ Replay keeps at most 1 MiB of encoded output and 256 events per process. An
 expired cursor returns 410; resume with loss from `info().first_seq`. A gap
 while streaming throws `OutputGap`. The registry holds 128 records: a start when
 full evicts the oldest finished record, or returns 503 if none has finished.
+
+## Operations
+
+`agentd` emits JSON logs to stderr, filtered by `RUST_LOG` (default `info`).
+Process starts and finishes are logged at `debug`, with process IDs and
+outcomes. `GET /metrics` exposes Prometheus gauges `agentd_processes_running`
+and `agentd_processes_retained`, including finished records retained for replay.
+
+Process admission and spawning stay serialized so a terminal descriptor cannot
+leak into another child. HTTP registry access and shutdown admission run on
+blocking workers so a slow spawn does not hold up Tokio runtime threads.

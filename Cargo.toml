@@ -12,5 +12,8 @@ publish = false
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "process", "io-util", "sync", "time"] }
 
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"

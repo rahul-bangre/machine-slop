@@ -41,7 +41,15 @@ impl Proxy {
 
     async fn exchange(&self, request: &str) -> String {
         let mut guest = UnixStream::connect(&self.socket).await.expect("connect");
-        guest.write_all(request.as_bytes()).await.expect("write");
+        if let Err(error) = guest.write_all(request.as_bytes()).await {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "write: {error}"
+            );
+        }
         let mut response = String::new();
         match guest.read_to_string(&mut response).await {
             Ok(_) => response,

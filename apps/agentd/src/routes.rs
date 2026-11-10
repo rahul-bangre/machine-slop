@@ -19,28 +19,31 @@ pub async fn start(
     State(processes): State<Arc<Processes>>,
     Json(request): Json<StartProcess>,
 ) -> Result<(StatusCode, Json<ProcessInfo>), ApiError> {
-    Ok((StatusCode::CREATED, Json(processes.start(request)?.info())))
+    let process = tokio::task::spawn_blocking(move || processes.start(request))
+        .await
+        .expect("process start task panicked")?;
+    Ok((StatusCode::CREATED, Json(process.info())))
 }
 
 pub async fn info(
     State(processes): State<Arc<Processes>>,
     Path(id): Path<String>,
 ) -> Result<Json<ProcessInfo>, ApiError> {
-    Ok(Json(find(&processes, &id)?.info()))
+    Ok(Json(find(&processes, &id).await?.info()))
 }
 
 pub async fn wait(
     State(processes): State<Arc<Processes>>,
     Path(id): Path<String>,
 ) -> Result<Json<ProcessResult>, ApiError> {
-    Ok(Json(find(&processes, &id)?.wait().await))
+    Ok(Json(find(&processes, &id).await?.wait().await))
 }
 
 pub async fn kill(
     State(processes): State<Arc<Processes>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    find(&processes, &id)?.kill();
+    find(&processes, &id).await?.kill();
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -58,7 +61,8 @@ pub async fn write_stdin(
     Query(StdinPosition { offset, close }): Query<StdinPosition>,
     data: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    find(&processes, &id)?
+    find(&processes, &id)
+        .await?
         .write_stdin(offset, data, close)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -69,7 +73,7 @@ pub async fn resize_terminal(
     Path(id): Path<String>,
     Json(size): Json<TerminalSize>,
 ) -> Result<StatusCode, ApiError> {
-    find(&processes, &id)?.resize_terminal(size)?;
+    find(&processes, &id).await?.resize_terminal(size)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -85,7 +89,7 @@ pub async fn events(
     Path(id): Path<String>,
     Query(Cursor { cursor }): Query<Cursor>,
 ) -> Result<Response, ApiError> {
-    let process = find(&processes, &id)?;
+    let process = find(&processes, &id).await?;
     let mut changed = process.subscribe();
     let initial = process.events(cursor)?;
     if initial.finished && initial.chunks.is_empty() {
@@ -122,9 +126,14 @@ pub async fn events(
         .into_response())
 }
 
-fn find(processes: &Processes, id: &str) -> Result<Arc<Process>, ApiError> {
-    processes.get(id).ok_or(ApiError(
-        StatusCode::NOT_FOUND,
-        "unknown or expired process".into(),
-    ))
+async fn find(processes: &Arc<Processes>, id: &str) -> Result<Arc<Process>, ApiError> {
+    let processes = processes.clone();
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || processes.get(&id))
+        .await
+        .expect("process lookup task panicked")
+        .ok_or(ApiError(
+            StatusCode::NOT_FOUND,
+            "unknown or expired process".into(),
+        ))
 }
