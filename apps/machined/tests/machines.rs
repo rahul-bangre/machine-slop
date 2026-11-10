@@ -642,7 +642,7 @@ async fn an_open_port_tunnel_keeps_a_machine_from_expiring() {
     std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
 }
 
-const SMALLEST_MACHINE_FOR_CHROMIUM_MIB: u32 = 1024;
+const CHROMIUM_MACHINE_MIB: u32 = 1024;
 
 const CHROMIUM_LOADS_A_PAGE_SERVED_IN_THE_MACHINE: &str = r#"
 cd "$(mktemp -d)"
@@ -682,7 +682,7 @@ async fn chromium_runs_headless_in_a_machine_without_network() {
     let host = Host::start("chromium").await;
     let info = host
         .create_with(Some(json!({
-            "memory_mib": SMALLEST_MACHINE_FOR_CHROMIUM_MIB,
+            "memory_mib": CHROMIUM_MACHINE_MIB,
             "allowed_hosts": [],
         })))
         .await;
@@ -705,7 +705,7 @@ async fn chromium_reaches_https_sites_through_the_allowlist_without_flags() {
     let host = Host::start("chromium-egress").await;
     let info = host
         .create_with(Some(json!({
-            "memory_mib": SMALLEST_MACHINE_FOR_CHROMIUM_MIB,
+            "memory_mib": CHROMIUM_MACHINE_MIB,
             "allowed_hosts": ["example.com"],
         })))
         .await;
