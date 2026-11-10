@@ -17,7 +17,9 @@ export type {
 } from "./process.gen.ts";
 export type {
     CreateMachine,
+    CreateSnapshot,
     MachineInfo,
     MachineState,
+    SnapshotInfo,
     UpdateMachine,
 } from "./machines.gen.ts";

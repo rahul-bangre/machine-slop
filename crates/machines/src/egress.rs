@@ -58,7 +58,7 @@ enum HostPattern {
     Subdomains(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct EgressPolicy(Vec<HostPattern>);
 
 impl EgressPolicy {

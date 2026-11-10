@@ -331,7 +331,7 @@ export function machinedProvider(
             isolation:
                 "one Firecracker microVM per attempt; network access follows machine.allowed_hosts",
             create_measures:
-                "cold boot of a new microVM until agentd is healthy, and a new work directory",
+                "handing out a microVM machined booted ahead of time when one is ready, otherwise a boot until agentd is healthy, and a new work directory",
             host_ownership:
                 "exclusive: every machine found on the host is destroyed before each create and when the run ends",
         }),
@@ -345,7 +345,7 @@ export function machinedProvider(
             });
             if (machines.length > 0) {
                 throw new ProviderNotReady(
-                    `machined at ${url} already has ${machines.length} running. The bench needs the host to itself and destroys every machine it finds. Restart machined to clear them.`,
+                    `machined at ${url} already has ${machines.length} machines, running, paused or exited. The bench needs the host to itself and destroys every machine it finds. Delete them first; they survive a machined restart.`,
                 );
             }
         },

@@ -1,9 +1,10 @@
 use std::{path::PathBuf, sync::Arc};
 
-use slop_machines::Machines;
+use slop_machines::{Limits, Machines, default_memory_budget_mib};
 use tokio::net::TcpListener;
 
-const CAPACITY: usize = 16;
+const MAX_RUNNING_VMS: usize = 16;
+const DEFAULT_SPARE_MACHINES: usize = 2;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,9 +21,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     else {
         return Err("usage: machined <listen address> <image dir> <state dir>".into());
     };
-    let machines = Arc::new(
-        Machines::open(PathBuf::from(image_dir), PathBuf::from(state_dir), CAPACITY).await?,
+    let default_budget = default_memory_budget_mib()?;
+    let limits = Limits {
+        running_vms: MAX_RUNNING_VMS,
+        memory_mib: env_number("SLOP_MEMORY_MIB")?
+            .map_or(default_budget, |budget: u32| budget.min(default_budget)),
+        spare_machines: env_number("SLOP_SPARE_MACHINES")?.unwrap_or(DEFAULT_SPARE_MACHINES),
+    };
+    tracing::info!(
+        running_vms = limits.running_vms,
+        memory_mib = limits.memory_mib,
+        spare_machines = limits.spare_machines,
+        "admission limits"
     );
+    let machines =
+        Machines::open(PathBuf::from(image_dir), PathBuf::from(state_dir), limits).await?;
     let listener = TcpListener::bind(&address).await?;
     let app = machined::app(machines.clone());
 
@@ -45,4 +58,15 @@ async fn shutdown(machines: Arc<Machines>) {
     tracing::info!("shutdown started");
     machines.shutdown().await;
     tracing::info!("shutdown completed");
+}
+
+fn env_number<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{name} must be a whole number, not {value:?}")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("{name}: {error}")),
+    }
 }

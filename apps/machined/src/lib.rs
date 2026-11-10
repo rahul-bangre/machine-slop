@@ -6,11 +6,14 @@ use axum::{
     extract::{Path, Request, State},
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
-use slop_machines::{CreateMachine, Machine, MachineError, MachineInfo, Machines, UpdateMachine};
+use slop_machines::{
+    CreateMachine, CreateSnapshot, MachineError, MachineInfo, MachineState, Machines, SnapshotInfo,
+    UpdateMachine,
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 pub fn app(machines: Arc<Machines>) -> Router {
@@ -19,17 +22,36 @@ pub fn app(machines: Arc<Machines>) -> Router {
         .route("/metrics", get(metrics))
         .route("/machines", get(list).post(create))
         .route("/machines/{id}", get(info).patch(update).delete(destroy))
+        .route("/machines/{id}/pause", post(pause))
+        .route("/machines/{id}/resume", post(resume))
+        .route("/machines/{id}/fork", post(fork))
         .route("/machines/{id}/{*path}", any(proxy))
+        .route("/snapshots", get(list_snapshots).post(create_snapshot))
+        .route(
+            "/snapshots/{id}",
+            get(snapshot_info).delete(delete_snapshot),
+        )
         .with_state(machines)
 }
 
 async fn metrics(State(machines): State<Arc<Machines>>) -> impl IntoResponse {
     let (active, reserved, budget) = machines.resource_usage();
     let (successes, failures) = machines.create_counts();
+    let spares = machines.spares().await;
+    let listed = machines.list().await;
+    let in_state = |wanted: fn(&MachineState) -> bool| {
+        listed
+            .iter()
+            .filter(|machine| wanted(&machine.state))
+            .count()
+    };
+    let running = in_state(|state| matches!(state, MachineState::Running));
+    let paused = in_state(|state| matches!(state, MachineState::Paused));
+    let exited = in_state(|state| matches!(state, MachineState::Exited { .. }));
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         format!(
-            "# TYPE machined_machines_active gauge\nmachined_machines_active {active}\n# TYPE machined_memory_reserved_mib gauge\nmachined_memory_reserved_mib {reserved}\n# TYPE machined_memory_budget_mib gauge\nmachined_memory_budget_mib {budget}\n# TYPE machined_creates_total counter\nmachined_creates_total{{result=\"success\"}} {successes}\nmachined_creates_total{{result=\"failure\"}} {failures}\n"
+            "# TYPE machined_machines_active gauge\nmachined_machines_active {active}\n# TYPE machined_memory_reserved_mib gauge\nmachined_memory_reserved_mib {reserved}\n# TYPE machined_memory_budget_mib gauge\nmachined_memory_budget_mib {budget}\n# TYPE machined_spare_machines gauge\nmachined_spare_machines {spares}\n# TYPE machined_machines gauge\nmachined_machines{{state=\"running\"}} {running}\nmachined_machines{{state=\"paused\"}} {paused}\nmachined_machines{{state=\"exited\"}} {exited}\n# TYPE machined_creates_total counter\nmachined_creates_total{{result=\"success\"}} {successes}\nmachined_creates_total{{result=\"failure\"}} {failures}\n"
         ),
     )
 }
@@ -49,11 +71,7 @@ async fn update(
     body: Bytes,
 ) -> Result<Json<MachineInfo>, ApiError> {
     let request: UpdateMachine = json_body(&body)?;
-    machines
-        .update(&id, request)
-        .await?
-        .map(Json)
-        .ok_or_else(unknown_machine)
+    Ok(Json(machines.update(&id, request).await?))
 }
 
 fn json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
@@ -69,18 +87,67 @@ async fn info(
     State(machines): State<Arc<Machines>>,
     Path(id): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    Ok(Json(find(&machines, &id).await?.info()))
+    let machine = machines.get(&id).await;
+    Ok(Json(machine.ok_or(MachineError::UnknownMachine)?.info()))
 }
 
 async fn destroy(
     State(machines): State<Arc<Machines>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if machines.destroy(&id).await {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(unknown_machine())
-    }
+    machines.destroy(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pause(
+    State(machines): State<Arc<Machines>>,
+    Path(id): Path<String>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    Ok(Json(machines.pause(&id).await?))
+}
+
+async fn resume(
+    State(machines): State<Arc<Machines>>,
+    Path(id): Path<String>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    Ok(Json(machines.resume(&id).await?))
+}
+
+async fn fork(
+    State(machines): State<Arc<Machines>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<MachineInfo>), ApiError> {
+    let machine = machines.fork(&id).await?;
+    Ok((StatusCode::CREATED, Json(machine.info())))
+}
+
+async fn create_snapshot(
+    State(machines): State<Arc<Machines>>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<SnapshotInfo>), ApiError> {
+    let request: CreateSnapshot = json_body(&body)?;
+    let snapshot = machines.create_snapshot(request).await?;
+    Ok((StatusCode::CREATED, Json(snapshot)))
+}
+
+async fn list_snapshots(State(machines): State<Arc<Machines>>) -> Json<Vec<SnapshotInfo>> {
+    Json(machines.snapshots().await)
+}
+
+async fn snapshot_info(
+    State(machines): State<Arc<Machines>>,
+    Path(id): Path<String>,
+) -> Result<Json<SnapshotInfo>, ApiError> {
+    let snapshot = machines.snapshot_info(&id).await;
+    Ok(Json(snapshot.ok_or(MachineError::UnknownSnapshot)?))
+}
+
+async fn delete_snapshot(
+    State(machines): State<Arc<Machines>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    machines.delete_snapshot(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn proxy(
@@ -88,7 +155,17 @@ async fn proxy(
     Path((id, _)): Path<(String, String)>,
     mut request: Request,
 ) -> Result<Response, ApiError> {
-    let machine = Arc::new(machines.begin_use(&id).await.ok_or_else(unknown_machine)?);
+    let machine = machines
+        .begin_use(&id)
+        .await
+        .ok_or(MachineError::UnknownMachine)?;
+    if machine.state() == MachineState::Paused {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "machine is paused; resume it first".into(),
+        ));
+    }
+    let machine = Arc::new(machine);
     let client_upgrade = hyper::upgrade::on(&mut request);
     let (mut parts, body) = request.into_parts();
     parts.uri = agentd_uri(&parts.uri, &id)?;
@@ -144,14 +221,6 @@ fn agentd_uri(uri: &Uri, id: &str) -> Result<Uri, ApiError> {
         .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "malformed machine path".into()))
 }
 
-async fn find(machines: &Machines, id: &str) -> Result<Arc<Machine>, ApiError> {
-    machines.get(id).await.ok_or_else(unknown_machine)
-}
-
-fn unknown_machine() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "unknown machine".into())
-}
-
 fn unreachable_agentd(error: impl std::fmt::Display) -> ApiError {
     ApiError(
         StatusCode::BAD_GATEWAY,
@@ -165,8 +234,12 @@ impl From<MachineError> for ApiError {
     fn from(error: MachineError) -> Self {
         let status = match error {
             MachineError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            MachineError::UnknownMachine | MachineError::UnknownSnapshot => StatusCode::NOT_FOUND,
+            MachineError::Conflict(_) => StatusCode::CONFLICT,
             MachineError::Capacity | MachineError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
-            MachineError::Boot(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            MachineError::Boot(_) | MachineError::Failed { .. } | MachineError::Io(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         Self(status, error.to_string())
     }

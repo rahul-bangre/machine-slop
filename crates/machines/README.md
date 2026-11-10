@@ -1,33 +1,60 @@
 # Machines
 
-`machined` creates and destroys machines on a Linux host with `/dev/kvm`. Each
-machine is a Firecracker microVM running
-[`agentd`](../../apps/agentd/README.md).
+`machined` runs machines on a Linux host with `/dev/kvm`. Each machine is a
+Firecracker microVM running [`agentd`](../../apps/agentd/README.md). A machine
+can be paused to disk and resumed with its memory intact, forked while it runs,
+and snapshotted to start any number of new machines from the same moment.
 
 ```ts
 import { Host } from "@machine-slop/sdk";
 
 const host = new Host("http://127.0.0.1:4001");
-const { machine, info } = await host.createMachine({
-  vcpus: 2,
-  memory_mib: 512,
-});
-const process = await machine.startProcess({
+const { machine, info } = await host.createMachine();
+const waiting = await machine.startProcess({
   program: "/bin/sh",
-  args: ["-c", "uname -a"],
+  args: ["-c", "read line; echo $line"],
+  keep_stdin_open: true,
 });
-console.log(info.boot_ms, await process.wait());
-await machine.destroy();
+console.log(info.boot_ms);
+
+const fork = await machine.fork();
+await fork.machine.process(waiting.id).writeStdin(0, "from the fork\n");
+
+const snapshot = await machine.snapshot();
+const options = await Promise.all(
+  [1, 2, 3].map(() => host.createMachine({ snapshot_id: snapshot.id })),
+);
+await host.deleteSnapshot(snapshot.id);
+
+await machine.pause();
+await machine.resume();
+await machine.process(waiting.id).writeStdin(0, "from the original\n");
+
+for (const m of [machine, fork.machine, ...options.map((o) => o.machine)]) {
+  await m.destroy();
+}
 ```
 
-| Request                 | SDK                             | Result                                                                  |
-| ----------------------- | ------------------------------- | ----------------------------------------------------------------------- |
-| `POST /machines`        | `host.createMachine(...)`       | Boots a machine; 201 with `MachineInfo` once `agentd` answers `/health` |
-| `GET /machines`         | `host.machines()`               | Lists machines by id                                                    |
-| `GET /machines/{id}`    | `machine.info()`                | `MachineInfo`                                                           |
-| `PATCH /machines/{id}`  | `machine.setAllowedHosts(list)` | Replaces the machine's `allowed_hosts`; `MachineInfo`                   |
-| `DELETE /machines/{id}` | `machine.destroy()`             | Kills the VM and removes its files; 204                                 |
-| `/machines/{id}/...`    | `host.machine(id)`              | Forwarded to that machine's `agentd`, upgrades included                 |
+The fork and the three machines from the snapshot each have their own copy of
+the waiting shell. Deleting the snapshot leaves those machines running, and the
+original machine's shell is still waiting after the pause and resume.
+
+| Request                      | SDK                                   | Result                                                         |
+| ---------------------------- | ------------------------------------- | -------------------------------------------------------------- |
+| `POST /machines`             | `host.createMachine(...)`             | Starts a machine; 201 with `MachineInfo` once `agentd` answers |
+| `GET /machines`              | `host.machines()`                     | Lists machines by id                                           |
+| `GET /machines/{id}`         | `machine.info()`                      | `MachineInfo`                                                  |
+| `PATCH /machines/{id}`       | `machine.setAllowedHosts(list)`       | Replaces the machine's `allowed_hosts`; `MachineInfo`          |
+| `POST /machines/{id}/pause`  | `machine.pause()`                     | Saves the machine and stops its VM; `MachineInfo`              |
+| `POST /machines/{id}/resume` | `machine.resume()`                    | Restores the machine once `agentd` answers; `MachineInfo`      |
+| `POST /machines/{id}/fork`   | `machine.fork()`                      | A new machine from this one's current state; 201 with its info |
+| `DELETE /machines/{id}`      | `machine.destroy()`                   | Kills the VM and removes its files, saved state included; 204  |
+| `/machines/{id}/...`         | `host.machine(id)`                    | Forwarded to that machine's `agentd`, upgrades included        |
+| `POST /snapshots`            | `machine.snapshot()`                  | Records the machine's current state; 201 with `SnapshotInfo`   |
+| `GET /snapshots`             | `host.snapshots()`                    | Lists snapshots by id                                          |
+| `GET /snapshots/{id}`        | `host.snapshot(id)`                   | `SnapshotInfo`                                                 |
+| `DELETE /snapshots/{id}`     | `host.deleteSnapshot(id)`             | Removes the snapshot's files; 204                              |
+| `POST /machines`             | `host.createMachine({ snapshot_id })` | Starts a new machine from a snapshot; 201 with `MachineInfo`   |
 
 `HostedMachine` is a `Machine`, so processes, files and ports work the same as
 against a local `agentd`. `GET /health` returns `ok`.
@@ -38,35 +65,143 @@ against a local `agentd`. `GET /health` returns `ok`.
 | `memory_mib`        | 512     | 128–32768 |
 | `idle_timeout_secs` | 600     | 1–86400   |
 | `allowed_hosts`     | `["*"]` | see below |
+| `snapshot_id`       | none    | see below |
 
-An invalid request returns 422, a full host or a shutting-down `machined` 503, a
-failed boot 500 with the console tail, an unknown machine 404, and an
-unreachable `agentd` 502. A host runs at most 16 machines. Admission also
-reserves requested guest memory plus 64 MiB per VM for host overhead, before
-launching. The default memory budget is Linux `MemAvailable` at daemon startup
-minus the greater of 512 MiB or 10%. Set `SLOP_MEMORY_MIB` to a smaller total
-budget for machines and their overhead. Each create also checks current
-`MemAvailable`, leaving 512 MiB for the host. Memory exhaustion returns 503
-before creating VM files. Reservations include boots and exited VMs and release
-after destruction or failed-boot cleanup, even if a caller retains the machine
-handle.
+A machine is `running`, `paused` or `exited`. An invalid request returns 422, an
+unknown machine or snapshot 404, a request that does not apply to the machine's
+state 409, a host with no room for another VM or a shutting-down `machined` 503,
+a failed boot 500 with the console tail, a failed save or restore 500, and an
+unreachable `agentd` 502. Forwarding to a paused machine is a 409; pausing,
+resuming, forking or snapshotting an exited one is a 409. An exited machine can
+only be deleted or left to expire. A machine becomes exited when its VM exits on
+its own, when a resume fails after its checkpoint was given up, and when
+`machined` stops without saving it.
+
+At most 16 VMs run at once, and each running VM reserves its guest memory plus
+64 MiB of host overhead from a memory budget before it launches. The budget is
+Linux `MemAvailable` when `machined` starts, minus the greater of 512 MiB or
+10%; set `SLOP_MEMORY_MIB` to a smaller total. Each admission also checks the
+current `MemAvailable`, leaving 512 MiB for the host. Paused and exited machines
+run no VM and reserve neither a place nor memory, so any number can be parked;
+they and snapshots are limited only by disk. A create, fork or resume that does
+not fit returns 503 and changes nothing: no files are created, a resume leaves
+the machine paused, and a fork is refused before its source is touched. A
+machine larger than the whole budget is refused at once.
 
 This is admission control for a dedicated Linux host, not an operating-system
 memory limit. Other workloads, cgroup limits and growing host-side buffers need
 room outside the budget; use a smaller explicit budget when sharing the host.
 
-`boot_ms` runs from the start of launch until `agentd` is healthy. A create or
-delete finishes even if its client disconnects. Creates are not idempotent:
-after a lost create response, find the machine with `host.machines()` instead of
-retrying. A machine whose VM exits on its own stays listed with state `exited`,
-and keeps its slot, until it is deleted or expires.
+`boot_ms` is how long the request that created the machine took until `agentd`
+was healthy. A create, delete, pause, resume, fork or snapshot finishes even if
+its client disconnects. Creates, forks and snapshots are not idempotent: after a
+lost response, find the result with `host.machines()` or `host.snapshots()`,
+where `machine_id` and `created_unix_ms` identify a snapshot, instead of
+retrying. A delete that fails to remove a machine's or snapshot's record returns
+500 and leaves it listed; retry it.
 
-A machine expires after `idle_timeout_secs` without an open request to its
-`agentd`, and is then destroyed as if deleted. The clock restarts when the last
-open request to `/machines/{id}/...` ends, so a long `wait()`, an event stream
-or an open port tunnel keeps the machine alive. Requests to `machined` itself,
-such as `GET /machines/{id}`, and egress traffic do not. To keep an unattended
-machine, call `machine.health()` within each timeout.
+A running or exited machine expires after `idle_timeout_secs` without an open
+request to its `agentd`, and is then destroyed as if deleted. The clock restarts
+when the last open request to `/machines/{id}/...` ends, so a long `wait()`, an
+event stream or an open port tunnel keeps the machine alive, and when a pause,
+resume, fork or snapshot of it ends. Other requests to `machined` itself, such
+as `GET /machines/{id}`, and egress traffic do not. A paused machine never
+expires, so pausing is how to keep a machine without keeping it busy; to keep a
+running machine unattended, call `machine.health()` within each timeout. After a
+`machined` restart an exited machine's clock starts again. An expiry that cannot
+remove the machine's record leaves it listed and tries again a timeout later.
+
+## Speed
+
+Measured with 512 MiB machines on a 2-vCPU host with an ext4 state dir:
+
+| Request                           | Time   | Dominated by                             |
+| --------------------------------- | ------ | ---------------------------------------- |
+| Create, default size              | ~10 ms | Recording a machine that already booted  |
+| Create, other sizes or in a burst | ~1 s   | Booting the guest                        |
+| Create from a snapshot            | ~60 ms | Copying the disk; memory loads on demand |
+| Resume                            | ~50 ms | Starting Firecracker; memory on demand   |
+| Pause                             | ~1 s   | Writing and syncing all of guest memory  |
+| Fork or snapshot, running machine | ~1 s   | Writing memory; the machine stops for it |
+| Snapshot, paused machine          | ~15 ms | Copying the disk                         |
+
+`machined` keeps two default-size machines booted, or `SLOP_SPARE_MACHINES` of
+them, and a create takes one instead of booting. Spares are replaced in the
+background and never listed. They use places and memory that nothing else is
+using: when a VM that was asked for needs either, a spare is shut down to make
+room, after it finishes booting if it has not yet. A create of another size, or
+a default-size one when no spare is ready and there is room, boots.
+
+Saving memory costs time in proportion to the machine's memory size, and
+restoring it does not. To explore several continuations of one state, take one
+snapshot and create each machine from it rather than forking repeatedly, so the
+save is paid once. Disks are reflinked where the state dir's filesystem supports
+it (XFS, Btrfs) and copied sparsely, in proportion to what the machine wrote,
+where it does not (ext4).
+
+## Pause and resume
+
+A successful pause means the machine's memory, device state and disk are
+complete and synced on the host, and its VM is gone. The machine keeps its id
+and survives a `machined` restart or a host reboot.
+
+A successful resume means the same guest is running again and `agentd` answers:
+processes, their memory, `agentd`'s process registry and files in memory-backed
+filesystems are as they were. Every connection into the machine is gone.
+Requests that were in flight when it paused, such as an event stream or a
+`wait()`, end with an error; reconnect with `machine.process(id)` and
+`events(last_seq + 1)`. The guest's clock does not advance while the machine is
+paused.
+
+Pausing a paused machine or resuming a running one returns its `MachineInfo` and
+does nothing, so either can be retried after a lost response. Requests that
+change one machine run one at a time: concurrent resumes restore one VM, and a
+delete that overlaps a resume waits for it, then deletes the machine.
+
+When a pause or resume fails, the 500 body ends with what the machine is now,
+and `machine.info()` agrees:
+
+- A failed pause leaves the machine running, with no checkpoint, although its
+  connections may have been reset. If the saved state could not be withdrawn,
+  the guest stays stopped and the machine is paused; if the VM cannot continue
+  for another reason, it is exited.
+- A resume that fails before the guest runs leaves the machine paused, and can
+  be retried.
+- A resume that fails after that, including `agentd` not answering within 30
+  seconds, leaves the machine exited. The guest may already have written to its
+  disk, so the saved memory no longer matches it and is not kept.
+
+## Fork and snapshots
+
+A fork is a new machine in the state its source is in at that moment, with a new
+id and its own memory and disk. A snapshot is that state kept as an immutable
+restore point: memory, device state, disk, root image and the Firecracker binary
+that saved it. A machine created from a snapshot gets the snapshot's vCPUs and
+memory, which the request may not override.
+
+Forking or snapshotting a running machine stops it only while its state is
+saved; it then carries on with its processes, but its connections are reset as
+with a pause. If saving fails the machine carries on and nothing is created; if
+it cannot carry on, it is exited and the 500 body says so. A paused machine is
+forked or snapshotted from its checkpoint and stays paused.
+
+A machine, its forks, a snapshot, and the machines created from the snapshot
+share nothing that is ever written. Whatever one does later, the others and the
+snapshot do not change. They all continue from the same instant: the same
+processes, hostname, clock, and random values already held in program memory. On
+x86_64 the guest kernel reseeds its random number generator on restore; on
+aarch64 the pinned kernel does not.
+
+A snapshot does not depend on its source machine, which can be deleted, and it
+survives a `machined` restart. Deleting a snapshot means no more machines can be
+created from it; machines already created from it keep running and can still be
+paused, resumed and forked. A delete waits for creates that are reading the
+snapshot.
+
+Saved state restores on the host that made it. Firecracker does not support
+restoring on a different CPU model, and does not promise it across host kernel
+versions; a restore that Firecracker rejects fails and leaves the snapshot, or
+the paused machine, as it was.
 
 ## Machine
 
@@ -111,7 +246,18 @@ numeric, such as `8.0.1`, which a resolver would read as an address.
 
 `setAllowedHosts` decides every later connection and closes open tunnels to
 hosts the new list no longer allows. Closing follows the response
-asynchronously, so a few bytes may still pass.
+asynchronously, so a few bytes may still pass. It runs one at a time with the
+machine's other changes, so it waits for a pause, resume, fork or snapshot in
+flight, and a fork or snapshot that starts after it never carries the old list.
+
+A machine keeps its list while paused and across a `machined` restart, and
+`setAllowedHosts` works on a paused machine. A fork starts with its source's
+list and idle timeout. A snapshot records its source's list as
+`SnapshotInfo.allowed_hosts`, and a machine created from it gets that list
+unless the request gives its own; its idle timeout is the request's or the
+default. A spare has no egress until a create takes it and gives it that
+machine's list. Open tunnels are among the connections a pause, fork or snapshot
+resets.
 
 Inside the machine, `HTTPS_PROXY` and `HTTP_PROXY` (and their lowercase forms)
 point at `127.0.0.1:3128`, where `socat` forwards each connection over vsock to
@@ -158,24 +304,60 @@ suites, and rebuilds the root filesystem only when its inputs change. It needs
 `mmdebstrap`, `e2fsprogs`, `debian-archive-keyring` and `python3` on the host.
 The Debian keyring verifies the pinned snapshot.
 
-`machined` holds a lock on its state dir. On start it kills Firecracker
-processes left by an earlier `machined` that died and removes their files. On
-SIGTERM or SIGINT it closes admission, destroys machines concurrently, and waits
-for admitted boots and deletions to finish before exiting.
+Rebuilding the image affects new machines only. Each machine and snapshot keeps
+the root image and Firecracker binary it started with, as hard links when the
+image dir and state dir share a filesystem and as copies of about 1 GiB when
+they do not, so saved memory is always restored against the root filesystem and
+Firecracker it was saved with. Replace image files, as the build script does;
+never modify them in place.
+
+The state dir holds one directory per machine and per snapshot. A directory
+counts only once its record file is written, after everything else in it is
+complete and synced, and stops counting when the record is removed. A paused
+machine's saved state is published the same way, by renaming a complete
+directory into place, and is renamed out of place before a VM restored from it
+may write to the disk. So nothing half-written is ever restored, and saved
+memory is never paired with a disk that a later run changed.
+
+A paused machine uses its memory size on disk, plus what it wrote to its scratch
+disk. Saved memory is one file shared by every machine and snapshot that holds
+that state: a snapshot of a paused machine adds no second copy, and machines
+created from a snapshot share its memory file until each is next paused.
+
+`machined` holds a lock on its state dir.
+
+- On SIGTERM or SIGINT it closes admission, pauses every running machine
+  concurrently, and waits until every VM it admitted has exited, including boots
+  and restores still in flight, so no VM is left running and the next `machined`
+  lists the machines as paused. A machine that cannot be saved is killed and
+  comes back exited. Saving writes each machine's memory to disk, so allow for
+  that in the service's stop timeout. The saves continue if the caller of
+  shutdown is cancelled.
+- On start it keeps every recorded snapshot and machine. Paused machines are
+  listed as paused; none is resumed automatically. A machine that was running
+  when `machined` was killed, or when the host lost power, has lost its memory:
+  its Firecracker process, if still alive, is killed, and the machine is listed
+  as exited until it is deleted or expires. Creates, forks, snapshots and saves
+  that did not finish are removed, and so are spares.
 
 Both daemons emit JSON logs to stderr, with `RUST_LOG` controlling filtering
-(default `info`). Machine lifecycle events include machine IDs, boot duration
-and requested resources; cleanup and egress listener failures include errors.
-`agentd` process-start events are available at `debug`.
+(default `info`). Machine lifecycle events (create, pause, resume, fork,
+snapshot, destroy, spare boots and the admission limits at startup) include
+machine and snapshot IDs, boot duration and requested resources; failures
+include errors. `agentd` process-start events are available at `debug`.
 
-`GET /metrics` exposes Prometheus text. `machined_machines_active` and
-`machined_memory_reserved_mib` include boots and pending cleanup, while
+`GET /metrics` exposes Prometheus text. `machined_machines_active` counts
+running VMs, spares and in-flight boots included, and
+`machined_memory_reserved_mib` the memory they reserve, while
 `machined_memory_budget_mib` reports the admission budget.
-`machined_creates_total{result="success"|"failure"}` counts validated create
-attempts through their terminal outcome, including capacity rejection, even if
-the client disconnects. These counters reset at daemon restart. `agentd` exposes
-`agentd_processes_running` and `agentd_processes_retained`; the latter includes
-finished records kept for replay.
+`machined_spare_machines` counts spares ready to be taken, and
+`machined_machines{state="running"|"paused"|"exited"}` the listed machines.
+`machined_creates_total{result="success"|"failure"}` counts validated
+`POST /machines` attempts through their terminal outcome, including capacity
+rejection, even if the client disconnects. These counters reset at daemon
+restart. `agentd` exposes `agentd_processes_running` and
+`agentd_processes_retained`; the latter includes finished records kept for
+replay.
 
 CI runs the live machine contracts on a Linux KVM runner, serially to bound
 memory use, and runs the ordinary checks on Linux and macOS.

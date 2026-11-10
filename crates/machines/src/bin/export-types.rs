@@ -1,6 +1,8 @@
 use std::{fs, path::Path};
 
-use slop_machines::{CreateMachine, MachineInfo, MachineState, UpdateMachine};
+use slop_machines::{
+    CreateMachine, CreateSnapshot, MachineInfo, MachineState, SnapshotInfo, UpdateMachine,
+};
 use ts_rs::TS;
 
 fn main() -> std::io::Result<()> {
@@ -10,6 +12,8 @@ fn main() -> std::io::Result<()> {
         UpdateMachine::decl(&config),
         MachineState::decl(&config),
         MachineInfo::decl(&config),
+        CreateSnapshot::decl(&config),
+        SnapshotInfo::decl(&config),
     ];
     let output = format!(
         "{}\n",

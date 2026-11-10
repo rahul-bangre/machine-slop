@@ -47,12 +47,12 @@ usage with `claude-cli`.
   `--agentd-url`. Commands run unisolated as the `agentd` user, so use it only
   for trusted tasks. It is a baseline for command latency without a machine
   around it.
-- `machined` boots a Firecracker microVM per attempt from a running `machined`
-  and destroys it afterwards. Machines get an empty `allowed_hosts`, so they
-  have no network. The bench needs the host to itself: it refuses to start if
-  machines are already running, and destroys every machine it finds before each
-  create and when the run ends, which also cleans up after a lost create
-  response.
+- `machined` gets a new Firecracker microVM per attempt from a running
+  `machined`, which hands out one it booted ahead of time when one is ready, and
+  destroys it afterwards. Machines get an empty `allowed_hosts`, so they have no
+  network. The bench needs the host to itself: it refuses to start if machines
+  are already running, and destroys every machine it finds before each create
+  and when the run ends, which also cleans up after a lost create response.
 - `e2b` starts a sandbox from `--e2b-template` per attempt. Needs `E2B_API_KEY`.
 - `daytona` starts a `python:3.12-slim` sandbox with 2 CPUs and 4 GiB per
   attempt. Needs `DAYTONA_API_KEY`. Its create time includes image preparation,

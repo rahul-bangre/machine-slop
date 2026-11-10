@@ -12,6 +12,15 @@ const machine_info = {
     allowed_hosts: [],
 };
 
+const snapshot_info = {
+    id: "s1",
+    machine_id: "m1",
+    vcpus: 1,
+    memory_mib: 256,
+    allowed_hosts: [],
+    created_unix_ms: 1794294079990,
+};
+
 const finished = {
     type: "finished",
     seq: 3,
@@ -24,8 +33,18 @@ const finished = {
     },
 };
 
+const paused_info = { ...machine_info, state: { state: "paused" } };
+
 const routes: Record<string, () => Response> = {
     "POST /base/machines": () => Response.json(machine_info, { status: 201 }),
+    "POST /base/machines/m1/pause": () => Response.json(paused_info),
+    "POST /base/machines/m1/resume": () => Response.json(machine_info),
+    "POST /base/snapshots": () => Response.json(snapshot_info, { status: 201 }),
+    "POST /base/machines/m1/fork": () =>
+        Response.json({ ...machine_info, id: "m2" }, { status: 201 }),
+    "GET /base/snapshots": () => Response.json([snapshot_info]),
+    "GET /base/snapshots/s1": () => Response.json(snapshot_info),
+    "DELETE /base/snapshots/s1": () => new Response(null, { status: 204 }),
     "POST /base/machines/m1/processes": () =>
         Response.json({ id: "p1", status: { state: "running" } }, {
             status: 201,
@@ -64,6 +83,17 @@ Deno.test("a hosted machine addresses its agent under the host's machine path", 
             (await machine.setAllowedHosts(["pypi.org"])).allowed_hosts,
             ["pypi.org"],
         );
+        assert.deepEqual(await machine.pause(), paused_info);
+        assert.deepEqual(await machine.snapshot(), snapshot_info);
+        assert.deepEqual(await machine.resume(), machine_info);
+        const fork = await machine.fork();
+        assert.equal(fork.machine.id, "m2");
+        assert.equal(fork.info.id, "m2");
+        assert.deepEqual(await host.snapshots(), [snapshot_info]);
+        assert.deepEqual(await host.snapshot("s1"), snapshot_info);
+        const restored = await host.createMachine({ snapshot_id: "s1" });
+        assert.equal(restored.machine.id, "m1");
+        await host.deleteSnapshot("s1");
         await machine.destroy();
         assert.deepEqual(seen, [
             'POST /base/machines {"vcpus":1,"memory_mib":256}',
@@ -71,6 +101,14 @@ Deno.test("a hosted machine addresses its agent under the host's machine path", 
             "GET /base/machines/m1/processes/p1/events?cursor=3",
             "GET /base/machines/m1",
             'PATCH /base/machines/m1 {"allowed_hosts":["pypi.org"]}',
+            "POST /base/machines/m1/pause",
+            'POST /base/snapshots {"machine_id":"m1"}',
+            "POST /base/machines/m1/resume",
+            "POST /base/machines/m1/fork",
+            "GET /base/snapshots",
+            "GET /base/snapshots/s1",
+            'POST /base/machines {"snapshot_id":"s1"}',
+            "DELETE /base/snapshots/s1",
             "DELETE /base/machines/m1",
         ]);
     } finally {

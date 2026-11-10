@@ -4,29 +4,40 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
-    process::{Child, Command},
-    sync::{Mutex, oneshot, watch},
-    time::Instant,
+    net::UnixStream,
+    process::Command,
+    sync::watch,
 };
 
 use crate::{
     contract::{MachineInfo, MachineState},
-    egress::{self, EGRESS_PORT, EgressPolicy},
-    machines::Admission,
+    egress::EgressPolicy,
+    files,
+    firecracker::Vm,
+    machines::{Admission, MachineError},
 };
 
-pub const AGENTD_PORT: u32 = 3000;
 const SCRATCH_BYTES: u64 = 8 << 30;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 const CONSOLE_TAIL_BYTES: usize = 4096;
+
+const RECORD: &str = "machine.json";
+const CHECKPOINT: &str = "checkpoint";
+const CHECKPOINT_STAGING: &str = "checkpoint.tmp";
+const CHECKPOINT_WITHDRAWN: &str = "checkpoint.withdrawn";
+const RESTORED: &str = "restored";
+const FIRECRACKER: &str = "firecracker";
+const ROOTFS: &str = "rootfs.ext4";
+const SAVED_STATE: [&str; 2] = ["vmstate", "memory"];
+const SCRATCH: &str = "scratch.ext4";
 
 #[derive(Clone, Debug)]
 pub struct Image {
@@ -37,20 +48,21 @@ pub struct Image {
 
 impl Image {
     pub fn in_dir(dir: &Path) -> io::Result<Self> {
-        let image = Self {
-            firecracker: dir.join("firecracker"),
-            kernel: dir.join("vmlinux"),
-            rootfs: dir.join("rootfs.ext4"),
-        };
-        for path in [&image.firecracker, &image.kernel, &image.rootfs] {
-            if !path.is_file() {
-                return Err(io::Error::new(
+        let file = |name: &str| {
+            let path = dir.join(name);
+            match std::fs::canonicalize(&path) {
+                Ok(file) if file.is_file() => Ok(file),
+                _ => Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("image file {} is missing", path.display()),
-                ));
+                )),
             }
-        }
-        Ok(image)
+        };
+        Ok(Self {
+            firecracker: file("firecracker")?,
+            kernel: file("vmlinux")?,
+            rootfs: file("rootfs.ext4")?,
+        })
     }
 }
 
@@ -68,7 +80,7 @@ impl std::fmt::Display for BootError {
             Self::Exited { message, console } => {
                 write!(
                     f,
-                    "machine exited during boot ({message}); console:\n{console}"
+                    "machine exited before agentd was ready ({message}); console:\n{console}"
                 )
             }
             Self::TimedOut { console } => write!(
@@ -95,6 +107,11 @@ impl From<io::Error> for BootError {
     }
 }
 
+pub enum Disk {
+    Copy,
+    Take,
+}
+
 pub(crate) struct MachineSpec {
     pub vcpus: u8,
     pub memory_mib: u32,
@@ -102,32 +119,183 @@ pub(crate) struct MachineSpec {
     pub egress: EgressPolicy,
 }
 
-pub struct Machine {
+pub struct Booted {
     id: String,
     dir: PathBuf,
+    vm: Vm,
     vcpus: u8,
     memory_mib: u32,
     egress: watch::Sender<EgressPolicy>,
-    boot_ms: u64,
-    idle_timeout_secs: u32,
-    activity: watch::Sender<Activity>,
-    exit: watch::Receiver<Option<String>>,
-    cleanup: Mutex<Option<Cleanup>>,
 }
 
-struct Cleanup {
-    _admission: Admission,
-    kill: Option<oneshot::Sender<()>>,
+impl Booted {
+    pub async fn from_image(
+        id: String,
+        dir: PathBuf,
+        image: &Image,
+        vcpus: u8,
+        memory_mib: u32,
+        egress: EgressPolicy,
+        admission: Admission,
+    ) -> Result<Self, BootError> {
+        let egress = watch::Sender::new(egress);
+        let boot = async {
+            tokio::fs::create_dir(&dir).await?;
+            files::link_immutable(&image.firecracker, &dir.join(FIRECRACKER)).await?;
+            files::link_immutable(&image.rootfs, &dir.join(ROOTFS)).await?;
+            create_scratch_disk(&dir.join(SCRATCH)).await?;
+            let config = firecracker_config(image, vcpus, memory_mib).to_string();
+            tokio::fs::write(dir.join("config.json"), config).await?;
+            Vm::boot(&dir, admission, egress.subscribe())
+        };
+        let vm = boot.await;
+        Self::once_ready(id, dir, vm, vcpus, memory_mib, egress).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_saved(
+        id: String,
+        dir: PathBuf,
+        saved: &Path,
+        disk: Disk,
+        vcpus: u8,
+        memory_mib: u32,
+        egress: EgressPolicy,
+        admission: Admission,
+    ) -> Result<Self, BootError> {
+        let egress = watch::Sender::new(egress);
+        let restore = async {
+            tokio::fs::create_dir(&dir).await?;
+            for name in [FIRECRACKER, ROOTFS] {
+                files::link_immutable(&saved.join(name), &dir.join(name)).await?;
+            }
+            tokio::fs::create_dir(dir.join(RESTORED)).await?;
+            for name in SAVED_STATE {
+                files::link_immutable(&saved.join(name), &dir.join(RESTORED).join(name)).await?;
+            }
+            match disk {
+                Disk::Copy => files::copy_disk(&saved.join(SCRATCH), &dir.join(SCRATCH)).await?,
+                Disk::Take => tokio::fs::rename(saved.join(SCRATCH), dir.join(SCRATCH)).await?,
+            }
+            let vm = restore(&dir, RESTORED, admission, egress.subscribe()).await?;
+            if let Err(error) = vm.resume().await {
+                vm.kill().await;
+                return Err(error);
+            }
+            Ok(vm)
+        };
+        let vm = restore.await;
+        Self::once_ready(id, dir, vm, vcpus, memory_mib, egress).await
+    }
+
+    async fn once_ready(
+        id: String,
+        dir: PathBuf,
+        vm: io::Result<Vm>,
+        vcpus: u8,
+        memory_mib: u32,
+        egress: watch::Sender<EgressPolicy>,
+    ) -> Result<Self, BootError> {
+        let ready = match vm {
+            Ok(vm) => match wait_until_ready(&vm, &dir).await {
+                Ok(()) => Ok(vm),
+                Err(error) => {
+                    vm.kill().await;
+                    Err(error)
+                }
+            },
+            Err(error) => Err(error.into()),
+        };
+        match ready {
+            Ok(vm) => Ok(Self {
+                id,
+                dir,
+                vm,
+                vcpus,
+                memory_mib,
+                egress,
+            }),
+            Err(error) => {
+                files::remove_dir_logged(&dir).await;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.vm.exited().is_none()
+    }
+
+    pub async fn record(
+        self,
+        request_started: Instant,
+        idle_timeout_secs: u32,
+        egress: EgressPolicy,
+    ) -> Result<Machine, BootError> {
+        self.egress.send_replace(egress);
+        let machine = Machine {
+            id: self.id,
+            dir: self.dir,
+            vcpus: self.vcpus,
+            memory_mib: self.memory_mib,
+            boot_ms: request_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            idle_timeout_secs,
+            egress: self.egress,
+            activity: watch::Sender::new(Activity::idle_from_now()),
+            phase: std::sync::Mutex::new(Phase::Running(self.vm.clone())),
+            lifecycle: tokio::sync::Mutex::default(),
+        };
+        if let Err(error) = files::commit(&machine.dir, RECORD, &machine.record()).await {
+            self.vm.kill().await;
+            if let Err(error) = files::discard(&machine.dir, RECORD).await {
+                tracing::error!(machine_id = %machine.id, path = %machine.dir.display(), %error, "machine cleanup failed");
+            }
+            return Err(error.into());
+        }
+        Ok(machine)
+    }
+
+    pub async fn discard(self) {
+        self.vm.kill().await;
+        files::remove_dir_logged(&self.dir).await;
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct Record {
+    vcpus: u8,
+    memory_mib: u32,
+    boot_ms: u64,
+    idle_timeout_secs: u32,
+    allowed_hosts: Vec<String>,
+}
+
+enum Phase {
+    Running(Vm),
+    Paused,
+    Exited(String),
+    Destroyed,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct Activity {
     in_use: usize,
-    idle_since: Instant,
+    idle_since: tokio::time::Instant,
 }
 
 impl Activity {
-    pub(crate) fn idle_deadline(&self, idle_timeout: Duration) -> Option<Instant> {
+    fn idle_from_now() -> Self {
+        Self {
+            in_use: 0,
+            idle_since: tokio::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn idle_deadline(&self, idle_timeout: Duration) -> Option<tokio::time::Instant> {
         (self.in_use == 0).then(|| self.idle_since + idle_timeout)
     }
 }
@@ -144,68 +312,56 @@ impl Deref for MachineUse {
 
 impl Drop for MachineUse {
     fn drop(&mut self) {
-        self.0.activity.send_modify(|activity| {
-            activity.in_use -= 1;
-            if activity.in_use == 0 {
-                activity.idle_since = Instant::now();
-            }
-        });
+        self.0.end_use();
     }
 }
 
+pub struct Machine {
+    id: String,
+    dir: PathBuf,
+    vcpus: u8,
+    memory_mib: u32,
+    boot_ms: u64,
+    idle_timeout_secs: u32,
+    egress: watch::Sender<EgressPolicy>,
+    activity: watch::Sender<Activity>,
+    phase: std::sync::Mutex<Phase>,
+    lifecycle: tokio::sync::Mutex<()>,
+}
+
 impl Machine {
-    pub(crate) async fn boot(
-        id: String,
-        dir: PathBuf,
-        image: &Image,
-        spec: MachineSpec,
-        admission: Admission,
-    ) -> Result<Self, BootError> {
-        let MachineSpec {
-            vcpus,
-            memory_mib,
-            idle_timeout_secs,
-            egress,
-        } = spec;
-        let started = Instant::now();
-        let (child, egress_listener) = match launch(&dir, image, vcpus, memory_mib).await {
-            Ok(launched) => launched,
-            Err(error) => {
-                let _ = tokio::fs::remove_dir_all(&dir).await;
-                return Err(error.into());
-            }
-        };
-        let (exit, kill) = supervise(child, id.clone());
-        let (egress, egress_policy) = watch::channel(egress);
-        serve_egress_until_exit(egress_listener, egress_policy, exit.clone());
-        let mut machine = Self {
+    pub async fn recover(id: String, dir: PathBuf) -> io::Result<Option<Self>> {
+        if !tokio::fs::try_exists(dir.join(RECORD)).await? {
+            tokio::fs::remove_dir_all(&dir).await?;
+            return Ok(None);
+        }
+        let record: Record = files::read_record(&dir, RECORD).await?;
+        let egress = EgressPolicy::parse(&record.allowed_hosts).map_err(io::Error::other)?;
+        for stale in [CHECKPOINT_STAGING, CHECKPOINT_WITHDRAWN, RESTORED] {
+            files::remove_dir_if_present(&dir.join(stale)).await?;
+        }
+        let machine = Self {
             id,
             dir,
-            vcpus,
-            memory_mib,
-            egress,
-            boot_ms: 0,
-            idle_timeout_secs,
-            activity: watch::Sender::new(Activity {
-                in_use: 0,
-                idle_since: started,
-            }),
-            exit,
-            cleanup: Mutex::new(Some(Cleanup {
-                _admission: admission,
-                kill: Some(kill),
-            })),
+            vcpus: record.vcpus,
+            memory_mib: record.memory_mib,
+            boot_ms: record.boot_ms,
+            idle_timeout_secs: record.idle_timeout_secs,
+            egress: watch::Sender::new(egress),
+            activity: watch::Sender::new(Activity::idle_from_now()),
+            phase: std::sync::Mutex::new(Phase::Destroyed),
+            lifecycle: tokio::sync::Mutex::default(),
         };
-        if let Err(error) = machine.wait_until_ready().await {
-            machine.destroy().await;
-            return Err(error);
-        }
-        machine.boot_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-        machine.activity.send_replace(Activity {
-            in_use: 0,
-            idle_since: Instant::now(),
-        });
-        Ok(machine)
+        machine.set(
+            if tokio::fs::try_exists(machine.dir.join(CHECKPOINT)).await? {
+                Phase::Paused
+            } else {
+                Phase::Exited(
+                    "machined stopped while the machine was running, so its memory was lost".into(),
+                )
+            },
+        );
+        Ok(Some(machine))
     }
 
     pub fn id(&self) -> &str {
@@ -215,12 +371,7 @@ impl Machine {
     pub fn info(&self) -> MachineInfo {
         MachineInfo {
             id: self.id.clone(),
-            state: match self.exit.borrow().as_ref() {
-                None => MachineState::Running,
-                Some(message) => MachineState::Exited {
-                    message: message.clone(),
-                },
-            },
+            state: self.state(),
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
             boot_ms: self.boot_ms,
@@ -229,12 +380,29 @@ impl Machine {
         }
     }
 
-    pub fn set_egress(&self, policy: EgressPolicy) -> MachineInfo {
-        let allowed_hosts = policy.patterns();
-        self.egress.send_replace(policy);
-        MachineInfo {
-            allowed_hosts,
-            ..self.info()
+    fn record(&self) -> Record {
+        Record {
+            vcpus: self.vcpus,
+            memory_mib: self.memory_mib,
+            boot_ms: self.boot_ms,
+            idle_timeout_secs: self.idle_timeout_secs,
+            allowed_hosts: self.egress.borrow().patterns(),
+        }
+    }
+
+    pub fn state(&self) -> MachineState {
+        match &*self.phase() {
+            Phase::Running(vm) => match vm.exited() {
+                None => MachineState::Running,
+                Some(message) => MachineState::Exited { message },
+            },
+            Phase::Paused => MachineState::Paused,
+            Phase::Exited(message) => MachineState::Exited {
+                message: message.clone(),
+            },
+            Phase::Destroyed => MachineState::Exited {
+                message: "machine was deleted".into(),
+            },
         }
     }
 
@@ -250,7 +418,7 @@ impl Machine {
         self.activity
             .borrow()
             .idle_deadline(self.idle_timeout())
-            .is_some_and(|deadline| deadline <= Instant::now())
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
     }
 
     pub(crate) fn begin_use(self: &Arc<Self>) -> MachineUse {
@@ -258,96 +426,340 @@ impl Machine {
         MachineUse(self.clone())
     }
 
+    fn end_use(&self) {
+        self.activity.send_modify(|activity| {
+            activity.in_use -= 1;
+            if activity.in_use == 0 {
+                activity.idle_since = tokio::time::Instant::now();
+            }
+        });
+    }
+
     pub async fn connect(&self) -> io::Result<UnixStream> {
-        connect_vsock(&self.dir.join("vsock.sock"), AGENTD_PORT).await
-    }
-
-    pub async fn destroy(&self) {
-        let mut cleanup = self.cleanup.lock().await;
-        let Some(pending) = cleanup.as_mut() else {
-            return;
+        let vm = match &*self.phase() {
+            Phase::Running(vm) => vm.clone(),
+            _ => return Err(io::Error::other("machine is not running")),
         };
-        if let Some(kill) = pending.kill.take() {
-            let _ = kill.send(());
-        }
-        let mut exit = self.exit.clone();
-        let _ = exit.wait_for(Option::is_some).await;
-        if let Err(error) = tokio::fs::remove_dir_all(&self.dir).await
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            tracing::error!(machine_id = %self.id, path = %self.dir.display(), %error, "machine cleanup failed");
-        }
-        tracing::info!(machine_id = %self.id, "machine destroyed");
-        cleanup.take();
+        vm.connect().await
     }
 
-    async fn wait_until_ready(&self) -> Result<(), BootError> {
-        let deadline = Instant::now() + BOOT_TIMEOUT;
-        loop {
-            let exited = self.exit.borrow().clone();
-            if let Some(message) = exited {
-                return Err(BootError::Exited {
-                    message,
-                    console: self.console_tail().await,
-                });
-            }
-            if tokio::time::timeout(HEALTH_TIMEOUT, self.health())
-                .await
-                .is_ok_and(|healthy| healthy.unwrap_or(false))
-            {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(BootError::TimedOut {
-                    console: self.console_tail().await,
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    pub(crate) async fn exclusive(&self) -> Exclusive<'_> {
+        Exclusive {
+            _lifecycle: self.lifecycle.lock().await,
+            machine: self,
         }
     }
 
-    async fn health(&self) -> io::Result<bool> {
-        let mut stream = self.connect().await?;
-        stream
-            .write_all(b"GET /health HTTP/1.1\r\nHost: agentd\r\nConnection: close\r\n\r\n")
-            .await?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await?;
-        Ok(response.starts_with(b"HTTP/1.1 200"))
+    fn phase(&self) -> std::sync::MutexGuard<'_, Phase> {
+        self.phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    async fn console_tail(&self) -> String {
-        let console = tokio::fs::read(self.dir.join("console.log"))
-            .await
-            .unwrap_or_default();
-        let start = console.len().saturating_sub(CONSOLE_TAIL_BYTES);
-        String::from_utf8_lossy(&console[start..]).into_owned()
+    fn set(&self, phase: Phase) {
+        let pauses = matches!(phase, Phase::Paused);
+        let was_paused = matches!(std::mem::replace(&mut *self.phase(), phase), Phase::Paused);
+        match (was_paused, pauses) {
+            (false, true) => self.activity.send_modify(|activity| activity.in_use += 1),
+            (true, false) => self.end_use(),
+            _ => {}
+        }
+    }
+
+    fn failed(&self, action: &str, error: impl std::fmt::Display) -> MachineError {
+        MachineError::Failed {
+            message: format!("{action} failed: {error}"),
+            state: self.state(),
+        }
     }
 }
 
-async fn launch(
+enum Live {
+    Running(Vm),
+    Paused,
+}
+
+pub(crate) struct Exclusive<'a> {
+    machine: &'a Machine,
+    _lifecycle: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl std::ops::Deref for Exclusive<'_> {
+    type Target = Machine;
+
+    fn deref(&self) -> &Machine {
+        self.machine
+    }
+}
+
+impl Exclusive<'_> {
+    fn live(&self) -> Result<Live, MachineError> {
+        match &*self.phase() {
+            Phase::Running(vm) if vm.exited().is_none() => Ok(Live::Running(vm.clone())),
+            Phase::Paused => Ok(Live::Paused),
+            Phase::Running(_) | Phase::Exited(_) => {
+                Err(MachineError::Conflict("machine has exited".into()))
+            }
+            Phase::Destroyed => Err(MachineError::UnknownMachine),
+        }
+    }
+
+    pub async fn pause(&self) -> Result<(), MachineError> {
+        let Live::Running(vm) = self.live()? else {
+            return Ok(());
+        };
+        if let Err(error) = vm.pause().await {
+            return Err(self.failed("pause", error));
+        }
+        if let Err(error) = self.checkpoint(&vm).await {
+            let withdrawn = self.withdraw_checkpoint().await;
+            self.carry_on(&vm, withdrawn).await;
+            for unused in [CHECKPOINT_STAGING, CHECKPOINT_WITHDRAWN] {
+                files::remove_dir_logged(&self.dir.join(unused)).await;
+            }
+            return Err(self.failed("pause", error));
+        }
+        self.set(Phase::Paused);
+        vm.kill().await;
+        files::remove_dir_logged(&self.dir.join(RESTORED)).await;
+        Ok(())
+    }
+
+    async fn withdraw_checkpoint(&self) -> io::Result<()> {
+        let checkpoint = self.dir.join(CHECKPOINT);
+        if tokio::fs::try_exists(&checkpoint).await? {
+            let withdrawn = self.dir.join(CHECKPOINT_WITHDRAWN);
+            files::remove_dir_if_present(&withdrawn).await?;
+            tokio::fs::rename(&checkpoint, &withdrawn).await?;
+        }
+        files::sync(&self.dir).await
+    }
+
+    async fn checkpoint(&self, vm: &Vm) -> io::Result<()> {
+        let staging = self.dir.join(CHECKPOINT_STAGING);
+        files::remove_dir_if_present(&staging).await?;
+        tokio::fs::create_dir(&staging).await?;
+        vm.save(&staging).await?;
+        files::sync_contents(&self.dir).await?;
+        files::publish_dir(&staging, &self.dir.join(CHECKPOINT)).await
+    }
+
+    async fn carry_on(&self, vm: &Vm, safe: io::Result<()>) {
+        let continued = match safe {
+            Ok(()) => vm.resume().await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = continued {
+            vm.kill().await;
+            let still_published = tokio::fs::try_exists(self.dir.join(CHECKPOINT)).await;
+            self.set(if matches!(still_published, Ok(true)) {
+                Phase::Paused
+            } else {
+                Phase::Exited(format!(
+                    "the VM could not continue after being paused for a save: {error}"
+                ))
+            });
+        }
+    }
+
+    pub fn is_paused(&self) -> Result<bool, MachineError> {
+        Ok(matches!(self.live()?, Live::Paused))
+    }
+
+    pub async fn resume(&self, admission: Admission) -> Result<(), MachineError> {
+        let Live::Paused = self.live()? else {
+            return Ok(());
+        };
+        let vm = match restore(&self.dir, CHECKPOINT, admission, self.egress.subscribe()).await {
+            Ok(vm) => vm,
+            Err(error) => return Err(self.failed("resume", error)),
+        };
+        if let Err(error) = self.retire_checkpoint().await {
+            vm.kill().await;
+            let reinstated = async {
+                let checkpoint = self.dir.join(CHECKPOINT);
+                if !tokio::fs::try_exists(&checkpoint).await? {
+                    tokio::fs::rename(self.dir.join(RESTORED), checkpoint).await?;
+                }
+                files::sync(&self.dir).await
+            };
+            if reinstated.await.is_err() {
+                self.set(Phase::Exited(format!("resume failed: {error}")));
+            }
+            return Err(self.failed("resume", error));
+        }
+        let ready = async {
+            vm.resume().await?;
+            wait_until_ready(&vm, &self.dir).await
+        };
+        match ready.await {
+            Ok(()) => {
+                self.set(Phase::Running(vm));
+                Ok(())
+            }
+            Err(error) => {
+                vm.kill().await;
+                self.set(Phase::Exited(format!("resume failed: {error}")));
+                Err(self.failed("resume", error))
+            }
+        }
+    }
+
+    async fn retire_checkpoint(&self) -> io::Result<()> {
+        files::remove_dir_if_present(&self.dir.join(RESTORED)).await?;
+        tokio::fs::rename(self.dir.join(CHECKPOINT), self.dir.join(RESTORED)).await?;
+        files::sync(&self.dir).await
+    }
+
+    pub async fn save_into(&self, dir: &Path) -> Result<(), MachineError> {
+        let copy_disk_and_image = async {
+            files::copy_disk(&self.dir.join(SCRATCH), &dir.join(SCRATCH)).await?;
+            for name in [FIRECRACKER, ROOTFS] {
+                files::link_immutable(&self.dir.join(name), &dir.join(name)).await?;
+            }
+            Ok(())
+        };
+        match self.live()? {
+            Live::Paused => {
+                let copy = async {
+                    for name in SAVED_STATE {
+                        let saved = self.dir.join(CHECKPOINT).join(name);
+                        files::link_immutable(&saved, &dir.join(name)).await?;
+                    }
+                    copy_disk_and_image.await
+                };
+                copy.await.map_err(MachineError::Io)
+            }
+            Live::Running(vm) => {
+                if let Err(error) = vm.pause().await {
+                    return Err(self.failed("saving", error));
+                }
+                let saved = async {
+                    vm.save(dir).await?;
+                    copy_disk_and_image.await
+                };
+                let saved = saved.await;
+                self.carry_on(&vm, Ok(())).await;
+                match saved {
+                    Ok(()) if self.state() == MachineState::Running => Ok(()),
+                    Ok(()) => Err(self.failed("saving", "the VM could not continue")),
+                    Err(error) => Err(self.failed("saving", error)),
+                }
+            }
+        }
+    }
+
+    pub fn spec(&self) -> MachineSpec {
+        MachineSpec {
+            vcpus: self.vcpus,
+            memory_mib: self.memory_mib,
+            idle_timeout_secs: self.idle_timeout_secs,
+            egress: self.egress.borrow().clone(),
+        }
+    }
+
+    pub async fn set_egress(&self, egress: EgressPolicy) -> Result<(), MachineError> {
+        if matches!(&*self.phase(), Phase::Destroyed) {
+            return Err(MachineError::UnknownMachine);
+        }
+        let record = Record {
+            allowed_hosts: egress.patterns(),
+            ..self.record()
+        };
+        files::replace_record(&self.dir, RECORD, &record)
+            .await
+            .map_err(MachineError::Io)?;
+        self.egress.send_replace(egress);
+        Ok(())
+    }
+
+    pub async fn park(&self) {
+        let Err(error) = self.pause().await else {
+            return;
+        };
+        if let Ok(Live::Running(vm)) = self.live() {
+            tracing::error!(machine_id = %self.id, %error, "machine was not saved at shutdown");
+            vm.kill().await;
+        }
+    }
+
+    pub async fn destroy(&self) -> io::Result<()> {
+        let was_paused = matches!(&*self.phase(), Phase::Paused);
+        let vm = match &*self.phase() {
+            Phase::Running(vm) => Some(vm.clone()),
+            _ => None,
+        };
+        self.set(Phase::Destroyed);
+        if let Some(vm) = vm {
+            vm.kill().await;
+        }
+        let discarded = files::discard(&self.dir, RECORD).await;
+        if let Err(error) = &discarded {
+            let still_recorded = tokio::fs::try_exists(self.dir.join(RECORD)).await;
+            self.set(if was_paused && matches!(still_recorded, Ok(true)) {
+                Phase::Paused
+            } else {
+                Phase::Exited(format!("deleting the machine failed: {error}"))
+            });
+        }
+        discarded
+    }
+}
+
+async fn restore(
     dir: &Path,
-    image: &Image,
-    vcpus: u8,
-    memory_mib: u32,
-) -> io::Result<(Child, UnixListener)> {
-    tokio::fs::create_dir_all(dir).await?;
-    let egress_listener = UnixListener::bind(dir.join(format!("vsock.sock_{EGRESS_PORT}")))?;
-    create_scratch_disk(&dir.join("scratch.ext4")).await?;
-    tokio::fs::write(
-        dir.join("config.json"),
-        firecracker_config(image, vcpus, memory_mib).to_string(),
-    )
-    .await?;
-    let mut child = spawn_firecracker(image, dir)?;
-    if let Some(pid) = child.id()
-        && let Err(error) = tokio::fs::write(dir.join("firecracker.pid"), pid.to_string()).await
-    {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+    saved: &str,
+    admission: Admission,
+    egress: watch::Receiver<EgressPolicy>,
+) -> io::Result<Vm> {
+    let vm = Vm::unconfigured(dir, admission, egress)?;
+    if let Err(error) = vm.load(saved).await {
+        vm.kill().await;
         return Err(error);
     }
-    Ok((child, egress_listener))
+    Ok(vm)
+}
+
+async fn wait_until_ready(vm: &Vm, dir: &Path) -> Result<(), BootError> {
+    let deadline = Instant::now() + BOOT_TIMEOUT;
+    loop {
+        if let Some(message) = vm.exited() {
+            return Err(BootError::Exited {
+                message,
+                console: console_tail(dir).await,
+            });
+        }
+        if tokio::time::timeout(HEALTH_TIMEOUT, health(vm))
+            .await
+            .is_ok_and(|healthy| healthy.unwrap_or(false))
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(BootError::TimedOut {
+                console: console_tail(dir).await,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn health(vm: &Vm) -> io::Result<bool> {
+    let mut stream = vm.connect().await?;
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: agentd\r\nConnection: close\r\n\r\n")
+        .await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    Ok(response.starts_with(b"HTTP/1.1 200"))
+}
+
+async fn console_tail(dir: &Path) -> String {
+    let console = tokio::fs::read(dir.join("console.log"))
+        .await
+        .unwrap_or_default();
+    let start = console.len().saturating_sub(CONSOLE_TAIL_BYTES);
+    String::from_utf8_lossy(&console[start..]).into_owned()
 }
 
 async fn create_scratch_disk(path: &Path) -> io::Result<()> {
@@ -380,13 +792,13 @@ fn firecracker_config(image: &Image, vcpus: u8, memory_mib: u32) -> serde_json::
         "drives": [
             {
                 "drive_id": "rootfs",
-                "path_on_host": image.rootfs,
+                "path_on_host": ROOTFS,
                 "is_root_device": true,
                 "is_read_only": true,
             },
             {
                 "drive_id": "scratch",
-                "path_on_host": "scratch.ext4",
+                "path_on_host": SCRATCH,
                 "is_root_device": false,
                 "is_read_only": false,
             },
@@ -394,135 +806,4 @@ fn firecracker_config(image: &Image, vcpus: u8, memory_mib: u32) -> serde_json::
         "machine-config": { "vcpu_count": vcpus, "mem_size_mib": memory_mib },
         "vsock": { "guest_cid": 3, "uds_path": "vsock.sock" },
     })
-}
-
-fn spawn_firecracker(image: &Image, dir: &Path) -> io::Result<Child> {
-    let console = std::fs::File::create(dir.join("console.log"))?;
-    Command::new(&image.firecracker)
-        .args(["--api-sock", "api.sock", "--config-file", "config.json"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(console.try_clone()?)
-        .stderr(console)
-        .kill_on_drop(true)
-        .spawn()
-}
-
-fn supervise(
-    mut child: Child,
-    machine_id: String,
-) -> (watch::Receiver<Option<String>>, oneshot::Sender<()>) {
-    let (exit_sender, exit) = watch::channel(None);
-    let (kill, kill_requested) = oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let status = tokio::select! {
-            status = child.wait() => status,
-            _ = kill_requested => {
-                let _ = child.start_kill();
-                child.wait().await
-            }
-        };
-        let message = match status {
-            Ok(status) => status.to_string(),
-            Err(error) => format!("failed to wait for firecracker: {error}"),
-        };
-        tracing::info!(%machine_id, %message, "firecracker exited");
-        exit_sender.send_replace(Some(message));
-    });
-    (exit, kill)
-}
-
-fn serve_egress_until_exit(
-    listener: UnixListener,
-    policy: watch::Receiver<EgressPolicy>,
-    mut exit: watch::Receiver<Option<String>>,
-) {
-    tokio::spawn(async move {
-        tokio::select! {
-            () = egress::serve(listener, policy) => {}
-            _ = exit.wait_for(Option::is_some) => {}
-        }
-    });
-}
-
-pub async fn connect_vsock(path: &Path, port: u32) -> io::Result<UnixStream> {
-    let mut stream = UnixStream::connect(path).await?;
-    stream
-        .write_all(format!("CONNECT {port}\n").as_bytes())
-        .await?;
-    let mut reply = Vec::new();
-    loop {
-        let byte = stream.read_u8().await?;
-        if byte == b'\n' {
-            break;
-        }
-        reply.push(byte);
-        if reply.len() > 64 {
-            return Err(io::Error::other("vsock handshake reply too long"));
-        }
-    }
-    if reply.starts_with(b"OK ") {
-        Ok(stream)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!(
-                "vsock port {port} refused: {}",
-                String::from_utf8_lossy(&reply)
-            ),
-        ))
-    }
-}
-
-pub fn kill_stale_firecracker(dir: &Path) {
-    let Ok(pid) = std::fs::read_to_string(dir.join("firecracker.pid")) else {
-        return;
-    };
-    let Some(pid) = pid
-        .trim()
-        .parse()
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-    else {
-        return;
-    };
-    let running_in_dir = std::fs::read_link(format!("/proc/{}/cwd", pid.as_raw_nonzero()))
-        .is_ok_and(|cwd| cwd == dir);
-    if running_in_dir {
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn controlled_machine(
-    id: &str,
-    dir: PathBuf,
-    admission: Admission,
-) -> (
-    Arc<Machine>,
-    oneshot::Receiver<()>,
-    watch::Sender<Option<String>>,
-) {
-    let (exit_sender, exit) = watch::channel(None);
-    let (kill, killed) = oneshot::channel();
-    let (egress, _) = watch::channel(EgressPolicy::parse(&[]).unwrap());
-    let machine = Arc::new(Machine {
-        id: id.into(),
-        dir,
-        vcpus: 1,
-        memory_mib: 128,
-        egress,
-        boot_ms: 0,
-        idle_timeout_secs: 600,
-        activity: watch::Sender::new(Activity {
-            in_use: 0,
-            idle_since: Instant::now(),
-        }),
-        exit,
-        cleanup: Mutex::new(Some(Cleanup {
-            _admission: admission,
-            kill: Some(kill),
-        })),
-    });
-    (machine, killed, exit_sender)
 }
