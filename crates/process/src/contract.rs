@@ -19,6 +19,9 @@ pub struct StartProcess {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub stdin: Option<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub keep_stdin_open: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]
@@ -50,6 +53,9 @@ pub struct ProcessInfo {
     pub first_seq: u64,
     #[ts(type = "number")]
     pub next_seq: u64,
+    #[ts(type = "number")]
+    pub stdin_offset: u64,
+    pub stdin_open: bool,
 }
 
 #[derive(Debug, Serialize, TS)]

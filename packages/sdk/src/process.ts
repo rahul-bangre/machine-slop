@@ -37,6 +37,26 @@ export class Process {
         });
     }
 
+    async writeStdin(
+        offset: number,
+        data: Uint8Array<ArrayBuffer> | string,
+        signal?: AbortSignal,
+    ): Promise<number> {
+        const bytes = typeof data === "string"
+            ? new TextEncoder().encode(data)
+            : data;
+        await this.postStdin(`offset=${offset}`, bytes, signal);
+        return offset + bytes.byteLength;
+    }
+
+    async closeStdin(offset: number, signal?: AbortSignal): Promise<void> {
+        await this.postStdin(
+            `offset=${offset}&close=true`,
+            new Uint8Array(),
+            signal,
+        );
+    }
+
     async *events(
         cursor = 0,
         signal?: AbortSignal,
@@ -55,6 +75,19 @@ export class Process {
             for (const event of parser.push(chunk)) yield event;
         }
         parser.finish();
+    }
+
+    private async postStdin(
+        query: string,
+        body: Uint8Array<ArrayBuffer>,
+        signal?: AbortSignal,
+    ): Promise<void> {
+        await request(this.url, `${this.path()}/stdin?${query}`, {
+            method: "POST",
+            headers: { "content-type": "application/octet-stream" },
+            body,
+            signal: signal ?? null,
+        });
     }
 
     private path(): string {
