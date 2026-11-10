@@ -123,6 +123,12 @@ impl Admission {
         self.tenant = Some(charge);
     }
 
+    pub(crate) fn start_metering(&mut self) {
+        if let Some(charge) = &mut self.tenant {
+            charge.start_metering();
+        }
+    }
+
     fn charged(mut self, charge: TenantCharge) -> Self {
         self.charge(charge);
         self
@@ -210,11 +216,6 @@ struct SnapshotRecord {
     tenant: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     idempotency: Option<Idempotency>,
-}
-
-enum Replay {
-    Machine(Arc<Machine>),
-    Snapshot(SnapshotInfo),
 }
 
 impl Machines {
@@ -330,25 +331,47 @@ impl Machines {
         self.tenants.get(id)
     }
 
-    async fn replay(
+    async fn replayed_machine(
         &self,
         tenant: &Tenant,
         attempt: Option<&Idempotency>,
-    ) -> Result<Option<Replay>, MachineError> {
+    ) -> Result<Option<Arc<Machine>>, MachineError> {
+        let Some(attempt) = attempt else {
+            return Ok(None);
+        };
+        let state = self.state.lock().await;
+        for snapshot in state.snapshots.values() {
+            if snapshot.tenant.id() == tenant.id() {
+                Idempotency::replays(snapshot.idempotency.as_ref(), attempt)?;
+            }
+        }
+        for machine in state.machines.values() {
+            if machine.belongs_to(tenant) && Idempotency::replays(machine.idempotency(), attempt)? {
+                return Ok(Some(machine.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn replayed_snapshot(
+        &self,
+        tenant: &Tenant,
+        attempt: Option<&Idempotency>,
+    ) -> Result<Option<SnapshotInfo>, MachineError> {
         let Some(attempt) = attempt else {
             return Ok(None);
         };
         let state = self.state.lock().await;
         for machine in state.machines.values() {
-            if machine.belongs_to(tenant) && Idempotency::replays(machine.idempotency(), attempt)? {
-                return Ok(Some(Replay::Machine(machine.clone())));
+            if machine.belongs_to(tenant) {
+                Idempotency::replays(machine.idempotency(), attempt)?;
             }
         }
         for snapshot in state.snapshots.values() {
             if snapshot.tenant.id() == tenant.id()
                 && Idempotency::replays(snapshot.idempotency.as_ref(), attempt)?
             {
-                return Ok(Some(Replay::Snapshot(snapshot.info.clone())));
+                return Ok(Some(snapshot.info.clone()));
             }
         }
         Ok(None)
@@ -379,9 +402,8 @@ impl Machines {
             ),
         );
         let turn = tenant.take_turn(attempt.as_ref()).await;
-        match self.replay(tenant, attempt.as_ref()).await? {
-            Some(Replay::Machine(machine)) => return Ok(machine),
-            Some(Replay::Snapshot(_)) | None => {}
+        if let Some(machine) = self.replayed_machine(tenant, attempt.as_ref()).await? {
+            return Ok(machine);
         }
         let snapshot = match &request.snapshot_id {
             None => None,
@@ -493,9 +515,8 @@ impl Machines {
     ) -> Result<Arc<Machine>, MachineError> {
         let attempt = Idempotency::of(key, format!("fork {id}"));
         let turn = tenant.take_turn(attempt.as_ref()).await;
-        match self.replay(tenant, attempt.as_ref()).await? {
-            Some(Replay::Machine(machine)) => return Ok(machine),
-            Some(Replay::Snapshot(_)) | None => {}
+        if let Some(machine) = self.replayed_machine(tenant, attempt.as_ref()).await? {
+            return Ok(machine);
         }
         let source = self
             .begin_use(tenant, id)
@@ -807,12 +828,18 @@ impl Machines {
     }
 
     async fn destroy_if_expired(self: &Arc<Self>, id: &str) -> ControlFlow<()> {
+        let Some(machine) = self.state.lock().await.machines.get(id).cloned() else {
+            return ControlFlow::Break(());
+        };
+        let _turn = machine.tenant().take_turn(machine.idempotency()).await;
         let expired = {
             let mut state = self.state.lock().await;
             match state.machines.get(id) {
-                Some(machine) if !machine.is_expired() => return ControlFlow::Continue(()),
-                Some(_) => state.machines.remove(id),
-                None => None,
+                Some(listed) if Arc::ptr_eq(listed, &machine) && !machine.is_expired() => {
+                    return ControlFlow::Continue(());
+                }
+                Some(listed) if Arc::ptr_eq(listed, &machine) => state.machines.remove(id),
+                _ => None,
             }
         };
         if let Some(machine) = expired
@@ -907,16 +934,22 @@ impl Machines {
     }
 
     pub async fn destroy(self: &Arc<Self>, tenant: &Tenant, id: &str) -> Result<(), MachineError> {
+        let machine = self
+            .get(tenant, id)
+            .await
+            .ok_or(MachineError::UnknownMachine)?;
+        let turn = tenant.take_turn(machine.idempotency()).await;
         let machine = {
             let mut state = self.state.lock().await;
             match state.machines.get(id) {
-                Some(machine) if machine.belongs_to(tenant) => state.machines.remove(id),
+                Some(listed) if Arc::ptr_eq(listed, &machine) => state.machines.remove(id),
                 _ => None,
             }
         }
         .ok_or(MachineError::UnknownMachine)?;
         let machines = self.clone();
         run_to_completion(async move {
+            let _turn = turn;
             machines
                 .destroy_unlisted(machine)
                 .await
@@ -954,9 +987,8 @@ impl Machines {
     ) -> Result<SnapshotInfo, MachineError> {
         let attempt = Idempotency::of(key, format!("snapshot {}", request.machine_id));
         let turn = tenant.take_turn(attempt.as_ref()).await;
-        match self.replay(tenant, attempt.as_ref()).await? {
-            Some(Replay::Snapshot(info)) => return Ok(info),
-            Some(Replay::Machine(_)) | None => {}
+        if let Some(info) = self.replayed_snapshot(tenant, attempt.as_ref()).await? {
+            return Ok(info);
         }
         let machine = self
             .begin_use(tenant, &request.machine_id)
@@ -1061,10 +1093,15 @@ impl Machines {
         tenant: &Tenant,
         id: &str,
     ) -> Result<(), MachineError> {
+        let snapshot = self
+            .snapshot(tenant, id)
+            .await
+            .ok_or(MachineError::UnknownSnapshot)?;
+        let turn = tenant.take_turn(snapshot.idempotency.as_ref()).await;
         let snapshot = {
             let mut state = self.state.lock().await;
             match state.snapshots.get(id) {
-                Some(snapshot) if snapshot.tenant.id() == tenant.id() => state.snapshots.remove(id),
+                Some(listed) if Arc::ptr_eq(listed, &snapshot) => state.snapshots.remove(id),
                 _ => None,
             }
         }
@@ -1072,6 +1109,7 @@ impl Machines {
         let machines = self.clone();
         let snapshot_id = snapshot.info.id.clone();
         run_to_completion(async move {
+            let _turn = turn;
             let mut deleted = snapshot.deleted.write().await;
             let discarded = files::discard(&snapshot.dir, SNAPSHOT_RECORD).await;
             *deleted = discarded.is_ok();

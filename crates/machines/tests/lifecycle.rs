@@ -1762,6 +1762,53 @@ async fn every_running_vm_is_jailed_as_its_own_user_with_its_reservation_as_limi
 }
 
 #[tokio::test]
+async fn a_vm_cannot_redirect_machined_to_another_machine_through_its_jail() {
+    let host = Host::new("jail-sockets");
+    let machines = host.open(4).await;
+    let (first, second) = (create(&machines).await, create(&machines).await);
+    for socket in ["vsock.sock", "api.sock"] {
+        let planted = host.jail_root(&first).join(socket);
+        std::fs::remove_file(&planted).expect("remove socket");
+        std::os::unix::fs::symlink(host.jail_root(&second).join(socket), &planted)
+            .expect("plant symlink");
+    }
+    assert!(!agent_answers(&machines, &first).await);
+    assert!(agent_answers(&machines, &second).await);
+    let paused = machines.pause(&owner(&machines), &first).await;
+    assert!(
+        matches!(paused, Err(MachineError::Failed { .. })),
+        "{paused:?}"
+    );
+    assert_eq!(state(&machines, &second).await, MachineState::Running);
+    assert_eq!(host.vm_pauses(), 0, "no request reached the other VM");
+}
+
+#[tokio::test]
+async fn saved_state_that_is_not_a_file_the_vm_wrote_is_refused_untouched() {
+    let host = Host::new("jail-files");
+    let machines = host.open(4).await;
+    let id = create(&machines).await;
+    let host_file = host.root.join("host-file");
+    std::fs::write(&host_file, "host").expect("write host file");
+    std::fs::set_permissions(&host_file, std::fs::Permissions::from_mode(0o640)).expect("set mode");
+
+    host.fail("save-as-symlink");
+    let paused = machines.pause(&owner(&machines), &id).await;
+    assert!(
+        matches!(paused, Err(MachineError::Failed { .. })),
+        "{paused:?}"
+    );
+    let untouched = std::fs::metadata(&host_file).expect("host file");
+    assert_eq!(untouched.permissions().mode() & 0o777, 0o640);
+    assert_eq!(std::fs::read_to_string(&host_file).expect("read"), "host");
+    assert!(!host.machine_dir(&id).join("checkpoint").exists());
+    assert_eq!(state(&machines, &id).await, MachineState::Running);
+    let snapshot = snapshot(&machines, &id).await;
+    assert!(snapshot.is_err(), "{snapshot:?}");
+    assert!(machines.snapshots(&owner(&machines)).await.is_empty());
+}
+
+#[tokio::test]
 async fn tenants_see_and_change_only_their_own_machines_and_snapshots() {
     let host = Host::new("tenants");
     let roomy = quotas(8, 8192, 1024);
@@ -2256,6 +2303,11 @@ async fn answer_api(stream: UnixStream, vm: &std::sync::Mutex<FakeVm>, fail: &Pa
                 if failing == "save" {
                     std::fs::write(memory, "partial").expect("write memory");
                     Err("cannot save")
+                } else if failing == "save-as-symlink" {
+                    std::os::unix::fs::symlink(fail.with_file_name("host-file"), memory)
+                        .expect("plant symlink");
+                    std::fs::write(state, "vmstate").expect("write state");
+                    Ok(())
                 } else {
                     std::fs::write(memory, "memory").expect("write memory");
                     std::fs::write(state, "vmstate").expect("write state");

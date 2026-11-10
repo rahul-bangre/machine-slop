@@ -1,7 +1,10 @@
 use std::{
     fs::Permissions,
     io,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -114,6 +117,7 @@ pub(crate) struct Launch<'a> {
 #[derive(Clone)]
 pub struct Vm {
     root: PathBuf,
+    pid: u32,
     admission: Arc<std::sync::Mutex<Option<Admission>>>,
     exit: watch::Receiver<Option<String>>,
     kill: Arc<Notify>,
@@ -192,6 +196,9 @@ impl Vm {
             .stderr(console)
             .kill_on_drop(true)
             .spawn()?;
+        let pid = child
+            .id()
+            .ok_or_else(|| io::Error::other("firecracker exited before it could be tracked"))?;
         let vm_dir = dir.to_owned();
         let admission = Arc::new(std::sync::Mutex::new(Some(admission)));
         let held_until_exit = admission.clone();
@@ -232,10 +239,17 @@ impl Vm {
         });
         Ok(Self {
             root,
+            pid,
             admission,
             exit,
             kill,
         })
+    }
+
+    pub(crate) fn start_metering(&self) {
+        if let Some(admission) = &mut *lock(&self.admission) {
+            admission.start_metering();
+        }
     }
 
     pub(crate) fn charge(&self, charge: TenantCharge) -> Result<(), TenantCharge> {
@@ -280,9 +294,7 @@ impl Vm {
             )
             .await?;
             for name in SAVED_STATE {
-                let saved = self.root.join(name);
-                seal(&saved)?;
-                tokio::fs::rename(&saved, into.join(name)).await?;
+                self.take_saved(name, into)?;
             }
             Ok(())
         };
@@ -312,7 +324,52 @@ impl Vm {
     }
 
     pub async fn connect(&self) -> io::Result<UnixStream> {
-        connect_vsock(&self.root.join("vsock.sock"), AGENTD_PORT).await
+        vsock_handshake(self.connect_jailed("vsock.sock").await?, AGENTD_PORT).await
+    }
+
+    async fn connect_jailed(&self, socket: &str) -> io::Result<UnixStream> {
+        let stream = UnixStream::connect(self.root.join(socket)).await?;
+        let served_by = stream.peer_cred()?.pid();
+        if served_by != i32::try_from(self.pid).ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{socket} in the jail is not served by this machine's VM"),
+            ));
+        }
+        Ok(stream)
+    }
+
+    fn take_saved(&self, name: &str, into: &Path) -> io::Result<()> {
+        use rustix::fs::{AtFlags, CWD, Mode, OFlags};
+        let jailed = self.root.join(name);
+        let file = rustix::fs::open(
+            &jailed,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let saved = rustix::fs::fstat(&file)?;
+        let vm_uid = std::fs::metadata(format!("/proc/{}", self.pid))?.uid();
+        let is_file = rustix::fs::FileType::from_raw_mode(saved.st_mode).is_file();
+        if !is_file || saved.st_uid != vm_uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{name} in the jail is not a file the VM saved"),
+            ));
+        }
+        rustix::fs::fchown(
+            &file,
+            Some(rustix::process::geteuid()),
+            Some(rustix::process::getegid()),
+        )?;
+        rustix::fs::fchmod(&file, Mode::from_raw_mode(0o444))?;
+        rustix::fs::linkat(
+            CWD,
+            format!("/proc/self/fd/{}", file.as_raw_fd()),
+            CWD,
+            into.join(name),
+            AtFlags::SYMLINK_FOLLOW,
+        )?;
+        std::fs::remove_file(jailed)
     }
 
     async fn api(&self, method: &str, path: &str, body: Value) -> io::Result<()> {
@@ -369,8 +426,9 @@ impl Vm {
     async fn connect_api(&self) -> io::Result<UnixStream> {
         let deadline = tokio::time::Instant::now() + API_SOCKET_TIMEOUT;
         loop {
-            match UnixStream::connect(self.root.join("api.sock")).await {
+            match self.connect_jailed("api.sock").await {
                 Ok(stream) => return Ok(stream),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(error),
                 Err(error) => {
                     if let Some(message) = self.exited() {
                         return Err(io::Error::other(format!("firecracker exited: {message}")));
@@ -389,8 +447,7 @@ fn egress_socket_name() -> String {
     format!("vsock.sock_{EGRESS_PORT}")
 }
 
-pub async fn connect_vsock(path: &Path, port: u32) -> io::Result<UnixStream> {
-    let mut stream = UnixStream::connect(path).await?;
+async fn vsock_handshake(mut stream: UnixStream, port: u32) -> io::Result<UnixStream> {
     stream
         .write_all(format!("CONNECT {port}\n").as_bytes())
         .await?;
@@ -430,13 +487,4 @@ impl Launch<'_> {
         tokio::fs::set_permissions(root.join(SCRATCH), Permissions::from_mode(0o666)).await?;
         Ok(root)
     }
-}
-
-fn seal(path: &Path) -> io::Result<()> {
-    rustix::fs::chown(
-        path,
-        Some(rustix::process::geteuid()),
-        Some(rustix::process::getegid()),
-    )?;
-    std::fs::set_permissions(path, Permissions::from_mode(0o444))
 }

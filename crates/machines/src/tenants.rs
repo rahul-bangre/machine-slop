@@ -187,9 +187,19 @@ impl Drop for Metered {
 }
 
 pub(crate) struct TenantCharge {
+    tenant: Arc<Tenant>,
+    rate: Rate,
     _running: Held,
     _memory: Held,
-    _metered: Metered,
+    metered: Option<Metered>,
+}
+
+impl TenantCharge {
+    pub(crate) fn start_metering(&mut self) {
+        if self.metered.is_none() {
+            self.metered = Some(self.tenant.meter(self.rate, unix_ms()));
+        }
+    }
 }
 
 pub(crate) struct Storage {
@@ -230,7 +240,9 @@ impl Tenant {
         Ok(TenantCharge {
             _running: self.running_machines.hold(1)?,
             _memory: self.memory_mib.hold(memory_mib.into())?,
-            _metered: self.meter(Rate::Vm { vcpus, memory_mib }, unix_ms()),
+            tenant: self.clone(),
+            rate: Rate::Vm { vcpus, memory_mib },
+            metered: None,
         })
     }
 
@@ -268,6 +280,11 @@ impl Tenant {
     }
 
     pub(crate) fn take_create(&self) -> Result<(), MachineError> {
+        if self.quotas.creates_per_second == 0 {
+            return Err(MachineError::QuotaExceeded(
+                "the tenant's creates_per_second quota is 0".into(),
+            ));
+        }
         let per_second = f64::from(self.quotas.creates_per_second);
         let mut bucket = lock(&self.creates);
         let now = Instant::now();
@@ -278,12 +295,9 @@ impl Tenant {
             bucket.tokens -= 1.0;
             return Ok(());
         }
-        let retry_after = if per_second > 0.0 {
-            Duration::from_secs_f64((1.0 - bucket.tokens) / per_second)
-        } else {
-            Duration::MAX
-        };
-        Err(MachineError::RateLimited { retry_after })
+        Err(MachineError::RateLimited {
+            retry_after: Duration::from_secs_f64((1.0 - bucket.tokens) / per_second),
+        })
     }
 
     pub(crate) async fn take_turn(
@@ -329,7 +343,7 @@ impl Tenant {
 }
 
 fn creates_burst(quotas: &Quotas) -> f64 {
-    f64::from(quotas.creates_per_second.max(1))
+    f64::from(quotas.creates_per_second)
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -455,6 +469,18 @@ mod tests {
     }
 
     #[test]
+    fn a_charge_meters_only_once_started() {
+        let tenant = Tenant::new("t".into(), quotas(1), Usage::default(), 0);
+        let mut charge = tenant.charge(2, 512).expect("charge");
+        assert!(lock(&tenant.meter).open.is_empty());
+        charge.start_metering();
+        charge.start_metering();
+        assert_eq!(lock(&tenant.meter).open.len(), 1);
+        drop(charge);
+        assert!(lock(&tenant.meter).open.is_empty());
+    }
+
+    #[test]
     fn holds_are_refused_beyond_the_quota_and_returned_when_dropped() {
         let tenant = Tenant::new("t".into(), quotas(1), Usage::default(), 0);
         let first = tenant.charge(1, 512).expect("first");
@@ -486,12 +512,9 @@ mod tests {
         };
         assert!(retry_after <= Duration::from_millis(500));
         let closed = Tenant::new("t".into(), quotas(0), Usage::default(), 0);
-        closed
-            .take_create()
-            .expect("a zero rate still allows one burst");
         assert!(matches!(
             closed.take_create(),
-            Err(MachineError::RateLimited { .. })
+            Err(MachineError::QuotaExceeded(_))
         ));
     }
 

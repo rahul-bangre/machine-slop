@@ -117,9 +117,11 @@ nothing, so its retry tries again. Reusing a key for a different request, such
 as another body, another source machine or another kind of request, returns 422.
 
 A key refers to its result for as long as that machine or snapshot exists,
-across `machined` restarts. Once it is deleted or expires, the key makes a new
-one. A request without a key is not retry-safe; after a lost response, find its
-result with `host.machines()` or `host.snapshots()`.
+across `machined` restarts. Deleting or expiring a keyed result also takes the
+key's turn, so a retry waits for it and then finds the result still listed if
+the delete failed. Once the result is gone, the key makes a new one. A request
+without a key is not retry-safe; after a lost response, find its result with
+`host.machines()` or `host.snapshots()`.
 
 A running or exited machine expires after `idle_timeout_secs` without an open
 request to its `agentd`, and is then destroyed as if deleted. The clock restarts
@@ -356,15 +358,17 @@ hold only disk. Disk is provisioned rather than measured: a machine counts the
 most it can store, whether or not it is paused, and a snapshot counts what it
 stored, `SnapshotInfo.stored_bytes`. A request over a quota or the rate returns
 429 before anything starts and changes nothing; a rate refusal carries
-`Retry-After`. `GET /usage` reports the quotas.
+`Retry-After`, and a `creates_per_second` of 0 refuses every create and fork.
+`GET /usage` reports the quotas.
 
 ## Usage
 
 `machined` meters each tenant's
 
-- `vcpu_ms`: vCPU-milliseconds, each VM's vCPUs times how long its process ran
-  for the tenant, from its admission (or, for a spare, from being taken) until
-  it exits;
+- `vcpu_ms`: vCPU-milliseconds, each machine's vCPUs times how long it runs:
+  from when a create or fork records it, or a resume finds `agentd` answering,
+  until its VM process exits. A boot, restore or resume that fails is not
+  metered, nor is a paused machine;
 - `memory_mib_ms`: MiB-milliseconds of guest memory over the same time;
 - `snapshot_mib_ms`: MiB-milliseconds of `stored_bytes` for each snapshot, from
   its creation until it is deleted, including while `machined` is down.
@@ -392,24 +396,31 @@ Every VM runs under Firecracker's `jailer`, which `machined` runs as root:
 - Firecracker's own seccomp filters.
 
 The machine's scratch disk is writable inside its jail; the root image, kernel
-and saved state are read-only to it. Saved memory and device state are moved out
-of the jail, owned by root and made read-only before any other machine or
-snapshot shares them. The state dir's `machines` and `snapshots` are readable
-only by root. `machined` removes the API key from requests it forwards to a
-machine, so the key never enters a guest.
+and saved state are read-only to it. Because the jail's root belongs to the VM's
+user, `machined` treats everything in it as the VM's to change: it connects to
+the VM's API and `agentd` sockets only when the process serving them is that
+VM's Firecracker, and takes saved memory and device state only as regular files
+owned by the VM's user, opened without following links. It then makes them owned
+by root and read-only, and links that same file out of the jail, before any
+other machine or snapshot shares it. The state dir's `machines` and `snapshots`
+are readable only by root. `machined` removes the API key from requests it
+forwards to a machine, so the key never enters a guest.
 
 ## Host
 
 `machined <listen address> <image dir> <state dir> <tenants file>`
 
 `machined` must run as root on cgroup v2 with the `cpu`, `memory` and `pids`
-controllers available. The image dir holds `jailer`, `firecracker`, `vmlinux`
-and `rootfs.ext4`, built by `vm/image/build.sh <image dir> <agentd binary>`. The
-script pins Firecracker, the guest kernel, Chrome for Testing and Deno by hash
-and Debian by snapshot date, installing from its `trixie`, `trixie-updates` and
-`trixie-security` suites, and rebuilds the root filesystem only when its inputs
-change. It needs `mmdebstrap`, `e2fsprogs`, `debian-archive-keyring` and
-`python3` on the host. The Debian keyring verifies the pinned snapshot.
+controllers available. Machine and snapshot records written before tenants
+existed name no tenant; `machined` logs them as unreadable and leaves their
+directories in place, so remove the old state dir when upgrading. The image dir
+holds `jailer`, `firecracker`, `vmlinux` and `rootfs.ext4`, built by
+`vm/image/build.sh <image dir> <agentd binary>`. The script pins Firecracker,
+the guest kernel, Chrome for Testing and Deno by hash and Debian by snapshot
+date, installing from its `trixie`, `trixie-updates` and `trixie-security`
+suites, and rebuilds the root filesystem only when its inputs change. It needs
+`mmdebstrap`, `e2fsprogs`, `debian-archive-keyring` and `python3` on the host.
+The Debian keyring verifies the pinned snapshot.
 
 Rebuilding the image affects new machines only. Each machine and snapshot keeps
 the root image and Firecracker binary it started with, as hard links when the

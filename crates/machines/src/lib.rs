@@ -11,7 +11,7 @@ pub use contract::{
     UpdateMachine,
 };
 pub use egress::{EgressPolicy, serve as serve_egress};
-pub use firecracker::{AGENTD_PORT, connect_vsock};
+pub use firecracker::AGENTD_PORT;
 pub use machine::{BootError, Machine, MachineUse};
 pub use machines::{Limits, MachineError, Machines, default_memory_budget_mib};
 pub use tenants::{IdempotencyKey, Tenant, TenantConfig};

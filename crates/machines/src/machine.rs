@@ -280,6 +280,7 @@ impl Booted {
             }
             return Err(error.into());
         }
+        self.vm.start_metering();
         Ok(machine)
     }
 
@@ -665,6 +666,7 @@ impl Exclusive<'_> {
         };
         match ready.await {
             Ok(()) => {
+                vm.start_metering();
                 self.set(Phase::Running(vm));
                 Ok(())
             }
