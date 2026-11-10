@@ -369,6 +369,7 @@ dependencies = [
  "axum",
  "hyper",
  "hyper-util",
+ "serde",
  "serde_json",
  "slop-machines",
  "tokio",
@@ -572,6 +573,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slop-machines"
 version = "0.1.0"
 dependencies = [
+ "httparse",
  "rustix",
  "serde",
  "serde_json",

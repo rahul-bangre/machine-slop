@@ -3,7 +3,7 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd -P)
 DEBIAN_SNAPSHOT=20261103T000000Z
-PACKAGES="build-essential ca-certificates curl git iproute2 nodejs procps python3 python3-pip python3-venv tini"
+PACKAGES="build-essential ca-certificates curl git iproute2 nodejs procps python3 python3-pip python3-venv socat tini"
 FIRECRACKER_VERSION=v1.17.0
 KERNEL_PATH=firecracker-ci/v1.15/ARCH/vmlinux-6.1.155
 

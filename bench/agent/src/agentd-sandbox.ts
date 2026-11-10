@@ -299,7 +299,7 @@ export function machinedProvider(url: string): SandboxProvider {
         await destroyEveryMachine();
         try {
             const { machine, info } = await host.createMachine(
-                {},
+                { allowed_hosts: [] },
                 AbortSignal.timeout(machine_boot_timeout_ms),
             );
             return {

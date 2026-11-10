@@ -13,4 +13,5 @@ export type {
     CreateMachine,
     MachineInfo,
     MachineState,
+    UpdateMachine,
 } from "./machines.gen.ts";

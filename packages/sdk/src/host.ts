@@ -1,6 +1,10 @@
 import { request } from "./http.ts";
 import { Machine } from "./machine.ts";
-import type { CreateMachine, MachineInfo } from "./machines.gen.ts";
+import type {
+    CreateMachine,
+    MachineInfo,
+    UpdateMachine,
+} from "./machines.gen.ts";
 
 export class HostedMachine extends Machine {
     constructor(private readonly host: URL, readonly id: string) {
@@ -9,6 +13,19 @@ export class HostedMachine extends Machine {
 
     async info(signal?: AbortSignal): Promise<MachineInfo> {
         return (await request(this.host, `/machines/${this.id}`, {
+            signal: signal ?? null,
+        })).json();
+    }
+
+    async setAllowedHosts(
+        allowed_hosts: string[],
+        signal?: AbortSignal,
+    ): Promise<MachineInfo> {
+        const update: UpdateMachine = { allowed_hosts };
+        return (await request(this.host, `/machines/${this.id}`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(update),
             signal: signal ?? null,
         })).json();
     }

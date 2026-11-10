@@ -9,13 +9,14 @@ use axum::{
     routing::{any, get},
 };
 use hyper_util::rt::TokioIo;
-use slop_machines::{CreateMachine, Machine, MachineError, MachineInfo, Machines};
+use serde::de::DeserializeOwned;
+use slop_machines::{CreateMachine, Machine, MachineError, MachineInfo, Machines, UpdateMachine};
 
 pub fn app(machines: Arc<Machines>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/machines", get(list).post(create))
-        .route("/machines/{id}", get(info).delete(destroy))
+        .route("/machines/{id}", get(info).patch(update).delete(destroy))
         .route("/machines/{id}/{*path}", any(proxy))
         .with_state(machines)
 }
@@ -24,14 +25,27 @@ async fn create(
     State(machines): State<Arc<Machines>>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<MachineInfo>), ApiError> {
-    let request = if body.is_empty() {
-        CreateMachine::default()
-    } else {
-        serde_json::from_slice(&body)
-            .map_err(|error| ApiError(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?
-    };
+    let request: CreateMachine = json_body(if body.is_empty() { b"{}" } else { &body })?;
     let machine = machines.create(request).await?;
     Ok((StatusCode::CREATED, Json(machine.info())))
+}
+
+async fn update(
+    State(machines): State<Arc<Machines>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let request: UpdateMachine = json_body(&body)?;
+    machines
+        .update(&id, request)
+        .await?
+        .map(Json)
+        .ok_or_else(unknown_machine)
+}
+
+fn json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
+    serde_json::from_slice(body)
+        .map_err(|error| ApiError(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))
 }
 
 async fn list(State(machines): State<Arc<Machines>>) -> Json<Vec<MachineInfo>> {

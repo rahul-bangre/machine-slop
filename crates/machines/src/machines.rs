@@ -10,8 +10,11 @@ use std::{
 use tokio::sync::{Mutex, Semaphore, watch};
 
 use crate::{
-    contract::{CreateMachine, MachineInfo},
-    machine::{Activity, BootError, Image, Machine, MachineUse, kill_stale_firecracker},
+    contract::{CreateMachine, MachineInfo, UpdateMachine},
+    egress::{EgressPolicy, MAX_MACHINE_TUNNEL_FILES},
+    machine::{
+        Activity, BootError, Image, Machine, MachineSpec, MachineUse, kill_stale_firecracker,
+    },
 };
 
 const DEFAULT_VCPUS: u8 = 2;
@@ -20,6 +23,7 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u32 = 600;
 const MAX_VCPUS: u8 = 32;
 const MEMORY_MIB_RANGE: std::ops::RangeInclusive<u32> = 128..=32768;
 const IDLE_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u32> = 1..=86400;
+const OPEN_FILES_OUTSIDE_EGRESS: u64 = 4096;
 
 #[derive(Debug)]
 pub enum MachineError {
@@ -57,6 +61,9 @@ struct State {
 impl Machines {
     pub async fn open(image_dir: PathBuf, state_dir: PathBuf, capacity: usize) -> io::Result<Self> {
         let image = Image::in_dir(&image_dir)?;
+        ensure_open_file_limit(
+            capacity as u64 * MAX_MACHINE_TUNNEL_FILES + OPEN_FILES_OUTSIDE_EGRESS,
+        )?;
         tokio::fs::create_dir_all(&state_dir).await?;
         let state_lock = std::fs::File::create(state_dir.join("machined.lock"))?;
         state_lock.try_lock().map_err(|_| {
@@ -106,17 +113,17 @@ impl Machines {
                 IDLE_TIMEOUT_SECS_RANGE.end()
             )));
         }
+        let spec = MachineSpec {
+            vcpus,
+            memory_mib,
+            idle_timeout_secs,
+            egress: EgressPolicy::parse(&request.allowed_hosts).map_err(MachineError::Invalid)?,
+        };
         let machines = self.clone();
-        run_to_completion(async move { machines.boot(vcpus, memory_mib, idle_timeout_secs).await })
-            .await
+        run_to_completion(async move { machines.boot(spec).await }).await
     }
 
-    async fn boot(
-        self: Arc<Self>,
-        vcpus: u8,
-        memory_mib: u32,
-        idle_timeout_secs: u32,
-    ) -> Result<Arc<Machine>, MachineError> {
+    async fn boot(self: Arc<Self>, spec: MachineSpec) -> Result<Arc<Machine>, MachineError> {
         if self.state.lock().await.shutting_down {
             return Err(MachineError::ShuttingDown);
         }
@@ -130,9 +137,7 @@ impl Machines {
             id.clone(),
             self.machines_dir.join(&id),
             &self.image,
-            vcpus,
-            memory_mib,
-            idle_timeout_secs,
+            spec,
             slot,
         )
         .await
@@ -153,6 +158,15 @@ impl Machines {
             machine.idle_timeout(),
         ));
         Ok(machine)
+    }
+
+    pub async fn update(
+        &self,
+        id: &str,
+        request: UpdateMachine,
+    ) -> Result<Option<MachineInfo>, MachineError> {
+        let egress = EgressPolicy::parse(&request.allowed_hosts).map_err(MachineError::Invalid)?;
+        Ok(self.get(id).await.map(|machine| machine.set_egress(egress)))
     }
 
     pub async fn get(&self, id: &str) -> Option<Arc<Machine>> {
@@ -256,6 +270,28 @@ async fn run_to_completion<T: Send + 'static>(work: impl Future<Output = T> + Se
         Ok(output) => output,
         Err(error) => std::panic::resume_unwind(error.into_panic()),
     }
+}
+
+fn ensure_open_file_limit(required: u64) -> io::Result<()> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let Rlimit { current, maximum } = getrlimit(Resource::Nofile);
+    if current.is_none_or(|current| current >= required) {
+        return Ok(());
+    }
+    if maximum.is_some_and(|maximum| maximum < required) {
+        return Err(io::Error::other(format!(
+            "machined needs {required} open files but the hard limit is {}",
+            maximum.unwrap_or_default()
+        )));
+    }
+    setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(required),
+            maximum,
+        },
+    )?;
+    Ok(())
 }
 
 async fn remove_stale_machines(machines_dir: &std::path::Path) -> io::Result<()> {

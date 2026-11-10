@@ -9,6 +9,7 @@ const machine_info = {
     memory_mib: 256,
     boot_ms: 400,
     idle_timeout_secs: 600,
+    allowed_hosts: [],
 };
 
 const finished = {
@@ -32,6 +33,8 @@ const routes: Record<string, () => Response> = {
     "GET /base/machines/m1/processes/p1/events?cursor=3": () =>
         new Response(`${JSON.stringify(finished)}\n`),
     "GET /base/machines/m1": () => Response.json(machine_info),
+    "PATCH /base/machines/m1": () =>
+        Response.json({ ...machine_info, allowed_hosts: ["pypi.org"] }),
     "DELETE /base/machines/m1": () => new Response(null, { status: 204 }),
 };
 
@@ -57,12 +60,17 @@ Deno.test("a hosted machine addresses its agent under the host's machine path", 
         const process = await machine.startProcess({ program: "/bin/true" });
         assert.deepEqual(await Array.fromAsync(process.events(3)), [finished]);
         assert.deepEqual(await machine.info(), machine_info);
+        assert.deepEqual(
+            (await machine.setAllowedHosts(["pypi.org"])).allowed_hosts,
+            ["pypi.org"],
+        );
         await machine.destroy();
         assert.deepEqual(seen, [
             'POST /base/machines {"vcpus":1,"memory_mib":256}',
             'POST /base/machines/m1/processes {"program":"/bin/true"}',
             "GET /base/machines/m1/processes/p1/events?cursor=3",
             "GET /base/machines/m1",
+            'PATCH /base/machines/m1 {"allowed_hosts":["pypi.org"]}',
             "DELETE /base/machines/m1",
         ]);
     } finally {

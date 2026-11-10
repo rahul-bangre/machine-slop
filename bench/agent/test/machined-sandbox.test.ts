@@ -10,6 +10,7 @@ import { ProviderNotReady, SandboxError } from "../src/sandbox.ts";
 type StubHost = {
     url: string;
     running: Set<string>;
+    create_requests: unknown[];
     destroyed: string[];
     faults: { processes_fail: boolean; output_never_ends: boolean };
     stop(): Promise<void>;
@@ -18,6 +19,7 @@ type StubHost = {
 async function withStubHost(run: (host: StubHost) => Promise<void>) {
     const agentd = await startAgentd("./target/debug/agentd");
     const running = new Set<string>();
+    const create_requests: unknown[] = [];
     const destroyed: string[] = [];
     const faults = { processes_fail: false, output_never_ends: false };
     const hung_outputs: ReadableStreamDefaultController[] = [];
@@ -30,6 +32,7 @@ async function withStubHost(run: (host: StubHost) => Promise<void>) {
             const [root, id, ...rest] = url.pathname.split("/").filter(Boolean);
             if (root !== "machines") return new Response(null, { status: 404 });
             if (!id && request.method === "POST") {
+                create_requests.push(await request.json());
                 const machine = crypto.randomUUID();
                 running.add(machine);
                 return json({
@@ -38,6 +41,7 @@ async function withStubHost(run: (host: StubHost) => Promise<void>) {
                     vcpus: 2,
                     memory_mib: 512,
                     boot_ms: 123,
+                    allowed_hosts: [],
                 });
             }
             if (!id) {
@@ -76,6 +80,7 @@ async function withStubHost(run: (host: StubHost) => Promise<void>) {
         await run({
             url: `http://127.0.0.1:${port}`,
             running,
+            create_requests,
             destroyed,
             faults,
             stop: () => server.shutdown(),
@@ -94,6 +99,7 @@ Deno.test("a machined sandbox runs commands in its own machine, reports the host
 
         const sandbox = await provider.create();
         assert.equal(sandbox.reported_boot_ms, 123);
+        assert.deepEqual(host.create_requests, [{ allowed_hosts: [] }]);
         assert.equal(host.running.size, 1);
         await sandbox.writeFile("nested/note.txt", "hello");
         const read = await sandbox.run("cat nested/note.txt", 10_000);
