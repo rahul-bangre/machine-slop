@@ -143,7 +143,9 @@ and git over SSH.
 The image dir holds `firecracker`, `vmlinux` and `rootfs.ext4`, built by
 `vm/image/build.sh <image dir> <agentd binary>`. The script pins Firecracker and
 the guest kernel by hash and Debian by snapshot date, and rebuilds the root
-filesystem only when its inputs change.
+filesystem only when its inputs change. Building the image on Ubuntu requires
+`mmdebstrap`, `e2fsprogs` and `debian-archive-keyring`; the Debian keyring
+verifies the pinned snapshot.
 
 `machined` holds a lock on its state dir. On start it kills Firecracker
 processes left by an earlier `machined` that died and removes their files. On

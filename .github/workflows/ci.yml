@@ -49,7 +49,7 @@ jobs:
       - name: Install image tools and enable KVM
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mmdebstrap e2fsprogs
+          sudo apt-get install -y --no-install-recommends mmdebstrap e2fsprogs debian-archive-keyring
           test -c /dev/kvm
           sudo usermod -aG kvm "$(id -un)"
           sg kvm -c 'test -r /dev/kvm && test -w /dev/kvm'
