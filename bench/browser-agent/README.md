@@ -1,45 +1,69 @@
 # Browser agent bench
 
-Compare fresh native accessibility queries with Playwright's AI snapshots and
-locators inside the same sandbox. Both support scoped observations, complete
-modal views, batched actions, explicit waits and full fallback. This tests a
-browser runtime policy, not a modified Chromium or a hosting advantage.
+Compares two browser runtimes for a model-driven agent inside the same sandbox:
+fresh native accessibility queries (`native`) and Playwright's AI snapshots and
+locators (`playwright`). Both support scoped observations, complete modal views,
+batched actions, explicit waits and full fallback. This tests a browser runtime
+policy, not a modified Chromium or a hosting advantage.
 
 ```sh
 cargo build -p agentd
 deno task bench:chromium
 deno task test:browser-agent
-deno task bench:browser-agent --rounds=3
+deno task bench:browser-agent
 ```
 
-Uses the local Claude CLI subscription login, with tools disabled. The default
-model is pinned in the run metadata; no model API key is required. Each model
-command is parsed as browser JSON, never executed as shell code.
+| Flag                   | Default                                       |
+| ---------------------- | --------------------------------------------- |
+| `--sandboxes`          | `agentd`; also `machined`, `e2b`, `daytona`   |
+| `--engines`            | `playwright,native`                           |
+| `--tasks`              | `shop-checkout,dashboard-ticket`              |
+| `--rounds`             | `3`                                           |
+| `--model`              | `claude-opus-5-5`                             |
+| `--max-turns`          | `20`                                          |
+| `--agentd-binary`      | `./target/debug/agentd`                       |
+| `--agentd-url`         | none; starts a local `agentd`                 |
+| `--machined-url`       | `http://127.0.0.1:4001`                       |
+| `--e2b-template`       | the record in `bench/env/images/e2b.json`     |
+| `--daytona-snapshot`   | the record in `bench/env/images/daytona.json` |
+| `--browser-executable` | the pinned local Chromium                     |
+| `--deno`               | `deno`                                        |
+| `--out`                | `bench-results/browser-agent-<timestamp>/`    |
 
-Checkout and dashboard are tuning tasks. Select the independently graded pack
-explicitly with
+The model runs through the local `claude` CLI with its subscription login and
+tools disabled; no model API key is needed. Each model command is parsed as
+browser JSON, never executed as shell code.
+
+## Tasks
+
+The default tasks are for tuning. The held-out
+[workflow pack](../browser/README.md#held-out-workflows) is selected explicitly
+with
 `--tasks=invoice-dispute,member-offboarding,expense-claim,room-rebooking,address-change`.
-Rounds rotate seeds and arm order; each pair gets the same seed. Freeze the
-drivers and prompt before held-out evaluation. Do not tune on those results.
+Freeze the drivers and prompt before running it, and do not tune on its results.
+Rounds rotate seeds and engine order, and both engines get the same seed.
 
-For E2B, Daytona or machined, supply `--sandboxes=...`, a prepared environment
-with Deno 2.9.7 and Chromium 157.0.8103.50, and
-`--browser-executable=/guest/path`. `--deno=/guest/path` and
-`--e2b-template=...` select installed runtimes. Pin equal CPU/memory limits for
-cross-provider comparisons. machined requires an exclusive host and destroys
-every machine it finds; its stock image currently has no network or browser
-runtime. Local agentd runs without host resource limits.
+## Sandboxes
 
-E2B and Daytona default to the committed `bench/env/images/` records (2 CPUs, 4
-GiB). Use `--browser-executable=/usr/local/bin/chromium` with those images;
-`--daytona-snapshot=...` selects another prepared snapshot. Both providers allow
-network access for dependency setup; tasks stay on guest loopback.
+Every sandbox other than local `agentd` needs Deno 2.9.7 and Chromium
+157.0.8103.50 installed, and `--browser-executable` set to the guest path.
 
-Raw attempts, observations, CLI transcripts and configuration go to
-`bench-results/`. Failed attempts and cleanup errors remain visible. Success is
-checked from server outcomes, separately from the model's stop reason. Setup,
-model calls, tool transport, action/wait/capture phases, report collection and
-cleanup are recorded separately. Token proxies use `o200k_base`; actual CLI
-usage includes scaffolding and possible side calls. Sampled runtime/browser CPU
-and summed RSS include measurement buffers and are approximate; shared memory is
-counted repeatedly. No billed cost is inferred from these measurements.
+- `e2b` and `daytona` default to the [`bench/env`](../env/README.md) builds,
+  with 2 CPUs and 4 GiB; use `--browser-executable=/usr/local/bin/chromium`.
+  They need `E2B_API_KEY` or `DAYTONA_API_KEY`, and have network access for
+  setup while tasks stay on guest loopback.
+- `machined` needs the host to itself and destroys every machine it finds. Its
+  machines get no network, and the stock image has no browser runtime yet.
+- Local `agentd` runs without resource limits.
+
+## Results
+
+The results directory holds `run.json`, `attempts.jsonl` and CLI transcripts.
+Failed attempts and cleanup errors stay in the record. Success is checked from
+server outcomes, separately from the model's stop reason. Setup, model calls,
+tool transport, action, wait and capture phases, report collection and cleanup
+are timed separately.
+
+Token proxies use `o200k_base`; actual CLI usage adds scaffolding and possible
+side calls. CPU and summed RSS are sampled, include measurement buffers, and
+count shared memory repeatedly. No billed cost is inferred.

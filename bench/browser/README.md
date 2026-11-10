@@ -1,4 +1,4 @@
-# browser-bench
+# Browser bench
 
 Measures what a browser costs an agent, so a candidate browser or observation
 path can be judged against unmodified headless Chromium.
@@ -10,7 +10,22 @@ deno task bench --arms stock-ax,stock-html --rounds 10 --tasks shop-checkout
 deno task bench --live
 ```
 
-Results land in `bench-results/<timestamp>/`:
+`bench:chromium` downloads the pinned Chromium for `darwin-aarch64` or
+`linux-x86_64`.
+
+| Flag                | Default                                                                             |
+| ------------------- | ----------------------------------------------------------------------------------- |
+| `--config`          | `bench.json`                                                                        |
+| `--arms`            | every arm in the config                                                             |
+| `--tasks`           | `shop-checkout`, `docs-lookup`, `dashboard-ticket`                                  |
+| `--live`            | off; adds `live-wikipedia-search`, `live-hacker-news-paging`, `live-mdn-navigation` |
+| `--rounds`          | `5`                                                                                 |
+| `--retries`         | `1`                                                                                 |
+| `--think-ms`        | `500`                                                                               |
+| `--step-timeout-ms` | `20000`                                                                             |
+| `--out`             | `bench-results/<timestamp>/`                                                        |
+
+The results directory holds:
 
 - `run.json`: host, pinned conditions, arms, observation format and tokenizer
 - `attempts.jsonl`: one record per attempt, failed attempts and retries included
@@ -23,9 +38,11 @@ An arm is a browser plus an observation format. Each attempt uses one arm in a
 fresh browser with a fresh profile, because some formats change what the browser
 does for the rest of the session.
 
-Arms and browsers are declared in `bench.json`. A candidate browser is another
-entry under `browsers` with its own `executable`, `product` and `args`. A
-candidate observation path is another entry in `src/observers.ts`.
+Arms and browsers are declared in `bench.json`: `stock-ax`, `stock-ax-diff`,
+`stock-html` and `stock-screenshot` pair stock Chromium with each observer in
+`src/observers.ts`. A candidate browser is another entry under `browsers` with
+its own `executable`, `product` and `args`. A candidate observation path is
+another entry in `src/observers.ts`.
 
 ## What is pinned
 
