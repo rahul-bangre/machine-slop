@@ -19,7 +19,8 @@ use tokio::{
 use crate::{
     egress::{self, EGRESS_PORT, EgressPolicy},
     files::{self, link_immutable},
-    machines::{Admission, MACHINE_OVERHEAD_MIB},
+    machines::{Admission, MACHINE_OVERHEAD_MIB, lock},
+    tenants::TenantCharge,
 };
 
 pub const AGENTD_PORT: u32 = 3000;
@@ -113,6 +114,7 @@ pub(crate) struct Launch<'a> {
 #[derive(Clone)]
 pub struct Vm {
     root: PathBuf,
+    admission: Arc<std::sync::Mutex<Option<Admission>>>,
     exit: watch::Receiver<Option<String>>,
     kill: Arc<Notify>,
 }
@@ -191,6 +193,8 @@ impl Vm {
             .kill_on_drop(true)
             .spawn()?;
         let vm_dir = dir.to_owned();
+        let admission = Arc::new(std::sync::Mutex::new(Some(admission)));
+        let held_until_exit = admission.clone();
         let (exit_sender, exit) = watch::channel(None);
         let kill = Arc::new(Notify::new());
         let kill_requested = kill.clone();
@@ -216,7 +220,7 @@ impl Vm {
             if let Err(error) = dismantled {
                 tracing::error!(%error, "machine jail was not removed");
             }
-            drop(admission);
+            drop(lock(&held_until_exit).take());
             exit_sender.send_replace(Some(message));
         });
         let mut exited = exit.clone();
@@ -226,7 +230,22 @@ impl Vm {
                 _ = exited.wait_for(Option::is_some) => {}
             }
         });
-        Ok(Self { root, exit, kill })
+        Ok(Self {
+            root,
+            admission,
+            exit,
+            kill,
+        })
+    }
+
+    pub(crate) fn charge(&self, charge: TenantCharge) -> Result<(), TenantCharge> {
+        match &mut *lock(&self.admission) {
+            Some(admission) => {
+                admission.charge(charge);
+                Ok(())
+            }
+            None => Err(charge),
+        }
     }
 
     pub fn exited(&self) -> Option<String> {

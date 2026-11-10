@@ -17,11 +17,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
     let mut args = std::env::args().skip(1);
-    let (Some(address), Some(image_dir), Some(state_dir), None) =
-        (args.next(), args.next(), args.next(), args.next())
-    else {
-        return Err("usage: machined <listen address> <image dir> <state dir>".into());
+    let (Some(address), Some(image_dir), Some(state_dir), Some(tenants_file), None) = (
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+    ) else {
+        return Err(
+            "usage: machined <listen address> <image dir> <state dir> <tenants file>".into(),
+        );
     };
+    let (tenants, keys) = machined::parse_tenants(&std::fs::read_to_string(&tenants_file)?)?;
     let default_budget = default_memory_budget_mib()?;
     let limits = Limits {
         running_vms: MAX_RUNNING_VMS,
@@ -37,10 +44,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         first_jail_uid = limits.first_jail_uid,
         "admission limits"
     );
-    let machines =
-        Machines::open(PathBuf::from(image_dir), PathBuf::from(state_dir), limits).await?;
+    tracing::info!(tenants = tenants.len(), "tenants configured");
+    let machines = Machines::open(
+        PathBuf::from(image_dir),
+        PathBuf::from(state_dir),
+        limits,
+        tenants,
+    )
+    .await?;
     let listener = TcpListener::bind(&address).await?;
-    let app = machined::app(machines.clone());
+    let app = machined::app(Arc::new(machined::Host {
+        machines: machines.clone(),
+        keys,
+    }));
 
     tracing::info!(address = %format!("http://{}", listener.local_addr()?), "machined listening");
     axum::serve(listener, app)

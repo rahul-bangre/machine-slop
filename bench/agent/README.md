@@ -29,6 +29,8 @@ deno task bench:agent --agentd-url http://127.0.0.1:3001
 | `--e2b-template`       | `base`                             |
 | `--out`                | `bench-results/agent-<timestamp>/` |
 
+The `machined` provider sends `SLOP_API_KEY` as its API key.
+
 The results directory holds:
 
 - `run.json`: the model settings, sandboxes, limits and tasks

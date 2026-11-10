@@ -1,6 +1,7 @@
 import { parseArgs } from "node:util";
 import {
     agentdProvider,
+    machinedApiKey,
     machinedProvider,
 } from "../../agent/src/agentd-sandbox.ts";
 import { claudeCliModel } from "../../agent/src/claude-cli-model.ts";
@@ -55,7 +56,7 @@ function provider(name: string): SandboxProvider {
                     : { binary: flags["agentd-binary"] },
             );
         case "machined":
-            return machinedProvider(flags["machined-url"], {
+            return machinedProvider(flags["machined-url"], machinedApiKey(), {
                 ...sandbox_resources,
                 allowed_hosts: [dependency_registry],
             });

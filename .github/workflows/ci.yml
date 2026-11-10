@@ -46,13 +46,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         run: rustup show active-toolchain
-      - name: Install image tools and enable KVM
+      - name: Install image tools and check KVM
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mmdebstrap e2fsprogs debian-archive-keyring
           test -c /dev/kvm
-          sudo usermod -aG kvm "$(id -un)"
-          sg kvm -c 'test -r /dev/kvm && test -w /dev/kvm'
       - uses: actions/cache@v4
         with:
           path: ~/.cache/machine-slop
@@ -63,4 +61,7 @@ jobs:
       - name: Run live machine contracts
         env:
           SLOP_IMAGE_DIR: ${{ runner.temp }}/image
-        run: sg kvm -c 'cargo test --locked -p machined --test machines -- --ignored --test-threads=1'
+        run: >-
+          cargo test --locked -p machined --test machines
+          --config 'target."cfg(all())".runner = ["sudo", "--preserve-env=SLOP_IMAGE_DIR"]'
+          -- --ignored --test-threads=1

@@ -1,4 +1,4 @@
-import { request } from "./http.ts";
+import { type Endpoint, request } from "./http.ts";
 import type {
     ProcessEvent,
     ProcessInfo,
@@ -16,23 +16,23 @@ export class OutputGap extends Error {
 }
 
 export class Process {
-    constructor(private readonly url: URL, readonly id: string) {}
+    constructor(private readonly endpoint: Endpoint, readonly id: string) {}
 
     async info(signal?: AbortSignal): Promise<ProcessInfo> {
-        return (await request(this.url, this.path(), {
+        return (await request(this.endpoint, this.path(), {
             signal: signal ?? null,
         }))
             .json();
     }
 
     async wait(signal?: AbortSignal): Promise<ProcessResult> {
-        return (await request(this.url, `${this.path()}/wait`, {
+        return (await request(this.endpoint, `${this.path()}/wait`, {
             signal: signal ?? null,
         })).json();
     }
 
     async kill(signal?: AbortSignal): Promise<void> {
-        await request(this.url, `${this.path()}/kill`, {
+        await request(this.endpoint, `${this.path()}/kill`, {
             method: "POST",
             signal: signal ?? null,
         });
@@ -59,7 +59,7 @@ export class Process {
     }
 
     async resize(size: TerminalSize, signal?: AbortSignal): Promise<void> {
-        await request(this.url, `${this.path()}/terminal`, {
+        await request(this.endpoint, `${this.path()}/terminal`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(size),
@@ -72,7 +72,7 @@ export class Process {
         signal?: AbortSignal,
     ): AsyncGenerator<OutputEvent> {
         const response = await request(
-            this.url,
+            this.endpoint,
             `${this.path()}/events?cursor=${cursor}`,
             { signal: signal ?? null },
         );
@@ -92,7 +92,7 @@ export class Process {
         body: Uint8Array<ArrayBuffer>,
         signal?: AbortSignal,
     ): Promise<void> {
-        await request(this.url, `${this.path()}/stdin?${query}`, {
+        await request(this.endpoint, `${this.path()}/stdin?${query}`, {
             method: "POST",
             headers: { "content-type": "application/octet-stream" },
             body,

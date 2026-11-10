@@ -21,7 +21,8 @@ use crate::{
     egress::EgressPolicy,
     files,
     firecracker::{FIRECRACKER, Jail, Launch, ROOTFS, SAVED_STATE, SCRATCH, Vm},
-    machines::{Admission, MachineError},
+    machines::{Admission, MachineError, lock},
+    tenants::{Held, Idempotency, Storage, Tenant, TenantCharge, Tenants},
 };
 
 const SCRATCH_BYTES: u64 = 8 << 30;
@@ -241,9 +242,14 @@ impl Booted {
         self.vm.exited().is_none()
     }
 
-    pub async fn record(
+    pub(crate) fn charge(&self, charge: TenantCharge) -> Result<(), TenantCharge> {
+        self.vm.charge(charge)
+    }
+
+    pub(crate) async fn record(
         self,
         request_started: Instant,
+        ownership: Ownership,
         idle_timeout_secs: u32,
         egress: EgressPolicy,
     ) -> Result<Machine, BootError> {
@@ -251,6 +257,9 @@ impl Booted {
         let machine = Machine {
             id: self.id,
             dir: self.dir,
+            tenant: ownership.tenant,
+            idempotency: ownership.idempotency,
+            storage: std::sync::Mutex::new(Some(Tenant::store_unmetered(ownership.disk))),
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
             boot_ms: request_started
@@ -280,8 +289,21 @@ impl Booted {
     }
 }
 
+pub(crate) struct Ownership {
+    pub tenant: Arc<Tenant>,
+    pub idempotency: Option<Idempotency>,
+    pub disk: Held,
+}
+
+pub(crate) fn provisioned_disk_mib(memory_mib: u32) -> u64 {
+    (SCRATCH_BYTES >> 20) + u64::from(memory_mib)
+}
+
 #[derive(Deserialize, Serialize)]
 struct Record {
+    tenant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idempotency: Option<Idempotency>,
     vcpus: u8,
     memory_mib: u32,
     boot_ms: u64,
@@ -334,6 +356,9 @@ impl Drop for MachineUse {
 pub struct Machine {
     id: String,
     dir: PathBuf,
+    tenant: Arc<Tenant>,
+    idempotency: Option<Idempotency>,
+    storage: std::sync::Mutex<Option<Storage>>,
     vcpus: u8,
     memory_mib: u32,
     boot_ms: u64,
@@ -345,19 +370,28 @@ pub struct Machine {
 }
 
 impl Machine {
-    pub async fn recover(id: String, dir: PathBuf) -> io::Result<Option<Self>> {
+    pub(crate) async fn recover(
+        id: String,
+        dir: PathBuf,
+        tenants: &Tenants,
+    ) -> io::Result<Option<Self>> {
         if !tokio::fs::try_exists(dir.join(RECORD)).await? {
             tokio::fs::remove_dir_all(&dir).await?;
             return Ok(None);
         }
         let record: Record = files::read_record(&dir, RECORD).await?;
         let egress = EgressPolicy::parse(&record.allowed_hosts).map_err(io::Error::other)?;
+        let tenant = tenants.owner(&record.tenant);
+        let disk = tenant.keep_disk(provisioned_disk_mib(record.memory_mib));
         for stale in [CHECKPOINT_STAGING, CHECKPOINT_WITHDRAWN, CHECKPOINT_RETIRED] {
             files::remove_dir_if_present(&dir.join(stale)).await?;
         }
         let machine = Self {
             id,
             dir,
+            storage: std::sync::Mutex::new(Some(Tenant::store_unmetered(disk))),
+            tenant,
+            idempotency: record.idempotency,
             vcpus: record.vcpus,
             memory_mib: record.memory_mib,
             boot_ms: record.boot_ms,
@@ -383,6 +417,18 @@ impl Machine {
         &self.id
     }
 
+    pub fn tenant(&self) -> &Arc<Tenant> {
+        &self.tenant
+    }
+
+    pub(crate) fn belongs_to(&self, tenant: &Tenant) -> bool {
+        self.tenant.id() == tenant.id()
+    }
+
+    pub(crate) fn idempotency(&self) -> Option<&Idempotency> {
+        self.idempotency.as_ref()
+    }
+
     pub fn info(&self) -> MachineInfo {
         MachineInfo {
             id: self.id.clone(),
@@ -397,6 +443,8 @@ impl Machine {
 
     fn record(&self) -> Record {
         Record {
+            tenant: self.tenant.id().to_owned(),
+            idempotency: self.idempotency.clone(),
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
             boot_ms: self.boot_ms,
@@ -717,6 +765,9 @@ impl Exclusive<'_> {
             vm.kill().await;
         }
         let discarded = files::discard(&self.dir, RECORD).await;
+        if discarded.is_ok() {
+            drop(lock(&self.storage).take());
+        }
         if let Err(error) = &discarded {
             let still_recorded = tokio::fs::try_exists(self.dir.join(RECORD)).await;
             self.set(if was_paused && matches!(still_recorded, Ok(true)) {

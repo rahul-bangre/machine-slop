@@ -67,7 +67,7 @@ Deno.test("a machined host that already runs machines is refused before any mach
         host.running.add("someone-elses-machine");
 
         await assert.rejects(
-            machinedSandboxes(host.url, resources),
+            machinedSandboxes(host.url, "test-key", resources),
             ProviderNotReady,
         );
         assert.deepEqual(host.create_requests, []);
@@ -80,14 +80,18 @@ Deno.test("an unreachable machined is reported as not ready", async () => {
     listener.close();
 
     await assert.rejects(
-        machinedSandboxes(`http://127.0.0.1:${port}`, resources),
+        machinedSandboxes(`http://127.0.0.1:${port}`, "test-key", resources),
         ProviderNotReady,
     );
 });
 
 Deno.test("a smoke machine has the pinned resources, no network, and an idle expiry", () =>
     withStubHost(async (host) => {
-        const sandboxes = await machinedSandboxes(host.url, resources);
+        const sandboxes = await machinedSandboxes(
+            host.url,
+            "test-key",
+            resources,
+        );
 
         const guest = await sandboxes.start({ "env-smoke-run": "run-1" });
 
@@ -105,7 +109,11 @@ Deno.test("a smoke machine has the pinned resources, no network, and an idle exp
 
 Deno.test("a machine that is already gone counts as destroyed, and any other refusal does not", () =>
     withStubHost(async (host) => {
-        const sandboxes = await machinedSandboxes(host.url, resources);
+        const sandboxes = await machinedSandboxes(
+            host.url,
+            "test-key",
+            resources,
+        );
 
         host.destroy_status = 404;
         await sandboxes.destroy("expired-machine");

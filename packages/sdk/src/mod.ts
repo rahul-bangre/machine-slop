@@ -1,6 +1,7 @@
 export { Machine } from "./machine.ts";
 export type { FileData, WriteFileOptions } from "./machine.ts";
 export { Host, HostedMachine } from "./host.ts";
+export type { HostOptions } from "./host.ts";
 export { HttpError } from "./http.ts";
 export { OutputGap, Process } from "./process.ts";
 export type { OutputEvent } from "./process.ts";
@@ -20,6 +21,8 @@ export type {
     CreateSnapshot,
     MachineInfo,
     MachineState,
+    Quotas,
     SnapshotInfo,
+    TenantUsage,
     UpdateMachine,
 } from "./machines.gen.ts";

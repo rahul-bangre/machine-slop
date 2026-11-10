@@ -1,5 +1,5 @@
 import { Forward } from "./forward.ts";
-import { request } from "./http.ts";
+import { type Endpoint, request } from "./http.ts";
 import { Process } from "./process.ts";
 import type { ProcessInfo, StartProcess } from "./process.gen.ts";
 import { openTunnel, type Tunnel } from "./tunnel.ts";
@@ -13,14 +13,16 @@ export type FileData =
 export type WriteFileOptions = { mode?: number; signal?: AbortSignal };
 
 export class Machine {
-    private readonly url: URL;
+    private readonly endpoint: Endpoint;
 
-    constructor(url: string | URL) {
-        this.url = new URL(url);
+    constructor(url: string | URL, headers: Record<string, string> = {}) {
+        this.endpoint = { url: new URL(url), headers };
     }
 
     async health(signal?: AbortSignal): Promise<string> {
-        return (await request(this.url, "/health", { signal: signal ?? null }))
+        return (await request(this.endpoint, "/health", {
+            signal: signal ?? null,
+        }))
             .text();
     }
 
@@ -28,7 +30,7 @@ export class Machine {
         command: StartProcess,
         signal?: AbortSignal,
     ): Promise<Process> {
-        const response = await request(this.url, "/processes", {
+        const response = await request(this.endpoint, "/processes", {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(command),
@@ -39,16 +41,20 @@ export class Machine {
     }
 
     process(id: string): Process {
-        return new Process(this.url, id);
+        return new Process(this.endpoint, id);
     }
 
     async readFile(
         path: string,
         signal?: AbortSignal,
     ): Promise<Uint8Array<ArrayBuffer>> {
-        const response = await request(this.url, machinePath("files", path), {
-            signal: signal ?? null,
-        });
+        const response = await request(
+            this.endpoint,
+            machinePath("files", path),
+            {
+                signal: signal ?? null,
+            },
+        );
         return new Uint8Array(await response.arrayBuffer());
     }
 
@@ -60,7 +66,7 @@ export class Machine {
         const mode = options.mode === undefined
             ? ""
             : `?mode=${options.mode.toString(8)}`;
-        await request(this.url, `${machinePath("files", path)}${mode}`, {
+        await request(this.endpoint, `${machinePath("files", path)}${mode}`, {
             method: "PUT",
             headers: { "content-type": "application/octet-stream" },
             body: data,
@@ -69,7 +75,7 @@ export class Machine {
     }
 
     async remove(path: string, signal?: AbortSignal): Promise<void> {
-        await request(this.url, machinePath("files", path), {
+        await request(this.endpoint, machinePath("files", path), {
             method: "DELETE",
             signal: signal ?? null,
         });
@@ -80,7 +86,7 @@ export class Machine {
         signal?: AbortSignal,
     ): Promise<ReadableStream<Uint8Array<ArrayBuffer>>> {
         const response = await request(
-            this.url,
+            this.endpoint,
             machinePath("archives", directory),
             { signal: signal ?? null },
         );
@@ -93,7 +99,7 @@ export class Machine {
         archive: Exclude<FileData, string>,
         signal?: AbortSignal,
     ): Promise<void> {
-        await request(this.url, machinePath("archives", directory), {
+        await request(this.endpoint, machinePath("archives", directory), {
             method: "PUT",
             headers: { "content-type": "application/x-tar" },
             body: archive,
@@ -102,7 +108,7 @@ export class Machine {
     }
 
     connect(port: number, signal?: AbortSignal): Promise<Tunnel> {
-        return openTunnel(this.url, port, signal);
+        return openTunnel(this.endpoint, port, signal);
     }
 
     forward(port: number, local_port = 0): Forward {
@@ -110,7 +116,7 @@ export class Machine {
             hostname: "127.0.0.1",
             port: local_port,
         });
-        return new Forward(listener, this.url, port);
+        return new Forward(listener, this.endpoint, port);
     }
 }
 
