@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Accounts dashboard</title>
+    <style>
+    :root {
+      font-family: system-ui, sans-serif;
+      color: #17202a;
+    }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #eef1f5;
+    }
+    .summary {
+      display: flex;
+      gap: 24px;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+    canvas {
+      background: #fff;
+      border: 1px solid #ccd;
+      border-radius: 6px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+    }
+    th,
+    td {
+      padding: 8px 12px;
+      border-bottom: 1px solid #e3e6ea;
+      text-align: left;
+    }
+    th {
+      cursor: pointer;
+      user-select: none;
+      position: sticky;
+      top: 0;
+      background: #fff;
+    }
+    tbody tr {
+      cursor: pointer;
+    }
+    tbody tr:hover {
+      background: #f3f7ff;
+    }
+    .pager {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-top: 12px;
+    }
+    dialog {
+      width: 460px;
+      border: 1px solid #bbb;
+      border-radius: 8px;
+    }
+    textarea {
+      width: 100%;
+      height: 80px;
+      box-sizing: border-box;
+    }
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid #88a;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      display: inline-block;
+    }
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+    </style>
+  </head>
+  <body>
+    <h1>Accounts</h1>
+    <div class="summary">
+      <status-pill></status-pill>
+      <span class="spinner" aria-hidden="true"></span>
+      <span>Events processed: <output id="events">0</output></span>
+      <canvas id="throughput" width="320" height="60"
+        aria-label="Throughput chart"></canvas>
+    </div>
+    <table id="accounts">
+      <thead>
+        <tr>
+          <th data-key="name" scope="col" aria-sort="none">Account</th>
+          <th data-key="region" scope="col" aria-sort="none">Region</th>
+          <th data-key="seats" scope="col" aria-sort="none">Seats</th>
+          <th data-key="revenue" scope="col" aria-sort="none">Revenue</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="pager">
+      <button id="previous" type="button">Previous</button>
+      <span id="page-label"></span>
+      <button id="next" type="button">Next</button>
+    </div>
+    <dialog id="detail" aria-labelledby="detail-name">
+      <h2 id="detail-name"></h2>
+      <p id="detail-facts"></p>
+      <form id="ticket-form">
+        <h3>File ticket</h3>
+        <label>Note <textarea id="note" required></textarea></label>
+        <button id="submit-ticket" type="submit">Submit ticket</button>
+      </form>
+      <p id="ticket-status" role="status"></p>
+    </dialog>
+    <script>
+    customElements.define(
+      "status-pill",
+      class extends HTMLElement {
+        connectedCallback() {
+          const root = this.attachShadow({ mode: "open" });
+          root.innerHTML =
+            `<span role="status" style="padding:4px 10px;border-radius:12px;background:#d6f5dd">Live</span>`;
+        }
+      },
+    );
+
+    const page_size = 50;
+    const body = document.querySelector("#accounts tbody");
+    const state = {
+      rows: [],
+      sort_key: null,
+      descending: false,
+      page: 0,
+      selected: null,
+    };
+
+    function render() {
+      const start = state.page * page_size;
+      body.replaceChildren(
+        ...state.rows.slice(start, start + page_size).map((account) => {
+          const row = document.createElement("tr");
+          for (
+            const value of [
+              account.name,
+              account.region,
+              account.seats,
+              `$${account.revenue.toLocaleString("en-US")}`,
+            ]
+          ) {
+            const cell = document.createElement("td");
+            cell.textContent = value;
+            row.append(cell);
+          }
+          row.addEventListener("click", () => openDetail(account));
+          return row;
+        }),
+      );
+      document.querySelector("#page-label").textContent = `Page ${
+        state.page + 1
+      } of ${Math.ceil(state.rows.length / page_size)}`;
+      for (const header of document.querySelectorAll("th")) {
+        const active = header.dataset.key === state.sort_key;
+        header.setAttribute(
+          "aria-sort",
+          !active ? "none" : state.descending ? "descending" : "ascending",
+        );
+      }
+    }
+
+    function openDetail(account) {
+      state.selected = account;
+      document.querySelector("#detail-name").textContent = account.name;
+      document.querySelector("#detail-facts").textContent =
+        `${account.region} · ${account.seats} seats · $${
+          account.revenue.toLocaleString("en-US")
+        } revenue`;
+      document.querySelector("#detail").showModal();
+    }
+
+    for (const header of document.querySelectorAll("th")) {
+      header.addEventListener("click", () => {
+        const key = header.dataset.key;
+        state.descending = state.sort_key === key ? !state.descending : true;
+        state.sort_key = key;
+        state.page = 0;
+        state.rows.sort((left, right) => {
+          const order = left[key] < right[key]
+            ? -1
+            : left[key] > right[key]
+            ? 1
+            : 0;
+          return state.descending ? -order : order;
+        });
+        render();
+      });
+    }
+    document.querySelector("#previous").addEventListener("click", () => {
+      state.page = Math.max(0, state.page - 1);
+      render();
+    });
+    document.querySelector("#next").addEventListener("click", () => {
+      state.page = Math.min(
+        Math.ceil(state.rows.length / page_size) - 1,
+        state.page + 1,
+      );
+      render();
+    });
+    document.querySelector("#ticket-form").addEventListener(
+      "submit",
+      async (event) => {
+        event.preventDefault();
+        const response = await fetch("/api/tickets", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            account_id: state.selected.id,
+            note: document.querySelector("#note").value,
+          }),
+        });
+        const { ticket_id } = await response.json();
+        document.querySelector("#ticket-status").textContent =
+          `Ticket ${ticket_id} filed for ${state.selected.name}`;
+      },
+    );
+
+    let events = 0;
+    setInterval(() => {
+      events += 17;
+      document.querySelector("#events").textContent = events;
+    }, 100);
+
+    const canvas = document.querySelector("#throughput");
+    const context = canvas.getContext("2d");
+    function draw(time) {
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.beginPath();
+      for (let x = 0; x <= canvas.width; x += 4) {
+        const y = 30 + 20 * Math.sin(x / 24 + time / 400) * Math.cos(x / 61);
+        if (x === 0) context.moveTo(x, y);
+        else context.lineTo(x, y);
+      }
+      context.strokeStyle = "#3566d6";
+      context.stroke();
+      requestAnimationFrame(draw);
+    }
+    requestAnimationFrame(draw);
+
+    fetch("/api/accounts").then((response) => response.json()).then((rows) => {
+      state.rows = rows;
+      render();
+    });
+    </script>
+  </body>
+</html>

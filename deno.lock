@@ -1,0 +1,20 @@
+{
+  "version": "5",
+  "specifiers": {
+    "npm:gpt-tokenizer@4.1.0": "4.1.0"
+  },
+  "npm": {
+    "gpt-tokenizer@4.1.0": {
+      "integrity": "sha512-r7Op7S3iPy9vGpcfHmfIlLN/+/mNL2kXDy3N/ppp2xC2pm57pyYTt3fqsncMZ/yfIT+d3mTGhd7H6fcF/qiqWg=="
+    }
+  },
+  "workspace": {
+    "members": {
+      "bench/browser": {
+        "dependencies": [
+          "npm:gpt-tokenizer@4.1.0"
+        ]
+      }
+    }
+  }
+}

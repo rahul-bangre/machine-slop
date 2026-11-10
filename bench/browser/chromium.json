@@ -1,0 +1,16 @@
+{
+  "version": "157.0.8103.50",
+  "product": "Chrome/157.0.8103.50",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.50/mac-arm64/chrome-mac-arm64.zip",
+      "sha256": "aceb0578a1cc3631358b164dbbef04bf8936f96c690fb78c3ac25b7655e795e8",
+      "executable": "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+    },
+    "linux-x86_64": {
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.50/linux64/chrome-linux64.zip",
+      "sha256": "d17167bc092eb495a3b768c7467f27e35f625aa03834233a1663af67dcb668c9",
+      "executable": "chrome-linux64/chrome"
+    }
+  }
+}
