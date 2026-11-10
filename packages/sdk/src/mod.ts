@@ -7,6 +7,7 @@ export type { OutputEvent } from "./process.ts";
 export { tar } from "./archive.ts";
 export type { ArchiveFile } from "./archive.ts";
 export { Forward } from "./forward.ts";
+export { connectPreview } from "./tunnel.ts";
 export type { Tunnel } from "./tunnel.ts";
 export type {
     ProcessInfo,
@@ -17,9 +18,12 @@ export type {
 } from "./process.gen.ts";
 export type {
     CreateMachine,
+    CreatePreview,
     CreateSnapshot,
+    EgressCredential,
     MachineInfo,
     MachineState,
+    PreviewInfo,
     SnapshotInfo,
     UpdateMachine,
 } from "./machines.gen.ts";

@@ -2,8 +2,11 @@ import { request } from "./http.ts";
 import { Machine } from "./machine.ts";
 import type {
     CreateMachine,
+    CreatePreview,
     CreateSnapshot,
+    EgressCredential,
     MachineInfo,
+    PreviewInfo,
     SnapshotInfo,
     UpdateMachine,
 } from "./machines.gen.ts";
@@ -19,11 +22,42 @@ export class HostedMachine extends Machine {
         })).json();
     }
 
-    async setAllowedHosts(
+    setAllowedHosts(
         allowed_hosts: string[],
         signal?: AbortSignal,
     ): Promise<MachineInfo> {
-        const update: UpdateMachine = { allowed_hosts };
+        return this.update({ allowed_hosts }, signal);
+    }
+
+    setEgressCredentials(
+        egress_credentials: EgressCredential[],
+        signal?: AbortSignal,
+    ): Promise<MachineInfo> {
+        return this.update({ egress_credentials }, signal);
+    }
+
+    async preview(
+        port: number,
+        options: { ttl_secs?: number } = {},
+        signal?: AbortSignal,
+    ): Promise<PreviewInfo> {
+        const preview: CreatePreview = {
+            machine_id: this.id,
+            port,
+            ...options,
+        };
+        return (await request(this.host, "/previews", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(preview),
+            signal: signal ?? null,
+        })).json();
+    }
+
+    private async update(
+        update: UpdateMachine,
+        signal?: AbortSignal,
+    ): Promise<MachineInfo> {
         return (await request(this.host, `/machines/${this.id}`, {
             method: "PATCH",
             headers: { "content-type": "application/json" },
@@ -121,6 +155,19 @@ export class Host {
 
     async deleteSnapshot(id: string, signal?: AbortSignal): Promise<void> {
         await request(this.url, `/snapshots/${id}`, {
+            method: "DELETE",
+            signal: signal ?? null,
+        });
+    }
+
+    async previews(signal?: AbortSignal): Promise<PreviewInfo[]> {
+        return (await request(this.url, "/previews", {
+            signal: signal ?? null,
+        })).json();
+    }
+
+    async deletePreview(id: string, signal?: AbortSignal): Promise<void> {
+        await request(this.url, `/previews/${id}`, {
             method: "DELETE",
             signal: signal ?? null,
         });

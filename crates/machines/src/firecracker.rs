@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use crate::{
-    egress::{self, EGRESS_PORT, EgressPolicy},
+    egress::{self, DNS_PORT, EGRESS_PORT, EgressRoute},
     machines::Admission,
 };
 
@@ -32,11 +32,7 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn boot(
-        dir: &Path,
-        admission: Admission,
-        egress: watch::Receiver<EgressPolicy>,
-    ) -> io::Result<Self> {
+    pub fn boot(dir: &Path, admission: Admission, egress: EgressRoute) -> io::Result<Self> {
         let console = std::fs::File::create(dir.join("console.log"))?;
         Self::spawn(
             dir,
@@ -47,12 +43,13 @@ impl Vm {
         )
     }
 
-    pub fn unconfigured(
-        dir: &Path,
-        admission: Admission,
-        egress: watch::Receiver<EgressPolicy>,
-    ) -> io::Result<Self> {
-        for socket in ["api.sock", "vsock.sock", &egress_socket_name()] {
+    pub fn unconfigured(dir: &Path, admission: Admission, egress: EgressRoute) -> io::Result<Self> {
+        for socket in [
+            "api.sock",
+            "vsock.sock",
+            &host_socket_name(EGRESS_PORT),
+            &host_socket_name(DNS_PORT),
+        ] {
             crate::files::remove_if_present(std::fs::remove_file(dir.join(socket)))?;
         }
         let console = std::fs::File::options()
@@ -67,9 +64,10 @@ impl Vm {
         console: std::fs::File,
         args: &[&str],
         admission: Admission,
-        egress: watch::Receiver<EgressPolicy>,
+        egress: EgressRoute,
     ) -> io::Result<Self> {
-        let egress_listener = UnixListener::bind(dir.join(egress_socket_name()))?;
+        let egress_listener = UnixListener::bind(dir.join(host_socket_name(EGRESS_PORT)))?;
+        let dns_listener = UnixListener::bind(dir.join(host_socket_name(DNS_PORT)))?;
         let mut child = Command::new(dir.join("firecracker"))
             .args(["--api-sock", "api.sock"])
             .args(args)
@@ -102,7 +100,7 @@ impl Vm {
         let mut exited = exit.clone();
         tokio::spawn(async move {
             tokio::select! {
-                () = egress::serve(egress_listener, egress) => {}
+                () = egress::serve(egress_listener, dns_listener, egress.policy, egress.gateway) => {}
                 _ = exited.wait_for(Option::is_some) => {}
             }
         });
@@ -232,8 +230,8 @@ impl Vm {
     }
 }
 
-fn egress_socket_name() -> String {
-    format!("vsock.sock_{EGRESS_PORT}")
+fn host_socket_name(port: u32) -> String {
+    format!("vsock.sock_{port}")
 }
 
 pub async fn connect_vsock(path: &Path, port: u32) -> io::Result<UnixStream> {

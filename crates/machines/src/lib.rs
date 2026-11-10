@@ -1,14 +1,21 @@
+mod client_hello;
 mod contract;
+mod dns;
 mod egress;
 mod files;
 mod firecracker;
+mod gateway;
 mod machine;
 mod machines;
+mod previews;
 
 pub use contract::{
-    CreateMachine, CreateSnapshot, MachineInfo, MachineState, SnapshotInfo, UpdateMachine,
+    CreateMachine, CreatePreview, CreateSnapshot, EgressCredential, MachineInfo, MachineState,
+    PreviewInfo, SnapshotInfo, UpdateMachine,
 };
-pub use egress::{EgressPolicy, serve as serve_egress};
+pub use egress::{CERTIFICATE_AUTHORITY_PATH, EgressPolicy, serve as serve_egress};
 pub use firecracker::{AGENTD_PORT, connect_vsock};
+pub use gateway::Gateway;
 pub use machine::{BootError, Machine, MachineUse};
-pub use machines::{Limits, MachineError, Machines, default_memory_budget_mib};
+pub use machines::{Limits, MachineError, Machines, Network, default_memory_budget_mib};
+pub use previews::{PreviewOrigin, PreviewUse};

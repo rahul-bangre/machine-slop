@@ -1,3 +1,5 @@
+mod preview;
+
 use std::sync::Arc;
 
 use axum::{
@@ -8,13 +10,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
+use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use slop_machines::{
-    CreateMachine, CreateSnapshot, MachineError, MachineInfo, MachineState, Machines, SnapshotInfo,
-    UpdateMachine,
+    CreateMachine, CreatePreview, CreateSnapshot, Machine, MachineError, MachineInfo, MachineState,
+    Machines, PreviewInfo, SnapshotInfo, UpdateMachine,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+pub use preview::preview_app;
 
 pub fn app(machines: Arc<Machines>) -> Router {
     Router::new()
@@ -31,6 +36,8 @@ pub fn app(machines: Arc<Machines>) -> Router {
             "/snapshots/{id}",
             get(snapshot_info).delete(delete_snapshot),
         )
+        .route("/previews", get(list_previews).post(create_preview))
+        .route("/previews/{id}", get(preview_info).delete(delete_preview))
         .with_state(machines)
 }
 
@@ -150,6 +157,35 @@ async fn delete_snapshot(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn create_preview(
+    State(machines): State<Arc<Machines>>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<PreviewInfo>), ApiError> {
+    let request: CreatePreview = json_body(&body)?;
+    let preview = machines.create_preview(request).await?;
+    Ok((StatusCode::CREATED, Json(preview)))
+}
+
+async fn list_previews(State(machines): State<Arc<Machines>>) -> Json<Vec<PreviewInfo>> {
+    Json(machines.previews().await)
+}
+
+async fn preview_info(
+    State(machines): State<Arc<Machines>>,
+    Path(id): Path<String>,
+) -> Result<Json<PreviewInfo>, ApiError> {
+    let preview = machines.preview(&id).await;
+    Ok(Json(preview.ok_or(MachineError::UnknownPreview)?))
+}
+
+async fn delete_preview(
+    State(machines): State<Arc<Machines>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    machines.delete_preview(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn proxy(
     State(machines): State<Arc<Machines>>,
     Path((id, _)): Path<(String, String)>,
@@ -173,15 +209,7 @@ async fn proxy(
         .headers
         .insert(header::HOST, header::HeaderValue::from_static("agentd"));
 
-    let stream = machine.connect().await.map_err(unreachable_agentd)?;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(unreachable_agentd)?;
-    let connection_use = machine.clone();
-    tokio::spawn(async move {
-        let _machine_in_use_until_agentd_disconnects = connection_use;
-        connection.with_upgrades().await
-    });
+    let mut sender = agentd(&machine, machine.clone()).await?;
     let mut response = sender
         .send_request(Request::from_parts(parts, body))
         .await
@@ -196,6 +224,21 @@ async fn proxy(
         });
     }
     Ok(response.map(Body::new))
+}
+
+async fn agentd(
+    machine: &Machine,
+    in_use: impl Send + 'static,
+) -> Result<SendRequest<Body>, ApiError> {
+    let stream = machine.connect().await.map_err(unreachable_agentd)?;
+    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(unreachable_agentd)?;
+    tokio::spawn(async move {
+        let _machine_in_use_until_agentd_disconnects = in_use;
+        connection.with_upgrades().await
+    });
+    Ok(sender)
 }
 
 async fn relay_until_either_side_ends(
@@ -234,7 +277,9 @@ impl From<MachineError> for ApiError {
     fn from(error: MachineError) -> Self {
         let status = match error {
             MachineError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            MachineError::UnknownMachine | MachineError::UnknownSnapshot => StatusCode::NOT_FOUND,
+            MachineError::UnknownMachine
+            | MachineError::UnknownSnapshot
+            | MachineError::UnknownPreview => StatusCode::NOT_FOUND,
             MachineError::Conflict(_) => StatusCode::CONFLICT,
             MachineError::Capacity | MachineError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             MachineError::Boot(_) | MachineError::Failed { .. } | MachineError::Io(_) => {

@@ -24,6 +24,7 @@ rmdir /mnt/old-root
 
 hostname machine
 ip link set lo up
+printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
 
 export HOME=/root
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -31,12 +32,18 @@ export LANG=C.UTF-8
 export HTTPS_PROXY=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128
 export HTTP_PROXY=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128
 export NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1
+export NODE_USE_ENV_PROXY=1
+egress_ca=/etc/ssl/certs/egress-gateway.pem
+export NODE_EXTRA_CA_CERTS=$egress_ca DENO_CERT=$egress_ca
+export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 socat TCP-LISTEN:3128,bind=127.0.0.1,reuseaddr,fork VSOCK-CONNECT:2:1080 &
 egress_forwarder=$!
 until ss -Hltn 'sport = :3128' | grep -q .; do
   kill -0 "$egress_forwarder"
   sleep 0.01
 done
+curl -fsS -o "$egress_ca" http://127.0.0.1:3128/egress-ca.pem
+cat "$egress_ca" >> /etc/ssl/certs/ca-certificates.crt
 mkdir -p /workspace
 cd /workspace
 exec /usr/bin/tini -- /usr/local/bin/agentd vsock:3000

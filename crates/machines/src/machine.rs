@@ -1,5 +1,6 @@
 use std::{
     io,
+    net::IpAddr,
     ops::Deref,
     path::{Path, PathBuf},
     process::Stdio,
@@ -17,10 +18,11 @@ use tokio::{
 };
 
 use crate::{
-    contract::{MachineInfo, MachineState},
-    egress::EgressPolicy,
+    contract::{EgressCredential, MachineInfo, MachineState},
+    egress::{Egress, EgressPolicy, EgressRoute},
     files,
     firecracker::Vm,
+    gateway::Gateway,
     machines::{Admission, MachineError},
 };
 
@@ -125,7 +127,7 @@ pub struct Booted {
     vm: Vm,
     vcpus: u8,
     memory_mib: u32,
-    egress: watch::Sender<EgressPolicy>,
+    egress: Egress,
 }
 
 impl Booted {
@@ -135,10 +137,9 @@ impl Booted {
         image: &Image,
         vcpus: u8,
         memory_mib: u32,
-        egress: EgressPolicy,
+        egress: Egress,
         admission: Admission,
     ) -> Result<Self, BootError> {
-        let egress = watch::Sender::new(egress);
         let boot = async {
             tokio::fs::create_dir(&dir).await?;
             files::link_immutable(&image.firecracker, &dir.join(FIRECRACKER)).await?;
@@ -146,7 +147,7 @@ impl Booted {
             create_scratch_disk(&dir.join(SCRATCH)).await?;
             let config = firecracker_config(image, vcpus, memory_mib).to_string();
             tokio::fs::write(dir.join("config.json"), config).await?;
-            Vm::boot(&dir, admission, egress.subscribe())
+            Vm::boot(&dir, admission, egress.route())
         };
         let vm = boot.await;
         Self::once_ready(id, dir, vm, vcpus, memory_mib, egress).await
@@ -160,10 +161,9 @@ impl Booted {
         disk: Disk,
         vcpus: u8,
         memory_mib: u32,
-        egress: EgressPolicy,
+        egress: Egress,
         admission: Admission,
     ) -> Result<Self, BootError> {
-        let egress = watch::Sender::new(egress);
         let restore = async {
             tokio::fs::create_dir(&dir).await?;
             for name in [FIRECRACKER, ROOTFS] {
@@ -177,7 +177,7 @@ impl Booted {
                 Disk::Copy => files::copy_disk(&saved.join(SCRATCH), &dir.join(SCRATCH)).await?,
                 Disk::Take => tokio::fs::rename(saved.join(SCRATCH), dir.join(SCRATCH)).await?,
             }
-            let vm = restore(&dir, RESTORED, admission, egress.subscribe()).await?;
+            let vm = restore(&dir, RESTORED, admission, egress.route()).await?;
             if let Err(error) = vm.resume().await {
                 vm.kill().await;
                 return Err(error);
@@ -194,7 +194,7 @@ impl Booted {
         vm: io::Result<Vm>,
         vcpus: u8,
         memory_mib: u32,
-        egress: watch::Sender<EgressPolicy>,
+        egress: Egress,
     ) -> Result<Self, BootError> {
         let ready = match vm {
             Ok(vm) => match wait_until_ready(&vm, &dir).await {
@@ -232,7 +232,7 @@ impl Booted {
         idle_timeout_secs: u32,
         egress: EgressPolicy,
     ) -> Result<Machine, BootError> {
-        self.egress.send_replace(egress);
+        self.egress.replace(egress);
         let machine = Machine {
             id: self.id,
             dir: self.dir,
@@ -249,7 +249,13 @@ impl Booted {
             phase: std::sync::Mutex::new(Phase::Running(self.vm.clone())),
             lifecycle: tokio::sync::Mutex::default(),
         };
-        if let Err(error) = files::commit(&machine.dir, RECORD, &machine.record()).await {
+        if let Err(error) = files::commit(
+            &machine.dir,
+            RECORD,
+            &machine.record(&machine.egress.policy()),
+        )
+        .await
+        {
             self.vm.kill().await;
             if let Err(error) = files::discard(&machine.dir, RECORD).await {
                 tracing::error!(machine_id = %machine.id, path = %machine.dir.display(), %error, "machine cleanup failed");
@@ -272,6 +278,10 @@ struct Record {
     boot_ms: u64,
     idle_timeout_secs: u32,
     allowed_hosts: Vec<String>,
+    #[serde(default)]
+    egress_credentials: Vec<EgressCredential>,
+    #[serde(default)]
+    egress_address: Option<IpAddr>,
 }
 
 enum Phase {
@@ -323,20 +333,29 @@ pub struct Machine {
     memory_mib: u32,
     boot_ms: u64,
     idle_timeout_secs: u32,
-    egress: watch::Sender<EgressPolicy>,
+    egress: Egress,
     activity: watch::Sender<Activity>,
     phase: std::sync::Mutex<Phase>,
     lifecycle: tokio::sync::Mutex<()>,
 }
 
 impl Machine {
-    pub async fn recover(id: String, dir: PathBuf) -> io::Result<Option<Self>> {
+    pub async fn recover(
+        id: String,
+        dir: PathBuf,
+        gateway: Arc<Gateway>,
+    ) -> io::Result<Option<Self>> {
         if !tokio::fs::try_exists(dir.join(RECORD)).await? {
             tokio::fs::remove_dir_all(&dir).await?;
             return Ok(None);
         }
         let record: Record = files::read_record(&dir, RECORD).await?;
-        let egress = EgressPolicy::parse(&record.allowed_hosts).map_err(io::Error::other)?;
+        let egress = EgressPolicy::new(
+            &record.allowed_hosts,
+            &record.egress_credentials,
+            record.egress_address,
+        )
+        .map_err(io::Error::other)?;
         for stale in [CHECKPOINT_STAGING, CHECKPOINT_WITHDRAWN, RESTORED] {
             files::remove_dir_if_present(&dir.join(stale)).await?;
         }
@@ -347,7 +366,7 @@ impl Machine {
             memory_mib: record.memory_mib,
             boot_ms: record.boot_ms,
             idle_timeout_secs: record.idle_timeout_secs,
-            egress: watch::Sender::new(egress),
+            egress: Egress::new(egress, gateway),
             activity: watch::Sender::new(Activity::idle_from_now()),
             phase: std::sync::Mutex::new(Phase::Destroyed),
             lifecycle: tokio::sync::Mutex::default(),
@@ -369,6 +388,7 @@ impl Machine {
     }
 
     pub fn info(&self) -> MachineInfo {
+        let egress = self.egress.policy();
         MachineInfo {
             id: self.id.clone(),
             state: self.state(),
@@ -376,17 +396,21 @@ impl Machine {
             memory_mib: self.memory_mib,
             boot_ms: self.boot_ms,
             idle_timeout_secs: self.idle_timeout_secs,
-            allowed_hosts: self.egress.borrow().patterns(),
+            allowed_hosts: egress.allowed_hosts(),
+            credential_hosts: egress.credential_hosts(),
+            egress_address: egress.source().map(|address| address.to_string()),
         }
     }
 
-    fn record(&self) -> Record {
+    fn record(&self, egress: &EgressPolicy) -> Record {
         Record {
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
             boot_ms: self.boot_ms,
             idle_timeout_secs: self.idle_timeout_secs,
-            allowed_hosts: self.egress.borrow().patterns(),
+            allowed_hosts: egress.allowed_hosts(),
+            egress_credentials: egress.credentials(),
+            egress_address: egress.source(),
         }
     }
 
@@ -570,7 +594,7 @@ impl Exclusive<'_> {
         let Live::Paused = self.live()? else {
             return Ok(());
         };
-        let vm = match restore(&self.dir, CHECKPOINT, admission, self.egress.subscribe()).await {
+        let vm = match restore(&self.dir, CHECKPOINT, admission, self.egress.route()).await {
             Ok(vm) => vm,
             Err(error) => return Err(self.failed("resume", error)),
         };
@@ -654,7 +678,7 @@ impl Exclusive<'_> {
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
             idle_timeout_secs: self.idle_timeout_secs,
-            egress: self.egress.borrow().clone(),
+            egress: self.egress.policy(),
         }
     }
 
@@ -662,14 +686,10 @@ impl Exclusive<'_> {
         if matches!(&*self.phase(), Phase::Destroyed) {
             return Err(MachineError::UnknownMachine);
         }
-        let record = Record {
-            allowed_hosts: egress.patterns(),
-            ..self.record()
-        };
-        files::replace_record(&self.dir, RECORD, &record)
+        files::replace_record(&self.dir, RECORD, &self.record(&egress))
             .await
             .map_err(MachineError::Io)?;
-        self.egress.send_replace(egress);
+        self.egress.replace(egress);
         Ok(())
     }
 
@@ -710,7 +730,7 @@ async fn restore(
     dir: &Path,
     saved: &str,
     admission: Admission,
-    egress: watch::Receiver<EgressPolicy>,
+    egress: EgressRoute,
 ) -> io::Result<Vm> {
     let vm = Vm::unconfigured(dir, admission, egress)?;
     if let Err(error) = vm.load(saved).await {

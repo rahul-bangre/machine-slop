@@ -18,7 +18,16 @@ export async function openTunnel(
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
         throw new RangeError(`port must be between 1 and 65535, got ${port}`);
     }
-    const conn = await connect(base);
+    const path = `${base.pathname.replace(/\/+$/, "")}/ports/${port}`;
+    return await openUpgrade(base, path, signal);
+}
+
+export async function openUpgrade(
+    origin: URL,
+    path: string,
+    signal?: AbortSignal,
+): Promise<Tunnel> {
+    const conn = await connect(origin);
     let closed = false;
     const closeConnection = () => {
         if (closed) return;
@@ -28,11 +37,10 @@ export async function openTunnel(
     signal?.addEventListener("abort", closeConnection, { once: true });
     try {
         signal?.throwIfAborted();
-        const path = `${base.pathname.replace(/\/+$/, "")}/ports/${port}`;
         await writeAll(
             conn,
             new TextEncoder().encode(
-                `GET ${path} HTTP/1.1\r\nHost: ${base.host}\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n`,
+                `GET ${path} HTTP/1.1\r\nHost: ${origin.host}\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n`,
             ),
         );
         const { status, headers, rest } = await readHead(conn);
@@ -48,6 +56,13 @@ export async function openTunnel(
     } finally {
         signal?.removeEventListener("abort", closeConnection);
     }
+}
+
+export function connectPreview(
+    url: string | URL,
+    signal?: AbortSignal,
+): Promise<Tunnel> {
+    return openUpgrade(new URL(url), "/", signal);
 }
 
 export function duplex(

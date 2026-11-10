@@ -10,6 +10,7 @@ use tokio::{
 struct Host {
     child: Child,
     address: String,
+    preview_address: Option<String>,
     state_dir: PathBuf,
     env: Vec<(&'static str, &'static str)>,
 }
@@ -22,10 +23,11 @@ impl Host {
     async fn start_with(name: &str, env: &[(&'static str, &'static str)]) -> Self {
         let state_dir =
             std::env::temp_dir().join(format!("machined-test-{}-{name}", std::process::id()));
-        let (child, address) = spawn_machined(&state_dir, env).await;
+        let (child, address, preview_address) = spawn_machined(&state_dir, env).await;
         Self {
             child,
             address,
+            preview_address,
             state_dir: std::fs::canonicalize(&state_dir).expect("state dir exists"),
             env: env.to_vec(),
         }
@@ -33,7 +35,8 @@ impl Host {
 
     async fn restart(&mut self, signal: &str) {
         self.stop(signal).await;
-        (self.child, self.address) = spawn_machined(&self.state_dir, &self.env).await;
+        (self.child, self.address, self.preview_address) =
+            spawn_machined(&self.state_dir, &self.env).await;
     }
 
     async fn stop(&mut self, signal: &str) {
@@ -255,6 +258,65 @@ impl Host {
         .expect("exchange completes within 60 seconds")
     }
 
+    async fn preview_request(&self, preview: &str, request: &str) -> String {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let address = self.preview_address.as_ref().expect("previews are on");
+            let mut stream = TcpStream::connect(address).await.expect("connect");
+            let request = request.replace("{host}", &format!("{preview}.preview.test"));
+            stream.write_all(request.as_bytes()).await.expect("write");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read");
+            String::from_utf8_lossy(&response).into_owned()
+        })
+        .await
+        .expect("preview request completes within 30 seconds")
+    }
+
+    async fn preview_get(&self, preview: &str, path: &str) -> String {
+        self.preview_request(
+            preview,
+            &format!("GET {path} HTTP/1.1\r\nHost: {{host}}\r\nConnection: close\r\n\r\n"),
+        )
+        .await
+    }
+
+    async fn preview_upgrade(&self, preview: &str, protocol: &str) -> (String, TcpStream) {
+        let address = self.preview_address.as_ref().expect("previews are on");
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        stream
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: {preview}.preview.test\r\nConnection: Upgrade\r\nUpgrade: {protocol}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write upgrade");
+        let mut head = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.expect("read upgrade response"));
+            }
+        })
+        .await
+        .expect("upgrade answered within 10 seconds");
+        (String::from_utf8_lossy(&head).into_owned(), stream)
+    }
+
+    async fn create_preview(&self, machine: &str, port: u16, ttl_secs: u32) -> String {
+        let (status, preview) = self
+            .request(
+                "POST",
+                "/previews",
+                Some(json!({ "machine_id": machine, "port": port, "ttl_secs": ttl_secs })),
+            )
+            .await;
+        assert_eq!(status, 201, "create preview: {preview}");
+        let id = preview["id"].as_str().expect("preview id").to_owned();
+        assert_eq!(preview["url"], json!(format!("https://{id}.preview.test/")));
+        id
+    }
+
     async fn tunnel(&self, machine: &str, port: u16) -> Option<TcpStream> {
         tokio::time::timeout(Duration::from_secs(10), async {
             let mut stream = TcpStream::connect(&self.address).await.expect("connect");
@@ -333,7 +395,7 @@ impl Drop for Host {
 async fn spawn_machined(
     state_dir: &std::path::Path,
     env: &[(&'static str, &'static str)],
-) -> (Child, String) {
+) -> (Child, String, Option<String>) {
     let image_dir = std::env::var("SLOP_IMAGE_DIR")
         .expect("SLOP_IMAGE_DIR names a directory built by vm/image/build.sh");
     let mut child = Command::new(env!("CARGO_BIN_EXE_machined"))
@@ -347,6 +409,7 @@ async fn spawn_machined(
         .spawn()
         .expect("spawn machined");
     let mut lines = BufReader::new(child.stderr.take().expect("stderr")).lines();
+    let mut preview_address = None;
     let address = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let line = lines
@@ -356,6 +419,13 @@ async fn spawn_machined(
                 .expect("machined reports its address");
             eprintln!("machined: {line}");
             let log: Value = serde_json::from_str(&line).expect("structured log");
+            if log["fields"]["message"] == "previews listening" {
+                preview_address = log["fields"]["address"]
+                    .as_str()
+                    .and_then(|address| address.strip_prefix("http://"))
+                    .map(str::to_owned);
+                continue;
+            }
             if let Some(address) = log["fields"]["address"].as_str() {
                 break address
                     .strip_prefix("http://")
@@ -371,7 +441,7 @@ async fn spawn_machined(
             eprintln!("machined: {line}");
         }
     });
-    (child, address)
+    (child, address, preview_address)
 }
 
 fn running(pid: &str) -> bool {
@@ -470,6 +540,27 @@ async fn invalid_requests_are_rejected_without_booting() {
     }
     let (status, _) = host.request("POST", "/snapshots", None).await;
     assert_eq!(status, 422);
+    let (status, refused) = host
+        .request(
+            "POST",
+            "/previews",
+            Some(json!({ "machine_id": "nope", "port": 80 })),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "previews are off without a preview URL: {refused}"
+    );
+    for invalid in [
+        json!({ "egress_address": "127.0.0.1" }),
+        json!({ "egress_credentials": [{ "host": "*", "headers": { "authorization": "x" } }] }),
+        json!({ "egress_credentials": [{ "host": "example.com", "headers": { "host": "x" } }] }),
+    ] {
+        let (status, body) = host
+            .request("POST", "/machines", Some(invalid.clone()))
+            .await;
+        assert_eq!(status, 422, "{invalid}: {body}");
+    }
     let (_, machines) = host.request("GET", "/machines", None).await;
     assert_eq!(machines, json!([]));
     let (_, snapshots) = host.request("GET", "/snapshots", None).await;
@@ -1357,5 +1448,249 @@ async fn chromium_reaches_https_sites_through_the_allowlist_without_flags() {
         .request("DELETE", &format!("/machines/{machine}"), None)
         .await;
     assert_eq!(status, 204);
+    host.finish().await;
+}
+
+const PREVIEW_SERVERS: &str = r#"
+import http.server, socket, threading
+open("/workspace/hello.txt", "w").write("hello from the machine")
+def echo(port, upgrade):
+    server = socket.create_server(("127.0.0.1", port))
+    while True:
+        client, _ = server.accept()
+        def serve(client):
+            if upgrade:
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    head += client.recv(1024)
+                client.sendall(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+            while data := client.recv(1024):
+                client.sendall(data)
+        threading.Thread(target=serve, args=(client,), daemon=True).start()
+threading.Thread(target=echo, args=(9000, False), daemon=True).start()
+threading.Thread(target=echo, args=(9001, True), daemon=True).start()
+handler = lambda *args: http.server.SimpleHTTPRequestHandler(*args, directory="/workspace")
+http.server.ThreadingHTTPServer(("127.0.0.1", 8000), handler).serve_forever()
+"#;
+
+async fn echoes(stream: &mut TcpStream, message: &[u8]) {
+    stream.write_all(message).await.expect("write");
+    let mut echoed = vec![0; message.len()];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
+        .await
+        .expect("echo within 10 seconds")
+        .expect("read echo");
+    assert_eq!(echoed, message);
+}
+
+async fn ends_within(stream: &mut TcpStream, within: Duration) {
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(within, stream.read_to_end(&mut rest)).await;
+    assert!(ended.is_ok(), "the connection ended within {within:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn a_preview_serves_a_port_publicly_until_it_is_deleted_or_expires() {
+    let host = Host::start_with(
+        "previews",
+        &[
+            ("SLOP_PREVIEW_URL", "https://preview.test"),
+            ("SLOP_PREVIEW_LISTEN", "127.0.0.1:0"),
+        ],
+    )
+    .await;
+    let machine = host.create().await;
+    let script = format!("python3 -c '{}'", PREVIEW_SERVERS.replace('\'', "'\\''"));
+    host.start_process(&machine, &script).await;
+    let site = host.create_preview(&machine, 8000, 600).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let response = host.preview_get(&site, "/hello.txt").await;
+        if response.starts_with("HTTP/1.1 200") {
+            assert!(response.ends_with("hello from the machine"), "{response}");
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{response}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let unknown = host
+        .preview_get("0123456789abcdef0123456789abcdef", "/")
+        .await;
+    assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+    let (status, previews) = host.request("GET", "/previews", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(previews.as_array().map(Vec::len), Some(1), "{previews}");
+
+    let websocket = host.create_preview(&machine, 9001, 600).await;
+    let (head, mut upgraded) = host.preview_upgrade(&websocket, "websocket").await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    echoes(&mut upgraded, b"through an application upgrade").await;
+
+    let raw = host.create_preview(&machine, 9000, 600).await;
+    let (head, mut tunnel) = host.preview_upgrade(&raw, "tcp").await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    echoes(&mut tunnel, b"raw tcp through a public url").await;
+    host.delete(&format!("/previews/{raw}")).await;
+    ends_within(&mut tunnel, Duration::from_secs(5)).await;
+    let (head, _) = host.preview_upgrade(&raw, "tcp").await;
+    assert!(
+        head.starts_with("HTTP/1.1 404"),
+        "a deleted preview is gone: {head}"
+    );
+
+    let brief = host.create_preview(&machine, 8000, 2).await;
+    assert!(
+        host.preview_get(&brief, "/hello.txt")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    let (_, mut held) = host.preview_upgrade(&websocket, "websocket").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let expired = host.preview_get(&brief, "/hello.txt").await;
+    assert!(expired.starts_with("HTTP/1.1 404"), "{expired}");
+    echoes(&mut held, b"other previews are unaffected").await;
+
+    host.pause(&machine).await;
+    let paused = host.preview_get(&site, "/hello.txt").await;
+    assert!(paused.starts_with("HTTP/1.1 503"), "{paused}");
+    ends_within(&mut held, Duration::from_secs(5)).await;
+    host.resume(&machine).await;
+
+    host.delete(&format!("/machines/{machine}")).await;
+    let (_, previews) = host.request("GET", "/previews", None).await;
+    assert_eq!(previews, json!([]), "deleting a machine ends its previews");
+    host.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, SLOP_IMAGE_DIR and internet access; run with make vm-test"]
+async fn machine_tools_resolve_names_and_reach_credentialed_hosts_without_holding_the_key() {
+    let host = Host::start("gateway").await;
+    let secret = "secret-from-the-host";
+    let info = host
+        .create_with(Some(json!({
+            "allowed_hosts": ["example.com", "postman-echo.com"],
+            "egress_credentials": [{
+                "host": "postman-echo.com",
+                "headers": { "x-injected-key": secret },
+            }],
+        })))
+        .await;
+    assert_eq!(info["credential_hosts"], json!(["postman-echo.com"]));
+    assert!(!info.to_string().contains(secret), "{info}");
+    let machine = info["id"].as_str().expect("machine id");
+
+    let checks = [
+        ("allowed names resolve", "getent hosts example.com".to_owned()),
+        ("other names are refused", "! getent hosts example.org".to_owned()),
+        (
+            "node fetch uses the proxy",
+            r#"node -e 'fetch("https://example.com/").then(r => process.exit(r.ok ? 0 : 1), () => process.exit(2))'"#.to_owned(),
+        ),
+        (
+            "deno keeps the public roots",
+            r#"deno eval 'Deno.exit((await fetch("https://example.com/")).ok ? 0 : 1)'"#.to_owned(),
+        ),
+        ("curl", format!("curl -fsS https://postman-echo.com/headers | grep -q {secret}")),
+        (
+            "python",
+            format!(r#"python3 -c 'import urllib.request; assert b"{secret}" in urllib.request.urlopen("https://postman-echo.com/headers").read()'"#),
+        ),
+        (
+            "node",
+            format!(r#"node -e 'fetch("https://postman-echo.com/headers").then(r => r.text()).then(t => process.exit(t.includes("{secret}") ? 0 : 1), () => process.exit(2))'"#),
+        ),
+        (
+            "deno",
+            format!(r#"deno eval 'Deno.exit((await (await fetch("https://postman-echo.com/headers")).text()).includes("{secret}") ? 0 : 1)'"#),
+        ),
+        (
+            "the key is nowhere in the machine",
+            format!("! env | grep -q {secret} && ! grep -rqs {secret} /etc /root /workspace /tmp"),
+        ),
+    ];
+    for (check, script) in &checks {
+        assert_eq!(
+            host.exit_code(machine, script).await,
+            json!(0),
+            "{check}: {script}"
+        );
+    }
+
+    let (status, updated) = host
+        .request(
+            "PATCH",
+            &format!("/machines/{machine}"),
+            Some(json!({ "egress_credentials": [] })),
+        )
+        .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["credential_hosts"], json!([]));
+    assert_eq!(
+        updated["allowed_hosts"],
+        json!(["example.com", "postman-echo.com"])
+    );
+    let removed = format!("! curl -fsS https://postman-echo.com/headers | grep -q {secret}");
+    assert_eq!(host.exit_code(machine, &removed).await, json!(0));
+
+    host.delete(&format!("/machines/{machine}")).await;
+    host.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, SLOP_IMAGE_DIR and internet access; run with make vm-test"]
+async fn a_machine_egress_address_is_where_its_connections_leave_from() {
+    let host = Host::start_with("egress-address", &[("SLOP_EGRESS_ADDRESSES", "127.0.0.1")]).await;
+    let (status, refused) = host
+        .request(
+            "POST",
+            "/machines",
+            Some(json!({ "egress_address": "127.0.0.2" })),
+        )
+        .await;
+    assert_eq!(status, 422, "{refused}");
+
+    let pinned = host
+        .create_with(Some(json!({
+            "allowed_hosts": ["1.1.1.1"],
+            "egress_address": "127.0.0.1",
+            "memory_mib": SMALL_MACHINE_MIB,
+        })))
+        .await;
+    assert_eq!(pinned["egress_address"], json!("127.0.0.1"));
+    let pinned = pinned["id"].as_str().expect("machine id");
+    let unpinned = host
+        .create_with(Some(
+            json!({ "allowed_hosts": ["1.1.1.1"], "memory_mib": SMALL_MACHINE_MIB }),
+        ))
+        .await;
+    assert_eq!(unpinned["egress_address"], json!(null));
+    let unpinned = unpinned["id"].as_str().expect("machine id");
+
+    let connect_status = |expected: u16| {
+        format!(
+            "test \"$(curl -sS --noproxy '' -o /dev/null -w '%{{http_connect}}' https://1.1.1.1/)\" = {expected}"
+        )
+    };
+    assert_eq!(
+        host.exit_code(unpinned, &connect_status(200)).await,
+        json!(0),
+        "the host's default address reaches the public host"
+    );
+    assert_eq!(
+        host.exit_code(pinned, &connect_status(502)).await,
+        json!(0),
+        "a loopback egress address cannot reach it, so the pinned address was used"
+    );
+
+    let fork = host.fork(pinned).await;
+    let (_, fork_info) = host
+        .request("GET", &format!("/machines/{fork}"), None)
+        .await;
+    assert_eq!(fork_info["egress_address"], json!("127.0.0.1"));
+    for machine in [pinned, unpinned, &fork] {
+        host.delete(&format!("/machines/{machine}")).await;
+    }
     host.finish().await;
 }

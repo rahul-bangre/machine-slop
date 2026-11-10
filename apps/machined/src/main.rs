@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use slop_machines::{Limits, Machines, default_memory_budget_mib};
+use slop_machines::{Limits, Machines, Network, PreviewOrigin, default_memory_budget_mib};
 use tokio::net::TcpListener;
 
 const MAX_RUNNING_VMS: usize = 16;
@@ -34,10 +34,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spare_machines = limits.spare_machines,
         "admission limits"
     );
-    let machines =
-        Machines::open(PathBuf::from(image_dir), PathBuf::from(state_dir), limits).await?;
+    let (previews, preview_listener) = match (
+        env_text("SLOP_PREVIEW_URL")?,
+        env_text("SLOP_PREVIEW_LISTEN")?,
+    ) {
+        (Some(url), Some(listen)) => (
+            Some(PreviewOrigin::parse(&url)?),
+            Some(TcpListener::bind(&listen).await?),
+        ),
+        (None, None) => (None, None),
+        _ => return Err("set SLOP_PREVIEW_URL and SLOP_PREVIEW_LISTEN together".into()),
+    };
+    let egress_addresses = env_text("SLOP_EGRESS_ADDRESSES")?
+        .unwrap_or_default()
+        .split(',')
+        .filter(|address| !address.trim().is_empty())
+        .map(|address| {
+            address
+                .trim()
+                .parse()
+                .map_err(|_| format!("SLOP_EGRESS_ADDRESSES has an invalid address {address:?}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let network = Network {
+        egress_addresses,
+        previews,
+    };
+    let machines = Machines::open(
+        PathBuf::from(image_dir),
+        PathBuf::from(state_dir),
+        limits,
+        network,
+    )
+    .await?;
     let listener = TcpListener::bind(&address).await?;
     let app = machined::app(machines.clone());
+    if let Some(preview_listener) = preview_listener {
+        tracing::info!(address = %format!("http://{}", preview_listener.local_addr()?), "previews listening");
+        let previews = machined::preview_app(machines.clone());
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(preview_listener, previews).await {
+                tracing::error!(%error, "preview server failed");
+            }
+        });
+    }
 
     tracing::info!(address = %format!("http://{}", listener.local_addr()?), "machined listening");
     axum::serve(listener, app)
@@ -60,13 +100,20 @@ async fn shutdown(machines: Arc<Machines>) {
     tracing::info!("shutdown completed");
 }
 
-fn env_number<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String> {
+fn env_text(name: &str) -> Result<Option<String>, String> {
     match std::env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map(Some)
-            .map_err(|_| format!("{name} must be a whole number, not {value:?}")),
+        Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(format!("{name}: {error}")),
     }
+}
+
+fn env_number<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String> {
+    env_text(name)?
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| format!("{name} must be a whole number, not {value:?}"))
+        })
+        .transpose()
 }

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io,
+    net::IpAddr,
     ops::ControlFlow,
     path::{Path, PathBuf},
     sync::{
@@ -14,12 +15,18 @@ use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, watch}
 
 use crate::{
     contract::{
-        CreateMachine, CreateSnapshot, MachineInfo, MachineState, SnapshotInfo, UpdateMachine,
+        CreateMachine, CreatePreview, CreateSnapshot, MachineInfo, MachineState, PreviewInfo,
+        SnapshotInfo, UpdateMachine,
     },
-    egress::{EgressPolicy, MAX_MACHINE_TUNNEL_FILES},
+    egress::{Egress, EgressPolicy, MAX_MACHINE_EGRESS_FILES, can_send_from},
     files,
     firecracker::kill_orphans,
+    gateway::Gateway,
     machine::{Activity, BootError, Booted, Disk, Image, Machine, MachineSpec, MachineUse},
+    previews::{
+        DEFAULT_PREVIEW_TTL_SECS, MAX_PREVIEW_TTL_SECS, MAX_PREVIEWS_PER_MACHINE, Preview,
+        PreviewOrigin, PreviewUse,
+    },
 };
 
 const DEFAULT_VCPUS: u8 = 2;
@@ -38,6 +45,7 @@ pub enum MachineError {
     Invalid(String),
     UnknownMachine,
     UnknownSnapshot,
+    UnknownPreview,
     Conflict(String),
     Capacity,
     ShuttingDown,
@@ -65,6 +73,7 @@ impl std::fmt::Display for MachineError {
             Self::Invalid(message) | Self::Conflict(message) => write!(f, "{message}"),
             Self::UnknownMachine => write!(f, "unknown machine"),
             Self::UnknownSnapshot => write!(f, "unknown snapshot"),
+            Self::UnknownPreview => write!(f, "unknown preview"),
             Self::Capacity => write!(f, "machine capacity reached"),
             Self::ShuttingDown => write!(f, "host is shutting down"),
             Self::Boot(error) => write!(f, "{error}"),
@@ -87,6 +96,12 @@ pub struct Limits {
     pub spare_machines: usize,
 }
 
+#[derive(Default)]
+pub struct Network {
+    pub egress_addresses: Vec<IpAddr>,
+    pub previews: Option<PreviewOrigin>,
+}
+
 pub(crate) struct Admission {
     _slot: OwnedSemaphorePermit,
     _memory: OwnedSemaphorePermit,
@@ -95,6 +110,8 @@ pub(crate) struct Admission {
 pub struct Machines {
     _state_lock: std::fs::File,
     image: Image,
+    gateway: Arc<Gateway>,
+    network: Network,
     machines_dir: PathBuf,
     snapshots_dir: PathBuf,
     limits: Limits,
@@ -111,6 +128,7 @@ pub struct Machines {
 struct State {
     machines: HashMap<String, Arc<Machine>>,
     snapshots: HashMap<String, Arc<Snapshot>>,
+    previews: HashMap<String, Preview>,
     spares: Vec<Booted>,
     spares_booting: usize,
     shutting_down: bool,
@@ -148,11 +166,20 @@ impl Machines {
         image_dir: PathBuf,
         state_dir: PathBuf,
         limits: Limits,
+        network: Network,
     ) -> io::Result<Arc<Self>> {
         let image = Image::in_dir(&image_dir)?;
         ensure_open_file_limit(
-            limits.running_vms as u64 * MAX_MACHINE_TUNNEL_FILES + OPEN_FILES_OUTSIDE_EGRESS,
+            limits.running_vms as u64 * MAX_MACHINE_EGRESS_FILES + OPEN_FILES_OUTSIDE_EGRESS,
         )?;
+        for address in &network.egress_addresses {
+            can_send_from(*address).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("egress address {address} cannot be used on this host: {error}"),
+                )
+            })?;
+        }
         tokio::fs::create_dir_all(&state_dir).await?;
         let state_lock = std::fs::File::create(state_dir.join("machined.lock"))?;
         state_lock.try_lock().map_err(|_| {
@@ -169,9 +196,10 @@ impl Machines {
         let machines_dir = tokio::fs::canonicalize(machines_dir).await?;
         let snapshots_dir = tokio::fs::canonicalize(snapshots_dir).await?;
         kill_orphans(&machines_dir)?;
+        let gateway = Gateway::open(&state_dir).await?;
         let mut state = State::default();
         for (id, dir) in subdirectories(&machines_dir).await? {
-            match Machine::recover(id.clone(), dir.clone()).await {
+            match Machine::recover(id.clone(), dir.clone(), gateway.clone()).await {
                 Ok(Some(machine)) => {
                     state.machines.insert(id, Arc::new(machine));
                 }
@@ -214,6 +242,8 @@ impl Machines {
         let machines = Arc::new(Self {
             _state_lock: state_lock,
             image,
+            gateway,
+            network,
             machines_dir,
             snapshots_dir,
             slots: Arc::new(Semaphore::new(limits.running_vms)),
@@ -293,11 +323,22 @@ impl Machines {
             )));
         }
         let allowed_hosts = request.allowed_hosts.unwrap_or(inherited_hosts);
+        let source = request
+            .egress_address
+            .as_deref()
+            .map(|address| self.egress_address(address))
+            .transpose()?;
+        let egress = EgressPolicy::new(
+            &allowed_hosts,
+            &request.egress_credentials.unwrap_or_default(),
+            source,
+        )
+        .map_err(MachineError::Invalid)?;
         let spec = MachineSpec {
             vcpus,
             memory_mib,
             idle_timeout_secs,
-            egress: EgressPolicy::parse(&allowed_hosts).map_err(MachineError::Invalid)?,
+            egress,
         };
         let machines = self.clone();
         let snapshot_id = request.snapshot_id;
@@ -367,6 +408,18 @@ impl Machines {
         .await
     }
 
+    fn egress_address(&self, address: &str) -> Result<IpAddr, MachineError> {
+        address
+            .parse()
+            .ok()
+            .filter(|address| self.network.egress_addresses.contains(address))
+            .ok_or_else(|| {
+                MachineError::Invalid(format!(
+                    "egress_address {address:?} is not one of this host's egress addresses"
+                ))
+            })
+    }
+
     fn new_machine_dir(&self) -> (String, PathBuf) {
         let id = new_id();
         let dir = self.machines_dir.join(&id);
@@ -397,6 +450,7 @@ impl Machines {
         egress: EgressPolicy,
     ) -> Result<Booted, MachineError> {
         let (id, dir) = self.new_machine_dir();
+        let egress = Egress::new(egress, self.gateway.clone());
         Booted::from_image(id, dir, &self.image, vcpus, memory_mib, egress, admission)
             .await
             .map_err(MachineError::Boot)
@@ -420,7 +474,8 @@ impl Machines {
         spec: &MachineSpec,
     ) -> Result<Booted, MachineError> {
         let (id, dir) = self.new_machine_dir();
-        let (vcpus, memory_mib, egress) = (spec.vcpus, spec.memory_mib, spec.egress.clone());
+        let (vcpus, memory_mib) = (spec.vcpus, spec.memory_mib);
+        let egress = Egress::new(spec.egress.clone(), self.gateway.clone());
         Booted::from_saved(id, dir, saved, disk, vcpus, memory_mib, egress, admission)
             .await
             .map_err(MachineError::Boot)
@@ -562,10 +617,20 @@ impl Machines {
         id: &str,
         request: UpdateMachine,
     ) -> Result<MachineInfo, MachineError> {
-        let egress = EgressPolicy::parse(&request.allowed_hosts).map_err(MachineError::Invalid)?;
         let machine = self.get(id).await.ok_or(MachineError::UnknownMachine)?;
         run_to_completion(async move {
             let machine = machine.exclusive().await;
+            let mut egress = machine.spec().egress;
+            if let Some(allowed_hosts) = &request.allowed_hosts {
+                egress = egress
+                    .with_allowed_hosts(allowed_hosts)
+                    .map_err(MachineError::Invalid)?;
+            }
+            if let Some(credentials) = &request.egress_credentials {
+                egress = egress
+                    .with_credentials(credentials)
+                    .map_err(MachineError::Invalid)?;
+            }
             machine.set_egress(egress).await?;
             Ok(machine.info())
         })
@@ -590,7 +655,7 @@ impl Machines {
             let mut state = self.state.lock().await;
             match state.machines.get(id) {
                 Some(machine) if !machine.is_expired() => return ControlFlow::Continue(()),
-                Some(_) => state.machines.remove(id),
+                Some(_) => state.unlist(id),
                 None => None,
             }
         };
@@ -669,8 +734,7 @@ impl Machines {
             .state
             .lock()
             .await
-            .machines
-            .remove(id)
+            .unlist(id)
             .ok_or(MachineError::UnknownMachine)?;
         let machines = self.clone();
         run_to_completion(async move {
@@ -721,7 +785,7 @@ impl Machines {
                     machine_id: machine.id().to_owned(),
                     vcpus: spec.vcpus,
                     memory_mib: spec.memory_mib,
-                    allowed_hosts: spec.egress.patterns(),
+                    allowed_hosts: spec.egress.allowed_hosts(),
                     created_unix_ms: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |elapsed| {
@@ -856,6 +920,111 @@ impl Machines {
 
     async fn snapshot(&self, id: &str) -> Option<Arc<Snapshot>> {
         self.state.lock().await.snapshots.get(id).cloned()
+    }
+
+    fn preview_origin(&self) -> Result<&PreviewOrigin, MachineError> {
+        self.network.previews.as_ref().ok_or_else(|| {
+            MachineError::Conflict("previews are off; start machined with SLOP_PREVIEW_URL".into())
+        })
+    }
+
+    pub async fn create_preview(
+        &self,
+        request: CreatePreview,
+    ) -> Result<PreviewInfo, MachineError> {
+        let origin = self.preview_origin()?;
+        let ttl_secs = request.ttl_secs.unwrap_or(DEFAULT_PREVIEW_TTL_SECS);
+        if !(1..=MAX_PREVIEW_TTL_SECS).contains(&ttl_secs) {
+            return Err(MachineError::Invalid(format!(
+                "ttl_secs must be between 1 and {MAX_PREVIEW_TTL_SECS}"
+            )));
+        }
+        if request.port == 0 {
+            return Err(MachineError::Invalid(
+                "port must be between 1 and 65535".into(),
+            ));
+        }
+        let mut state = self.state.lock().await;
+        let machine = state
+            .machines
+            .get(&request.machine_id)
+            .ok_or(MachineError::UnknownMachine)?;
+        if matches!(machine.state(), MachineState::Exited { .. }) {
+            return Err(MachineError::Conflict("machine has exited".into()));
+        }
+        state.previews.retain(|_, preview| !preview.has_expired());
+        let open = state
+            .previews
+            .values()
+            .filter(|preview| preview.machine_id == request.machine_id)
+            .count();
+        if open >= MAX_PREVIEWS_PER_MACHINE {
+            return Err(MachineError::Conflict(format!(
+                "a machine may have at most {MAX_PREVIEWS_PER_MACHINE} previews"
+            )));
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let preview = Preview::new(request.machine_id, request.port, ttl_secs);
+        let info = preview.info(&id, origin);
+        state.previews.insert(id, preview);
+        tracing::info!(preview_id = %info.id, machine_id = %info.machine_id, port = info.port, expires_unix_ms = info.expires_unix_ms, "preview created");
+        Ok(info)
+    }
+
+    pub async fn previews(&self) -> Vec<PreviewInfo> {
+        let Some(origin) = self.network.previews.as_ref() else {
+            return Vec::new();
+        };
+        let mut state = self.state.lock().await;
+        state.previews.retain(|_, preview| !preview.has_expired());
+        let mut infos: Vec<_> = state
+            .previews
+            .iter()
+            .map(|(id, preview)| preview.info(id, origin))
+            .collect();
+        infos.sort_by(|a, b| a.id.cmp(&b.id));
+        infos
+    }
+
+    pub async fn preview(&self, id: &str) -> Option<PreviewInfo> {
+        let origin = self.network.previews.as_ref()?;
+        let state = self.state.lock().await;
+        let preview = state
+            .previews
+            .get(id)
+            .filter(|preview| !preview.has_expired())?;
+        Some(preview.info(id, origin))
+    }
+
+    pub async fn delete_preview(&self, id: &str) -> Result<(), MachineError> {
+        let removed = self.state.lock().await.previews.remove(id);
+        match removed {
+            Some(preview) if !preview.has_expired() => {
+                tracing::info!(preview_id = %id, "preview deleted");
+                Ok(())
+            }
+            _ => Err(MachineError::UnknownPreview),
+        }
+    }
+
+    pub async fn open_preview(&self, host_header: &str) -> Option<PreviewUse> {
+        let id = self.network.previews.as_ref()?.preview_id(host_header)?;
+        let mut state = self.state.lock().await;
+        if state.previews.get(id)?.has_expired() {
+            state.previews.remove(id);
+            return None;
+        }
+        let preview = state.previews.get(id)?;
+        let machine = state.machines.get(&preview.machine_id)?.begin_use();
+        Some(preview.begin_use(machine))
+    }
+}
+
+impl State {
+    fn unlist(&mut self, id: &str) -> Option<Arc<Machine>> {
+        let machine = self.machines.remove(id)?;
+        self.previews.retain(|_, preview| preview.machine_id != id);
+        Some(machine)
     }
 }
 

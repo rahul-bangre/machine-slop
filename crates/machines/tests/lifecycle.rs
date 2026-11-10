@@ -8,7 +8,7 @@ use std::{
 
 use slop_machines::{
     CreateMachine, CreateSnapshot, Limits, MachineError, MachineInfo, MachineState, Machines,
-    SnapshotInfo, UpdateMachine,
+    Network, SnapshotInfo, UpdateMachine,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -56,7 +56,7 @@ impl Host {
                 memory_mib: MEMORY_BUDGET_MIB,
                 spare_machines: spares,
             };
-            match Machines::open(image.clone(), state.clone(), limits).await {
+            match Machines::open(image.clone(), state.clone(), limits, Network::default()).await {
                 Ok(machines) => return machines,
                 Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -921,7 +921,8 @@ async fn allowed_hosts_survive_pause_and_restart_and_pass_to_forks_and_snapshots
 
     machines.pause(&source).await.expect("pause");
     let narrowed = UpdateMachine {
-        allowed_hosts: vec!["example.com".into()],
+        allowed_hosts: Some(vec!["example.com".into()]),
+        egress_credentials: None,
     };
     let updated = machines.update(&source, narrowed).await.expect("update");
     assert_eq!(updated.allowed_hosts, ["example.com"]);
@@ -954,7 +955,8 @@ async fn allowed_hosts_survive_pause_and_restart_and_pass_to_forks_and_snapshots
     let revoking = {
         let (machines, source) = (machines.clone(), source.clone());
         let none = UpdateMachine {
-            allowed_hosts: Vec::new(),
+            allowed_hosts: Some(Vec::new()),
+            egress_credentials: None,
         };
         tokio::spawn(async move { machines.update(&source, none).await })
     };
@@ -979,7 +981,8 @@ async fn allowed_hosts_survive_pause_and_restart_and_pass_to_forks_and_snapshots
     let after_revocation = snapshotting.await.expect("join").expect("snapshot");
     assert!(after_revocation.allowed_hosts.is_empty());
     let restored = UpdateMachine {
-        allowed_hosts: vec!["example.com".into()],
+        allowed_hosts: Some(vec!["example.com".into()]),
+        egress_credentials: None,
     };
     machines.update(&source, restored).await.expect("update");
 
@@ -1179,7 +1182,9 @@ async fn memory_is_reserved_by_running_vms_and_given_up_by_spares() {
         memory_mib: budget,
         spare_machines: 1,
     };
-    let machines = Machines::open(image, state, limits).await.expect("open");
+    let machines = Machines::open(image, state, limits, Network::default())
+        .await
+        .expect("open");
     eventually("booted a spare", || async { machines.spares().await == 1 }).await;
     assert_eq!(
         machines.resource_usage(),
