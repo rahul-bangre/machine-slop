@@ -3,10 +3,11 @@ import { type Check, evaluate, type GuestFacts } from "./checks.ts";
 import type { Environment } from "./environment.ts";
 import {
     type Guest,
+    type ImageBuilder,
     type ImageRecord,
     inputSha256,
     type Owner,
-    type Provider,
+    type Sandboxes,
 } from "./provider.ts";
 
 export const guest_directory = "/tmp/env-smoke";
@@ -23,7 +24,7 @@ export type Release = {
 export type SmokeReport = {
     provider: string;
     run_id: string;
-    image: ImageRecord;
+    image: ImageRecord | null;
     passed: boolean;
     failure: string | null;
     guest: (GuestFacts & { id: string }) | null;
@@ -78,8 +79,19 @@ async function observeIn(
     return JSON.parse(last_line);
 }
 
+export async function recordedSandboxes(
+    builder: ImageBuilder,
+    environment: Environment,
+    record: ImageRecord,
+): Promise<Sandboxes> {
+    if (record.input_sha256 !== await inputSha256(builder, environment)) {
+        throw new StaleImage(builder.name);
+    }
+    return builder.sandboxes(record.image);
+}
+
 async function destroyOwnedAndStarted(
-    provider: Provider,
+    provider: Sandboxes,
     owner: Owner,
     started: string | null,
 ): Promise<Release> {
@@ -106,22 +118,19 @@ async function destroyOwnedAndStarted(
 }
 
 export async function smoke(
-    provider: Provider,
+    provider: Sandboxes,
+    image: ImageRecord | null,
     environment: Environment,
-    record: ImageRecord,
     files: GuestFiles,
     run_id: string,
 ): Promise<SmokeReport> {
-    if (record.input_sha256 !== await inputSha256(provider, environment)) {
-        throw new StaleImage(provider.name);
-    }
     const owner = { "env-smoke-run": run_id };
     let guest: SmokeReport["guest"] = null;
     let started_id: string | null = null;
     let observation: Observation | null = null;
     let failure: string | null = null;
     try {
-        const started = await provider.start(record.image, owner);
+        const started = await provider.start(owner);
         started_id = started.id;
         guest = {
             id: started.id,
@@ -154,7 +163,7 @@ export async function smoke(
     return {
         provider: provider.name,
         run_id,
-        image: record,
+        image,
         passed: failure === null && checks.every((check) => check.ok),
         failure,
         guest,

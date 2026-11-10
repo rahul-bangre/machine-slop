@@ -4,6 +4,7 @@ import { Image } from "@daytona/sdk";
 import { Template } from "e2b";
 
 import chromium from "../../browser/chromium.json" with { type: "json" };
+import deno_releases from "../deno-release.json" with { type: "json" };
 import type { Observation } from "../guest/observe.ts";
 import { CredentialInArtifact, serializeArtifact } from "../src/artifacts.ts";
 import { effectiveCpus, effectiveMemoryMib, evaluate } from "../src/checks.ts";
@@ -12,13 +13,19 @@ import { e2bRef } from "../src/e2b.ts";
 import { browserEnvironment } from "../src/environment.ts";
 import {
     type Guest,
+    type ImageBuilder,
     ImageMismatch,
     type ImageRecord,
     inputSha256,
     type Owner,
-    type Provider,
+    type Sandboxes,
 } from "../src/provider.ts";
-import { guestFiles, smoke, StaleImage } from "../src/smoke.ts";
+import {
+    guestFiles,
+    recordedSandboxes,
+    smoke,
+    StaleImage,
+} from "../src/smoke.ts";
 
 const environment = await browserEnvironment();
 
@@ -53,11 +60,19 @@ const microvm: Observation = {
     ],
 };
 
-async function recordFor(provider: Provider): Promise<ImageRecord> {
+const fake_builder: ImageBuilder = {
+    name: "fake",
+    sdk: "fake@0",
+    build_settings: {},
+    build: () => Promise.reject(new Error("not used")),
+    sandboxes: () => fakeProvider(),
+};
+
+async function recordFor(builder: ImageBuilder): Promise<ImageRecord> {
     return {
-        provider: provider.name,
-        sdk: provider.sdk,
-        input_sha256: await inputSha256(provider, environment),
+        provider: builder.name,
+        sdk: builder.sdk,
+        input_sha256: await inputSha256(builder, environment),
         resources: environment.resources,
         image: { ref: "slop-browser:test", id: "image-1", details: {} },
         built_at: "2026-11-10T00:00:00.000Z",
@@ -94,6 +109,18 @@ Deno.test("the environment pins Chromium, Deno, the base image and 2 vCPU with 4
     );
     assert.match(dockerfile, /snapshot\.debian\.org\/archive\/debian\/\d{8}T/);
     assert.doesNotMatch(dockerfile, /:latest\b/);
+});
+
+Deno.test("the pinned Deno has an archive for every architecture machines boot on", async () => {
+    const version = (await Deno.readTextFile(".tool-versions")).match(
+        /^deno (\S+)$/m,
+    )?.[1];
+    assert.ok(version);
+    const releases: Record<string, Record<string, unknown>> = deno_releases;
+    assert.deepEqual(Object.keys(releases[version] ?? {}).sort(), [
+        "linux-aarch64",
+        "linux-x86_64",
+    ]);
 });
 
 Deno.test("E2B and Daytona read the same build steps from the Dockerfile", async () => {
@@ -228,7 +255,7 @@ type FakeCloud = {
     };
 };
 
-function fakeProvider(): Provider & { cloud: FakeCloud } {
+function fakeProvider(): Sandboxes & { cloud: FakeCloud } {
     const cloud: FakeCloud = {
         sandboxes: new Map(),
         created: 0,
@@ -247,10 +274,7 @@ function fakeProvider(): Provider & { cloud: FakeCloud } {
     return {
         cloud,
         name: "fake",
-        sdk: "fake@0",
-        build_settings: {},
-        build: () => Promise.reject(new Error("not used")),
-        start(image, owner): Promise<Guest> {
+        start(owner): Promise<Guest> {
             const id = `sandbox-${++cloud.created}`;
             cloud.sandboxes.set(id, owner);
             if (cloud.faults.create_response_lost) {
@@ -258,7 +282,7 @@ function fakeProvider(): Provider & { cloud: FakeCloud } {
             }
             if (cloud.faults.image_moved) {
                 return Promise.reject(
-                    new ImageMismatch("fake", image.id, "image-2"),
+                    new ImageMismatch("fake", "image-1", "image-2"),
                 );
             }
             return Promise.resolve({
@@ -304,8 +328,8 @@ Deno.test("a smoke run observes the guest, passes, and destroys only its own san
 
     const report = await smoke(
         provider,
+        await recordFor(fake_builder),
         environment,
-        await recordFor(provider),
         files,
         "run-1",
     );
@@ -326,8 +350,8 @@ Deno.test("a sandbox whose create response was lost is still destroyed, and the 
 
     const report = await smoke(
         provider,
+        await recordFor(fake_builder),
         environment,
-        await recordFor(provider),
         files,
         "run-2",
     );
@@ -348,8 +372,8 @@ Deno.test("a run that cannot destroy its sandbox fails even when every check pas
 
     const report = await smoke(
         provider,
+        await recordFor(fake_builder),
         environment,
-        await recordFor(provider),
         files,
         "run-3",
     );
@@ -372,8 +396,8 @@ Deno.test("an observer that does not report fails the run instead of being judge
 
     const report = await smoke(
         provider,
+        await recordFor(fake_builder),
         environment,
-        await recordFor(provider),
         files,
         "run-4",
     );
@@ -385,30 +409,34 @@ Deno.test("an observer that does not report fails the run instead of being judge
 });
 
 Deno.test("an image built from other inputs is refused before any sandbox is created", async () => {
-    const provider = fakeProvider();
-    const record = await recordFor(provider);
+    let started = 0;
+    const builder: ImageBuilder = {
+        ...fake_builder,
+        sandboxes: () => {
+            started++;
+            return fakeProvider();
+        },
+    };
+    const record = await recordFor(builder);
 
     await assert.rejects(
-        smoke(
-            provider,
+        recordedSandboxes(
+            builder,
             { ...environment, resources: { vcpus: 2, memory_mib: 2048 } },
             record,
-            files,
-            "run-5",
         ),
         StaleImage,
     );
     await assert.rejects(
-        smoke(
-            provider,
-            environment,
-            { ...record, input_sha256: "0".repeat(64) },
-            files,
-            "run-5",
-        ),
+        recordedSandboxes(builder, environment, {
+            ...record,
+            input_sha256: "0".repeat(64),
+        }),
         StaleImage,
     );
-    assert.equal(provider.cloud.created, 0);
+    assert.equal(started, 0);
+    await recordedSandboxes(builder, environment, record);
+    assert.equal(started, 1);
 });
 
 Deno.test("an artifact that would contain a credential is refused", () => {
@@ -436,8 +464,8 @@ Deno.test("a sandbox that would not run the recorded build fails the run and is 
 
     const report = await smoke(
         provider,
+        await recordFor(fake_builder),
         environment,
-        await recordFor(provider),
         files,
         "run-6",
     );
@@ -464,8 +492,8 @@ Deno.test("the sandbox a run started is destroyed even when the listing is stale
 
     const report = await smoke(
         provider,
+        await recordFor(fake_builder),
         environment,
-        await recordFor(provider),
         files,
         "run-7",
     );
@@ -480,8 +508,8 @@ Deno.test("a failed listing still destroys the sandbox the run started, and fail
 
     const report = await smoke(
         provider,
+        await recordFor(fake_builder),
         environment,
-        await recordFor(provider),
         files,
         "run-8",
     );

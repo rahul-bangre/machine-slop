@@ -3,9 +3,9 @@ import { CommandExitError, Sandbox, SandboxNotFoundError, Template } from "e2b";
 import {
     type BuiltImage,
     type Guest,
+    type ImageBuilder,
     ImageMismatch,
     type Owner,
-    type Provider,
     requireEnv,
     untilGone,
 } from "./provider.ts";
@@ -32,7 +32,7 @@ async function requireTaggedBuild(image: BuiltImage): Promise<void> {
     }
 }
 
-export function e2bProvider(): Provider {
+export function e2bProvider(): ImageBuilder {
     requireEnv("E2B_API_KEY", "e2b");
     return {
         name: "e2b",
@@ -55,67 +55,75 @@ export function e2bProvider(): Provider {
                 details: { build_id: built.buildId, tag },
             };
         },
-        async start(image: BuiltImage, owner: Owner): Promise<Guest> {
-            await requireTaggedBuild(image);
-            const sandbox = await Sandbox.create(image.ref, {
-                metadata: owner,
-                timeoutMs: abandoned_sandbox_lifetime_ms,
-                allowInternetAccess: false,
-            });
-            const info = await sandbox.getInfo();
-            if (info.templateId !== image.id) {
-                throw new ImageMismatch("e2b", image.id, info.templateId);
-            }
-            return {
-                id: sandbox.sandboxId,
-                reported: { vcpus: info.cpuCount, memory_mib: info.memoryMB },
-                async write(path, content) {
-                    await sandbox.files.write(path, content);
-                },
-                async exec(command, timeout_ms) {
-                    try {
-                        const result = await sandbox.commands.run(command, {
-                            timeoutMs: timeout_ms,
-                        });
-                        return {
-                            exit_code: result.exitCode,
-                            output: `${result.stderr}${result.stdout}`,
-                        };
-                    } catch (error) {
-                        if (!(error instanceof CommandExitError)) throw error;
-                        return {
-                            exit_code: error.exitCode,
-                            output: `${error.stderr}${error.stdout}`,
-                        };
-                    }
-                },
-            };
-        },
-        async owned(owner) {
-            const pages = Sandbox.list({ query: { metadata: owner } });
-            const ids: string[] = [];
-            while (pages.hasNext) {
-                for (const info of await pages.nextItems()) {
-                    ids.push(info.sandboxId);
+        sandboxes: (image) => ({
+            name: "e2b",
+            async start(owner: Owner): Promise<Guest> {
+                await requireTaggedBuild(image);
+                const sandbox = await Sandbox.create(image.ref, {
+                    metadata: owner,
+                    timeoutMs: abandoned_sandbox_lifetime_ms,
+                    allowInternetAccess: false,
+                });
+                const info = await sandbox.getInfo();
+                if (info.templateId !== image.id) {
+                    throw new ImageMismatch("e2b", image.id, info.templateId);
                 }
-            }
-            return ids;
-        },
-        async destroy(id) {
-            await Sandbox.kill(id);
-            await untilGone(
-                id,
-                () =>
-                    Sandbox.getInfo(id).then(
-                        () => false,
-                        (error) => {
-                            if (error instanceof SandboxNotFoundError) {
-                                return true;
+                return {
+                    id: sandbox.sandboxId,
+                    reported: {
+                        vcpus: info.cpuCount,
+                        memory_mib: info.memoryMB,
+                    },
+                    async write(path, content) {
+                        await sandbox.files.write(path, content);
+                    },
+                    async exec(command, timeout_ms) {
+                        try {
+                            const result = await sandbox.commands.run(command, {
+                                timeoutMs: timeout_ms,
+                            });
+                            return {
+                                exit_code: result.exitCode,
+                                output: `${result.stderr}${result.stdout}`,
+                            };
+                        } catch (error) {
+                            if (!(error instanceof CommandExitError)) {
+                                throw error;
                             }
-                            throw error;
-                        },
-                    ),
-            );
-        },
+                            return {
+                                exit_code: error.exitCode,
+                                output: `${error.stderr}${error.stdout}`,
+                            };
+                        }
+                    },
+                };
+            },
+            async owned(owner) {
+                const pages = Sandbox.list({ query: { metadata: owner } });
+                const ids: string[] = [];
+                while (pages.hasNext) {
+                    for (const info of await pages.nextItems()) {
+                        ids.push(info.sandboxId);
+                    }
+                }
+                return ids;
+            },
+            async destroy(id) {
+                await Sandbox.kill(id);
+                await untilGone(
+                    id,
+                    () =>
+                        Sandbox.getInfo(id).then(
+                            () => false,
+                            (error) => {
+                                if (error instanceof SandboxNotFoundError) {
+                                    return true;
+                                }
+                                throw error;
+                            },
+                        ),
+                );
+            },
+        }),
     };
 }

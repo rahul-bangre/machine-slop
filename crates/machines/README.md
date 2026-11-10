@@ -74,8 +74,18 @@ The root filesystem is one read-only ext4 image shared by every machine. Writes
 go to an overlay on the machine's own sparse 8 GiB scratch disk, so a machine
 starts with the image's contents and nothing another machine wrote. `agentd`
 runs as root under `tini` in `/workspace` and listens on vsock port 3000. The
-image includes `curl`, `git`, `nodejs`, `python3` with `pip` and `venv`, and
-`build-essential`.
+image includes `curl`, `git`, `nodejs`, `python3` with `pip` and `venv`,
+`build-essential`, Deno, and a headless Chromium at `/usr/local/bin/chromium`.
+
+On x86_64 the browser is the Chrome for Testing build pinned in
+`bench/browser/chromium.json`, the same one the E2B and Daytona benchmark images
+use. Chrome for Testing has no Linux arm64 build, so on aarch64 it is Debian's
+`chromium` from the image's snapshot. Run it as
+`chromium --headless=new --no-sandbox` in a machine with at least 1024 MiB: at
+the 512 MiB default its renderer cannot reserve memory and page loads never
+finish. It loads pages served inside the machine directly and allowed HTTPS
+sites through egress, with no proxy flags. To drive it from outside, start it
+with `--remote-debugging-port` and reach that port with `machine.forward`.
 
 ## Egress
 
@@ -108,8 +118,8 @@ point at `127.0.0.1:3128`, where `socat` forwards each connection over vsock to
 `machined`. `machined` accepts only `CONNECT host:443`, checks the host against
 the list, resolves it itself, and connects only to public unicast addresses, so
 even `*` cannot reach the host's loopback, private networks, link-local metadata
-endpoints or the host's own public address. curl, git over HTTPS, pip and
-Python's `urllib` honour the proxy variables.
+endpoints or the host's own public address. curl, git over HTTPS, pip, Python's
+`urllib` and Chromium honour the proxy variables.
 
 A refusal is an HTTP response to the `CONNECT` with a plain-text reason:
 
@@ -141,11 +151,12 @@ and git over SSH.
 `machined <listen address> <image dir> <state dir>`
 
 The image dir holds `firecracker`, `vmlinux` and `rootfs.ext4`, built by
-`vm/image/build.sh <image dir> <agentd binary>`. The script pins Firecracker and
-the guest kernel by hash and Debian by snapshot date, and rebuilds the root
-filesystem only when its inputs change. Building the image on Ubuntu requires
-`mmdebstrap`, `e2fsprogs` and `debian-archive-keyring`; the Debian keyring
-verifies the pinned snapshot.
+`vm/image/build.sh <image dir> <agentd binary>`. The script pins Firecracker,
+the guest kernel, Chrome for Testing and Deno by hash and Debian by snapshot
+date, installing from its `trixie`, `trixie-updates` and `trixie-security`
+suites, and rebuilds the root filesystem only when its inputs change. It needs
+`mmdebstrap`, `e2fsprogs`, `debian-archive-keyring` and `python3` on the host.
+The Debian keyring verifies the pinned snapshot.
 
 `machined` holds a lock on its state dir. On start it kills Firecracker
 processes left by an earlier `machined` that died and removes their files. On
