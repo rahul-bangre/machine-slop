@@ -73,9 +73,10 @@ async fn destroy(
 async fn proxy(
     State(machines): State<Arc<Machines>>,
     Path((id, _)): Path<(String, String)>,
-    request: Request,
+    mut request: Request,
 ) -> Result<Response, ApiError> {
-    let machine = machines.begin_use(&id).await.ok_or_else(unknown_machine)?;
+    let machine = Arc::new(machines.begin_use(&id).await.ok_or_else(unknown_machine)?);
+    let client_upgrade = hyper::upgrade::on(&mut request);
     let (mut parts, body) = request.into_parts();
     parts.uri = agentd_uri(&parts.uri, &id)?;
     parts
@@ -86,14 +87,28 @@ async fn proxy(
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(unreachable_agentd)?;
+    let connection_use = machine.clone();
     tokio::spawn(async move {
-        let _machine_in_use_until_agentd_disconnects = machine;
-        connection.await
+        let _machine_in_use_until_agentd_disconnects = connection_use;
+        connection.with_upgrades().await
     });
-    let response = sender
+    let mut response = sender
         .send_request(Request::from_parts(parts, body))
         .await
         .map_err(unreachable_agentd)?;
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let agentd_upgrade = hyper::upgrade::on(&mut response);
+        tokio::spawn(async move {
+            let _machine_in_use_until_the_tunnel_ends = machine;
+            if let (Ok(client), Ok(agentd)) = tokio::join!(client_upgrade, agentd_upgrade) {
+                let _ = tokio::io::copy_bidirectional(
+                    &mut TokioIo::new(client),
+                    &mut TokioIo::new(agentd),
+                )
+                .await;
+            }
+        });
+    }
     Ok(response.map(Body::new))
 }
 

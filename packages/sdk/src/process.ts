@@ -3,6 +3,7 @@ import type {
     ProcessEvent,
     ProcessInfo,
     ProcessResult,
+    TerminalSize,
 } from "./process.gen.ts";
 
 export type OutputEvent = Exclude<ProcessEvent, { type: "gap" }>;
@@ -55,6 +56,15 @@ export class Process {
             new Uint8Array(),
             signal,
         );
+    }
+
+    async resize(size: TerminalSize, signal?: AbortSignal): Promise<void> {
+        await request(this.url, `${this.path()}/terminal`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(size),
+            signal: signal ?? null,
+        });
     }
 
     async *events(

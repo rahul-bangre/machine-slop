@@ -19,14 +19,14 @@ console.log(info.boot_ms, await process.wait());
 await machine.destroy();
 ```
 
-| Request                 | Result                                                                    |
-| ----------------------- | ------------------------------------------------------------------------- |
-| `POST /machines`        | Boots a machine and returns `MachineInfo` once `agentd` answers `/health` |
-| `GET /machines`         | Lists machines                                                            |
-| `GET /machines/{id}`    | `MachineInfo`                                                             |
-| `PATCH /machines/{id}`  | Replaces the machine's `allowed_hosts` and returns `MachineInfo`          |
-| `DELETE /machines/{id}` | Kills the VM and removes its files                                        |
-| `/machines/{id}/...`    | Forwarded to that machine's `agentd`, so `HostedMachine` is a `Machine`   |
+| Request                 | Result                                                                                     |
+| ----------------------- | ------------------------------------------------------------------------------------------ |
+| `POST /machines`        | Boots a machine and returns `MachineInfo` once `agentd` answers `/health`                  |
+| `GET /machines`         | Lists machines                                                                             |
+| `GET /machines/{id}`    | `MachineInfo`                                                                              |
+| `PATCH /machines/{id}`  | Replaces the machine's `allowed_hosts` and returns `MachineInfo`                           |
+| `DELETE /machines/{id}` | Kills the VM and removes its files                                                         |
+| `/machines/{id}/...`    | Forwarded to that machine's `agentd`, upgrades included, so `HostedMachine` is a `Machine` |
 
 A machine defaults to 2 vCPUs and 512 MiB. `boot_ms` runs from the start of the
 request until `agentd` is healthy. A create or delete finishes even if its

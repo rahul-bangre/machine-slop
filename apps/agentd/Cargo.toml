@@ -7,11 +7,17 @@ publish.workspace = true
 
 [dependencies]
 axum.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 slop-process = { path = "../../crates/process" }
 async-stream = "0.3.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tar = { version = "0.4.46", default-features = false }
+tempfile = { version = "3", default-features = false }
+futures-util = { version = "0.3", default-features = false }
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "=0.7.2"

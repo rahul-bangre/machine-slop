@@ -1,9 +1,14 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     io,
-    os::unix::process::ExitStatusExt,
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::process::ExitStatusExt,
+    },
+    pin::Pin,
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -11,30 +16,36 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Bytes;
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     process::{Child, Command},
     sync::{mpsc, oneshot, watch},
     time::{Instant, sleep_until},
 };
 use uuid::Uuid;
 
-use crate::{ProcessEvent, ProcessInfo, ProcessResult, ProcessStatus, StartProcess};
+use crate::{ProcessEvent, ProcessInfo, ProcessResult, ProcessStatus, StartProcess, TerminalSize};
 
 const MAX_PROCESSES: usize = 128;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_EVENTS: usize = 256;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const STDIN_QUEUE: usize = 8;
+const DEFAULT_TERM: &str = "xterm-256color";
 
 #[derive(Debug)]
 pub enum ProcessError {
     Capacity,
     ShuttingDown,
+    Invalid(String),
     Spawn(io::Error),
     InvalidCursor,
     Gap { first_seq: u64 },
     StdinClosed { offset: u64 },
     StdinOffsetAhead { offset: u64 },
+    TerminalInputStaysOpen,
+    NotATerminal,
+    Finished,
+    Resize(io::Error),
 }
 
 #[derive(Default)]
@@ -50,6 +61,18 @@ struct Registry {
 
 impl Processes {
     pub fn start(&self, request: StartProcess) -> Result<Arc<Process>, ProcessError> {
+        let close_stdin = match (request.terminal, request.keep_stdin_open) {
+            (Some(_), Some(false)) => {
+                return Err(ProcessError::Invalid(
+                    "a terminal's input stays open; omit keep_stdin_open or set it to true".into(),
+                ));
+            }
+            (Some(size), _) => {
+                require_visible_size(size)?;
+                false
+            }
+            (None, keep_open) => !keep_open.unwrap_or(false),
+        };
         let mut registry = self.registry.lock().expect("process registry poisoned");
         if registry.closed {
             return Err(ProcessError::ShuttingDown);
@@ -68,29 +91,27 @@ impl Processes {
         } else {
             None
         };
-        let mut command = Command::new(request.program);
-        command
-            .args(request.args.unwrap_or_default())
-            .envs(request.env.unwrap_or_default())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
-        if let Some(cwd) = request.cwd {
-            command.current_dir(cwd);
+        let program = Program {
+            program: request.program,
+            args: request.args.unwrap_or_default(),
+            env: request.env.unwrap_or_default(),
+            cwd: request.cwd,
+        };
+        let (child, io, terminal) = match request.terminal {
+            None => program.spawn_with_pipes(),
+            Some(size) => program.spawn_in_terminal(size),
         }
-        let child = command.spawn().map_err(ProcessError::Spawn)?;
+        .map_err(ProcessError::Spawn)?;
         let group = child
             .id()
             .and_then(|id| Pid::from_raw(id as i32))
             .expect("unreaped child has a pid");
         let (stdin_requests, requests) = mpsc::channel(STDIN_QUEUE);
-        let process = Arc::new(Process::new(stdin_requests));
+        let process = Arc::new(Process::new(stdin_requests, terminal));
         let initial_stdin = StdinWrite {
             offset: 0,
             data: Bytes::from(request.stdin.unwrap_or_default()),
-            close: !request.keep_stdin_open.unwrap_or(false),
+            close: close_stdin,
             reply: None,
         };
         if let Some(id) = evict {
@@ -101,6 +122,7 @@ impl Processes {
             process.clone(),
             child,
             group,
+            io,
             initial_stdin,
             requests,
         ));
@@ -147,6 +169,12 @@ struct Log {
     next_seq: u64,
     stdin_offset: u64,
     stdin_open: bool,
+    terminal: Option<Terminal>,
+}
+
+struct Terminal {
+    size: TerminalSize,
+    control: Option<OwnedFd>,
 }
 
 struct StdinWrite {
@@ -192,7 +220,7 @@ pub struct EventBatch {
 }
 
 impl Process {
-    fn new(stdin: mpsc::Sender<StdinWrite>) -> Self {
+    fn new(stdin: mpsc::Sender<StdinWrite>, terminal: Option<Terminal>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             created: Instant::now(),
@@ -203,6 +231,7 @@ impl Process {
                 next_seq: 0,
                 stdin_offset: 0,
                 stdin_open: true,
+                terminal,
             }),
             changed: watch::channel(()).0,
             kill: watch::channel(false).0,
@@ -219,6 +248,7 @@ impl Process {
             next_seq: log.next_seq,
             stdin_offset: log.stdin_offset,
             stdin_open: log.stdin_open,
+            terminal: log.terminal.as_ref().map(|terminal| terminal.size),
         }
     }
 
@@ -249,6 +279,16 @@ impl Process {
         data: Bytes,
         close: bool,
     ) -> Result<(), ProcessError> {
+        if close
+            && self
+                .log
+                .lock()
+                .expect("process log poisoned")
+                .terminal
+                .is_some()
+        {
+            return Err(ProcessError::TerminalInputStaysOpen);
+        }
         let (reply, outcome) = oneshot::channel();
         let request = StdinWrite {
             offset,
@@ -262,6 +302,16 @@ impl Process {
             return after_supervisor_exit();
         }
         outcome.await.unwrap_or_else(|_| after_supervisor_exit())
+    }
+
+    pub fn resize_terminal(&self, size: TerminalSize) -> Result<(), ProcessError> {
+        require_visible_size(size)?;
+        let mut log = self.log.lock().expect("process log poisoned");
+        let terminal = log.terminal.as_mut().ok_or(ProcessError::NotATerminal)?;
+        let control = terminal.control.as_ref().ok_or(ProcessError::Finished)?;
+        set_terminal_size(control, size).map_err(ProcessError::Resize)?;
+        terminal.size = size;
+        Ok(())
     }
 
     pub fn events(&self, cursor: u64) -> Result<EventBatch, ProcessError> {
@@ -319,6 +369,9 @@ impl Process {
 
     fn finish(&self, result: ProcessResult) {
         let mut log = self.log.lock().expect("process log poisoned");
+        if let Some(terminal) = log.terminal.as_mut() {
+            terminal.control = None;
+        }
         log.status = ProcessStatus::Finished {
             result: result.clone(),
         };
@@ -369,12 +422,16 @@ async fn supervise(
     process: Arc<Process>,
     mut child: Child,
     group: Pid,
+    io: ChildIo,
     initial_stdin: StdinWrite,
     mut stdin_requests: mpsc::Receiver<StdinWrite>,
 ) {
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let mut stderr = child.stderr.take().expect("stderr is piped");
-    let mut stdin = child.stdin.take();
+    let ChildIo {
+        stdin,
+        mut stdout,
+        mut stderr,
+    } = io;
+    let mut stdin = Some(stdin);
     let mut stdin_offset = 0;
     let mut stdin_complete = true;
     let mut pending = initial_stdin.admit(true, 0);
@@ -474,6 +531,121 @@ async fn supervise(
     };
     process.record_stdin(stdin_offset, false);
     process.finish(result);
+}
+
+struct Program {
+    program: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: Option<String>,
+}
+
+struct ChildIo {
+    stdin: Box<dyn AsyncWrite + Send + Unpin>,
+    stdout: Box<dyn AsyncRead + Send + Unpin>,
+    stderr: Box<dyn AsyncRead + Send + Unpin>,
+}
+
+impl Program {
+    fn spawn_with_pipes(self) -> io::Result<(Child, ChildIo, Option<Terminal>)> {
+        let mut command = Command::new(self.program);
+        command
+            .args(self.args)
+            .envs(self.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        if let Some(cwd) = self.cwd {
+            command.current_dir(cwd);
+        }
+        let mut child = command.spawn()?;
+        let io = ChildIo {
+            stdin: Box::new(child.stdin.take().expect("stdin is piped")),
+            stdout: Box::new(child.stdout.take().expect("stdout is piped")),
+            stderr: Box::new(child.stderr.take().expect("stderr is piped")),
+        };
+        Ok((child, io, None))
+    }
+
+    fn spawn_in_terminal(
+        self,
+        size: TerminalSize,
+    ) -> io::Result<(Child, ChildIo, Option<Terminal>)> {
+        let (pty, pts) = pty_process::open().map_err(pty_error)?;
+        let control = pty.as_fd().try_clone_to_owned()?;
+        set_terminal_size(&control, size)?;
+        let mut command = pty_process::Command::new(self.program)
+            .args(self.args)
+            .env("TERM", DEFAULT_TERM)
+            .envs(self.env)
+            .kill_on_drop(true);
+        if let Some(cwd) = self.cwd {
+            command = command.current_dir(cwd);
+        }
+        let child = command.spawn(pts).map_err(pty_error)?;
+        let (output, input) = pty.into_split();
+        let io = ChildIo {
+            stdin: Box::new(input),
+            stdout: Box::new(TerminalOutput(output)),
+            stderr: Box::new(tokio::io::empty()),
+        };
+        let terminal = Terminal {
+            size,
+            control: Some(control),
+        };
+        Ok((child, io, Some(terminal)))
+    }
+}
+
+struct TerminalOutput(pty_process::OwnedReadPty);
+
+impl AsyncRead for TerminalOutput {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match Pin::new(&mut self.0).poll_read(cx, buf) {
+            Poll::Ready(Err(error))
+                if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) =>
+            {
+                Poll::Ready(Ok(()))
+            }
+            polled => polled,
+        }
+    }
+}
+
+fn require_visible_size(size: TerminalSize) -> Result<(), ProcessError> {
+    if size.rows == 0 || size.cols == 0 {
+        return Err(ProcessError::Invalid(
+            "terminal rows and cols must be at least 1".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn set_terminal_size(control: &OwnedFd, size: TerminalSize) -> io::Result<()> {
+    rustix::termios::tcsetwinsize(
+        control,
+        rustix::termios::Winsize {
+            ws_row: size.rows,
+            ws_col: size.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .map_err(io::Error::from)
+}
+
+fn pty_error(error: pty_process::Error) -> io::Error {
+    match error {
+        pty_process::Error::Io(error) => error,
+        pty_process::Error::Rustix(errno) => errno.into(),
+        other => io::Error::other(other.to_string()),
+    }
 }
 
 fn exit_result(status: ExitStatus, output_complete: bool, stdin_complete: bool) -> ProcessResult {

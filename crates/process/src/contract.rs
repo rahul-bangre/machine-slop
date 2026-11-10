@@ -22,6 +22,16 @@ pub struct StartProcess {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub keep_stdin_open: Option<bool>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub terminal: Option<TerminalSize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalSize {
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]
@@ -56,6 +66,7 @@ pub struct ProcessInfo {
     #[ts(type = "number")]
     pub stdin_offset: u64,
     pub stdin_open: bool,
+    pub terminal: Option<TerminalSize>,
 }
 
 #[derive(Debug, Serialize, TS)]

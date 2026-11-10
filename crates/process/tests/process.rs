@@ -3,7 +3,7 @@ use std::{path::Path, time::Duration};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Bytes;
 use rustix::process::{Pid, test_kill_process};
-use slop_process::{Process, ProcessError, ProcessResult, Processes, StartProcess};
+use slop_process::{Process, ProcessError, ProcessResult, Processes, StartProcess, TerminalSize};
 use tokio::time::{Instant, sleep, timeout};
 
 fn command(program: &str, args: &[&str]) -> StartProcess {
@@ -14,6 +14,7 @@ fn command(program: &str, args: &[&str]) -> StartProcess {
         cwd: None,
         stdin: None,
         keep_stdin_open: None,
+        terminal: None,
     }
 }
 
@@ -244,4 +245,119 @@ async fn input_the_program_never_reads_is_reported_incomplete() {
             ..
         }
     ));
+}
+
+fn in_terminal(script: &str, rows: u16, cols: u16) -> StartProcess {
+    StartProcess {
+        terminal: Some(TerminalSize { rows, cols }),
+        ..command("/bin/sh", &["-c", script])
+    }
+}
+
+async fn stdout_until(process: &Process, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = stdout(process);
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{needle:?} never appeared in {text:?}"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_terminal_process_owns_a_sized_controlling_terminal() {
+    let processes = Processes::default();
+    let process = processes
+        .start(in_terminal(
+            "test -t 0 && test -t 1 && test -t 2 && echo \"$TERM\" && stty size && \
+             read line && echo \"got $line\" && stty size && echo \"leader $$ $(ps -o sid= -p $$ | tr -d ' ')\"",
+            24,
+            80,
+        ))
+        .unwrap();
+    stdout_until(&process, "24 80").await;
+    process
+        .resize_terminal(TerminalSize {
+            rows: 40,
+            cols: 120,
+        })
+        .unwrap();
+    assert_eq!(
+        process.info().terminal,
+        Some(TerminalSize {
+            rows: 40,
+            cols: 120
+        })
+    );
+    process
+        .write_stdin(0, Bytes::from_static(b"typed\n"), false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        finish(&process).await,
+        ProcessResult::Exited {
+            code: Some(0),
+            output_complete: true,
+            stdin_complete: true,
+            ..
+        }
+    ));
+    let output = stdout(&process).replace("\r\n", "\n");
+    let (expected, leader) = output.rsplit_once("leader ").unwrap();
+    assert_eq!(
+        expected,
+        "xterm-256color\n24 80\ntyped\ngot typed\n40 120\n"
+    );
+    let (pid, session) = leader.trim().split_once(' ').unwrap();
+    assert_eq!(pid, session, "the program leads its own session");
+    assert!(matches!(
+        process.resize_terminal(TerminalSize { rows: 1, cols: 1 }),
+        Err(ProcessError::Finished)
+    ));
+}
+
+#[tokio::test]
+async fn terminal_input_stays_open_and_sizes_are_validated() {
+    let processes = Processes::default();
+    for request in [
+        StartProcess {
+            keep_stdin_open: Some(false),
+            ..in_terminal("true", 24, 80)
+        },
+        in_terminal("true", 0, 80),
+    ] {
+        assert!(matches!(
+            processes.start(request),
+            Err(ProcessError::Invalid(_))
+        ));
+    }
+    let process = processes.start(in_terminal("cat", 24, 80)).unwrap();
+    assert!(matches!(
+        process.write_stdin(0, Bytes::from_static(b"x"), true).await,
+        Err(ProcessError::TerminalInputStaysOpen)
+    ));
+    assert!(matches!(
+        process.resize_terminal(TerminalSize { rows: 0, cols: 1 }),
+        Err(ProcessError::Invalid(_))
+    ));
+    assert!(process.info().stdin_open);
+    process.kill();
+    assert!(matches!(
+        finish(&process).await,
+        ProcessResult::Exited {
+            signal: Some(9),
+            ..
+        }
+    ));
+    let piped = processes.start(sleep_request()).unwrap();
+    assert!(matches!(
+        piped.resize_terminal(TerminalSize { rows: 24, cols: 80 }),
+        Err(ProcessError::NotATerminal)
+    ));
+    piped.kill();
 }

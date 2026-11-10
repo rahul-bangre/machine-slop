@@ -10,7 +10,10 @@ use axum::{
 use serde::Deserialize;
 use slop_process::{
     Process, ProcessError, ProcessEvent, ProcessInfo, ProcessResult, Processes, StartProcess,
+    TerminalSize,
 };
+
+use crate::error::ApiError;
 
 pub async fn start(
     State(processes): State<Arc<Processes>>,
@@ -58,6 +61,15 @@ pub async fn write_stdin(
     find(&processes, &id)?
         .write_stdin(offset, data, close)
         .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn resize_terminal(
+    State(processes): State<Arc<Processes>>,
+    Path(id): Path<String>,
+    Json(size): Json<TerminalSize>,
+) -> Result<StatusCode, ApiError> {
+    find(&processes, &id)?.resize_terminal(size)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -115,44 +127,4 @@ fn find(processes: &Processes, id: &str) -> Result<Arc<Process>, ApiError> {
         StatusCode::NOT_FOUND,
         "unknown or expired process".into(),
     ))
-}
-
-pub struct ApiError(StatusCode, String);
-
-impl From<ProcessError> for ApiError {
-    fn from(error: ProcessError) -> Self {
-        match error {
-            ProcessError::ShuttingDown => Self(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "daemon is shutting down".into(),
-            ),
-            ProcessError::Capacity => Self(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "process capacity reached".into(),
-            ),
-            ProcessError::Spawn(error) => Self(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
-            ProcessError::InvalidCursor => Self(
-                StatusCode::BAD_REQUEST,
-                "cursor is ahead of process output".into(),
-            ),
-            ProcessError::StdinClosed { offset } => Self(
-                StatusCode::CONFLICT,
-                format!("stdin is closed; {offset} bytes were written"),
-            ),
-            ProcessError::StdinOffsetAhead { offset } => Self(
-                StatusCode::CONFLICT,
-                format!("stdin offset is ahead; next offset is {offset}"),
-            ),
-            ProcessError::Gap { first_seq } => Self(
-                StatusCode::GONE,
-                format!("output expired; first available cursor is {first_seq}"),
-            ),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (self.0, self.1).into_response()
-    }
 }

@@ -34,13 +34,25 @@ Reconnect with `machine.process(id)` and `events(last_seq + 1)`. Disconnecting
 leaves execution running. State lasts until daemon restart or record eviction.
 Starts are not idempotent; do not retry a lost start response automatically.
 
+With `terminal: { rows, cols }`, the program runs in a new session whose
+controlling terminal is a pseudo-terminal of that size, with `TERM` set to
+`xterm-256color` unless `env` sets it. Its stdout and stderr are the terminal,
+so terminal output, including echoed input, arrives as `stdout` events. Stdin
+writes are typed into the terminal and keep the same offset rules. A terminal's
+input stays open until the program exits: `keep_stdin_open: false` is rejected
+with HTTP 422 and `closeStdin` with HTTP 409; send `\x04` for end of input in
+canonical mode. `resize(size)` returns once the kernel has the new size, which
+also signals `SIGWINCH` to the terminal's foreground group; `info().terminal`
+reports the current size, and resizing a finished or non-terminal process
+returns HTTP 409.
+
 Each process runs in its own process group. `kill()` sends SIGKILL to the group,
 and when the program exits, anything still running in its group is killed. A
-descendant that leaves the group, for example with `setsid`, is not tracked.
-`wait()` returns an observed exit or an `unknown` outcome. `stdin_complete` is
-false when accepted input was never written because the program exited or closed
-stdin. `output_complete` reports EOF on both output pipes; draining stops one
-second after child exit.
+descendant that leaves the group, for example with `setsid` or a job-control
+shell's job in a terminal, is not tracked. `wait()` returns an observed exit or
+an `unknown` outcome. `stdin_complete` is false when accepted input was never
+written because the program exited or closed stdin. `output_complete` reports
+EOF on both output pipes; draining stops one second after child exit.
 
 Replay retains at most 1 MiB of encoded output and 256 events per process.
 Expired cursors return HTTP 410; use `info().first_seq` to resume with loss. A

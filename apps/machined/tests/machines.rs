@@ -120,6 +120,33 @@ impl Host {
         result["code"].clone()
     }
 
+    async fn exchange(&self, head: &str, body: &[u8]) -> Vec<u8> {
+        let mut stream = TcpStream::connect(&self.address).await.expect("connect");
+        stream.write_all(head.as_bytes()).await.expect("write head");
+        stream.write_all(body).await.expect("write body");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.expect("read");
+        response
+    }
+
+    async fn tunnel(&self, machine: &str, port: u16) -> Option<TcpStream> {
+        let mut stream = TcpStream::connect(&self.address).await.expect("connect");
+        stream
+            .write_all(
+                format!(
+                    "GET /machines/{machine}/ports/{port} HTTP/1.1\r\nHost: machined\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write upgrade");
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.expect("read upgrade response"));
+        }
+        head.starts_with(b"HTTP/1.1 101 ").then_some(stream)
+    }
+
     fn firecracker_pid(&self, machine: &str) -> String {
         std::fs::read_to_string(
             self.state_dir
@@ -492,6 +519,86 @@ async fn allowed_hosts_change_while_a_machine_runs_and_revocation_closes_tunnels
     assert_eq!(info["allowed_hosts"], json!([]));
 
     let (status, _) = host.request("DELETE", &path, None).await;
+    assert_eq!(status, 204);
+    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+}
+
+fn body_of(response: &[u8]) -> &[u8] {
+    let end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("http response");
+    &response[end + 4..]
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn files_and_ports_reach_the_machine_through_the_host() {
+    let host = Host::start("files-ports").await;
+    let machine = host.create().await;
+    let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let put = host
+        .exchange(
+            &format!(
+                "PUT /machines/{machine}/files/workspace/site/data.bin HTTP/1.1\r\nHost: machined\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                content.len()
+            ),
+            &content,
+        )
+        .await;
+    assert!(
+        put.starts_with(b"HTTP/1.1 204 "),
+        "{}",
+        String::from_utf8_lossy(&put)
+    );
+    let get = host
+        .exchange(
+            &format!(
+                "GET /machines/{machine}/files/workspace/site/data.bin HTTP/1.1\r\nHost: machined\r\nConnection: close\r\n\r\n"
+            ),
+            &[],
+        )
+        .await;
+    assert_eq!(body_of(&get), content);
+
+    let (status, _) = host
+        .request(
+            "POST",
+            &format!("/machines/{machine}/processes"),
+            Some(json!({
+                "program": "python3",
+                "args": ["-m", "http.server", "8000", "--bind", "127.0.0.1"],
+                "cwd": "/workspace/site",
+            })),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut tunnel = loop {
+        if let Some(tunnel) = host.tunnel(&machine, 8000).await {
+            break tunnel;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "web server in the machine never accepted a tunnel"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    tunnel
+        .write_all(b"GET /data.bin HTTP/1.0\r\n\r\n")
+        .await
+        .expect("write through tunnel");
+    let mut response = Vec::new();
+    tunnel
+        .read_to_end(&mut response)
+        .await
+        .expect("read through tunnel");
+    assert!(response.starts_with(b"HTTP/1.0 200 "));
+    assert_eq!(body_of(&response), content);
+
+    let (status, _) = host
+        .request("DELETE", &format!("/machines/{machine}"), None)
+        .await;
     assert_eq!(status, 204);
     std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
 }
