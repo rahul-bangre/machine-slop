@@ -53,11 +53,16 @@ function ref(text: string, pattern: RegExp): string {
     return match[1]!;
 }
 
-async function navigate(browser: Browser, driver: Driver): Promise<void> {
+async function navigate(
+    browser: Browser,
+    driver: Driver,
+    html = fixture,
+    ready = "Native fixture",
+): Promise<void> {
     await browser.page.send("Page.navigate", {
-        url: `data:text/html,${encodeURIComponent(fixture)}`,
+        url: `data:text/html,${encodeURIComponent(html)}`,
     });
-    await driver.wait({ text: "Native fixture" }, 3000);
+    await driver.wait({ text: ready }, 3000);
     await browser.page.send("Runtime.evaluate", {
         expression:
             "new Promise(resolve => { if (document.readyState === 'complete') resolve(); else addEventListener('load', resolve, {once:true}); })",
@@ -349,6 +354,35 @@ Deno.test("native driver delivers fresh scoped accessibility and actual UI input
                 (await driver.observe({ mode: "full" })).text,
                 /textbox "Account".*value="original"/,
             );
+        });
+        await test.step("document replacement during pointer movement cannot redirect the click", async () => {
+            const style =
+                "<style>button{position:fixed;left:50px;top:50px;width:200px;height:80px}</style>";
+            const replacement =
+                `${style}<button onclick="document.body.dataset.clicked='wrong'">After</button>`;
+            await navigate(
+                browser,
+                driver,
+                `${style}<button>Before</button><script>document.querySelector('button').onmouseover=()=>{document.open();document.write(${
+                    JSON.stringify(replacement)
+                });document.close()}</script>`,
+                "Before",
+            );
+            await assert.rejects(
+                driver.act({
+                    kind: "click",
+                    target: { role: "button", name: "Before" },
+                }, 1000),
+                /document changed/,
+            );
+            const { result } = await browser.page.send<
+                { result: { value: { text: string; clicked: string | null } } }
+            >("Runtime.evaluate", {
+                expression:
+                    "({text:document.body.innerText,clicked:document.body.dataset.clicked??null})",
+                returnByValue: true,
+            });
+            assert.deepEqual(result.value, { text: "After", clicked: null });
         });
     } finally {
         await driver.close();

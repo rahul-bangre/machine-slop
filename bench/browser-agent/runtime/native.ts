@@ -11,7 +11,12 @@ import type {
 } from "./driver.ts";
 
 type Node = AxNode & { backendDOMNodeId?: number; aria_sort?: string };
-type Operation = { deadline: number; timeout_ms: number; cancelled: boolean };
+type Operation = {
+    epoch: number;
+    deadline: number;
+    timeout_ms: number;
+    cancelled: boolean;
+};
 type Remote = {
     result: { value?: unknown; objectId?: string };
     exceptionDetails?: { text: string; exception?: { description?: string } };
@@ -101,6 +106,7 @@ class Native implements Driver {
     async act(action: Action, timeout_ms: number): Promise<void> {
         this.assertOpen();
         const operation = {
+            epoch: this.epoch,
             deadline: performance.now() + timeout_ms,
             timeout_ms,
             cancelled: false,
@@ -490,6 +496,7 @@ class Native implements Driver {
 
     private checkOperation(operation: Operation): void {
         this.assertOpen();
+        this.assertEpoch(operation.epoch);
         if (operation.cancelled || performance.now() >= operation.deadline) {
             throw new TimeoutError(
                 "native action (outcome uncertain; action was not replayed)",
