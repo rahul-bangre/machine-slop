@@ -8,6 +8,7 @@ const machine_info = {
     vcpus: 1,
     memory_mib: 256,
     boot_ms: 400,
+    idle_timeout_secs: 600,
 };
 
 const finished = {

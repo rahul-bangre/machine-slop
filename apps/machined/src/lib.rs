@@ -61,7 +61,7 @@ async fn proxy(
     Path((id, _)): Path<(String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let machine = find(&machines, &id).await?;
+    let machine = machines.begin_use(&id).await.ok_or_else(unknown_machine)?;
     let (mut parts, body) = request.into_parts();
     parts.uri = agentd_uri(&parts.uri, &id)?;
     parts
@@ -72,7 +72,10 @@ async fn proxy(
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(unreachable_agentd)?;
-    tokio::spawn(connection);
+    tokio::spawn(async move {
+        let _machine_in_use_until_agentd_disconnects = machine;
+        connection.await
+    });
     let response = sender
         .send_request(Request::from_parts(parts, body))
         .await

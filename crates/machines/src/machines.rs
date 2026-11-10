@@ -1,16 +1,25 @@
-use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    io,
+    ops::ControlFlow,
+    path::PathBuf,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, watch};
 
 use crate::{
     contract::{CreateMachine, MachineInfo},
-    machine::{BootError, Image, Machine, kill_stale_firecracker},
+    machine::{Activity, BootError, Image, Machine, MachineUse, kill_stale_firecracker},
 };
 
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 512;
+const DEFAULT_IDLE_TIMEOUT_SECS: u32 = 600;
 const MAX_VCPUS: u8 = 32;
 const MEMORY_MIB_RANGE: std::ops::RangeInclusive<u32> = 128..=32768;
+const IDLE_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u32> = 1..=86400;
 
 #[derive(Debug)]
 pub enum MachineError {
@@ -75,6 +84,9 @@ impl Machines {
     ) -> Result<Arc<Machine>, MachineError> {
         let vcpus = request.vcpus.unwrap_or(DEFAULT_VCPUS);
         let memory_mib = request.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB);
+        let idle_timeout_secs = request
+            .idle_timeout_secs
+            .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
         if !(1..=MAX_VCPUS).contains(&vcpus) {
             return Err(MachineError::Invalid(format!(
                 "vcpus must be between 1 and {MAX_VCPUS}"
@@ -87,11 +99,24 @@ impl Machines {
                 MEMORY_MIB_RANGE.end()
             )));
         }
+        if !IDLE_TIMEOUT_SECS_RANGE.contains(&idle_timeout_secs) {
+            return Err(MachineError::Invalid(format!(
+                "idle_timeout_secs must be between {} and {}",
+                IDLE_TIMEOUT_SECS_RANGE.start(),
+                IDLE_TIMEOUT_SECS_RANGE.end()
+            )));
+        }
         let machines = self.clone();
-        run_to_completion(async move { machines.boot(vcpus, memory_mib).await }).await
+        run_to_completion(async move { machines.boot(vcpus, memory_mib, idle_timeout_secs).await })
+            .await
     }
 
-    async fn boot(&self, vcpus: u8, memory_mib: u32) -> Result<Arc<Machine>, MachineError> {
+    async fn boot(
+        self: Arc<Self>,
+        vcpus: u8,
+        memory_mib: u32,
+        idle_timeout_secs: u32,
+    ) -> Result<Arc<Machine>, MachineError> {
         if self.state.lock().await.shutting_down {
             return Err(MachineError::ShuttingDown);
         }
@@ -107,6 +132,7 @@ impl Machines {
             &self.image,
             vcpus,
             memory_mib,
+            idle_timeout_secs,
             slot,
         )
         .await
@@ -118,12 +144,28 @@ impl Machines {
             return Err(MachineError::ShuttingDown);
         }
         let machine = Arc::new(machine);
-        state.running.insert(id, machine.clone());
+        state.running.insert(id.clone(), machine.clone());
+        drop(state);
+        tokio::spawn(destroy_when_idle(
+            Arc::downgrade(&self),
+            id,
+            machine.activity(),
+            machine.idle_timeout(),
+        ));
         Ok(machine)
     }
 
     pub async fn get(&self, id: &str) -> Option<Arc<Machine>> {
         self.state.lock().await.running.get(id).cloned()
+    }
+
+    pub async fn begin_use(&self, id: &str) -> Option<MachineUse> {
+        self.state
+            .lock()
+            .await
+            .running
+            .get(id)
+            .map(Machine::begin_use)
     }
 
     pub async fn list(&self) -> Vec<MachineInfo> {
@@ -137,6 +179,21 @@ impl Machines {
             .collect();
         infos.sort_by(|a, b| a.id.cmp(&b.id));
         infos
+    }
+
+    async fn destroy_if_expired(&self, id: &str) -> ControlFlow<()> {
+        let expired = {
+            let mut state = self.state.lock().await;
+            match state.running.get(id) {
+                Some(machine) if !machine.is_expired() => return ControlFlow::Continue(()),
+                Some(_) => state.running.remove(id),
+                None => None,
+            }
+        };
+        if let Some(machine) = expired {
+            machine.destroy().await;
+        }
+        ControlFlow::Break(())
     }
 
     pub async fn destroy(&self, id: &str) -> bool {
@@ -155,6 +212,41 @@ impl Machines {
         };
         for machine in &machines {
             machine.destroy().await;
+        }
+    }
+}
+
+async fn destroy_when_idle(
+    machines: Weak<Machines>,
+    id: String,
+    mut activity: watch::Receiver<Activity>,
+    idle_timeout: Duration,
+) {
+    while idle_deadline_passes(&mut activity, idle_timeout).await {
+        let Some(machines) = machines.upgrade() else {
+            return;
+        };
+        if machines.destroy_if_expired(&id).await.is_break() {
+            return;
+        }
+    }
+}
+
+async fn idle_deadline_passes(
+    activity: &mut watch::Receiver<Activity>,
+    idle_timeout: Duration,
+) -> bool {
+    loop {
+        let deadline = activity.borrow_and_update().idle_deadline(idle_timeout);
+        let changed = match deadline {
+            None => activity.changed().await,
+            Some(deadline) => tokio::select! {
+                changed = activity.changed() => changed,
+                () = tokio::time::sleep_until(deadline) => return true,
+            },
+        };
+        if changed.is_err() {
+            return false;
         }
     }
 }
