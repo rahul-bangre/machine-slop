@@ -1,9 +1,5 @@
-# Machine Slop development VM (Lima). vm/vm.sh fills in @WORKSPACE@, creates
-# the VM from this file, and refuses to run a VM whose config no longer
-# matches it. See README.md.
 minimumLimaVersion: 1.1.0
 
-# Pinned to one dated Debian image so every VM boots the same base system.
 images:
   - location: https://cloud.debian.org/images/cloud/trixie/20261103-2651/debian-13-genericcloud-arm64-20261103-2651.qcow2
     arch: aarch64
@@ -12,8 +8,6 @@ images:
     arch: x86_64
     digest: sha512:d25999de0770d4cde1be72c299ba3ad94eac7ea8fd4d18f8cc86c69df69337e2e8a91d64465a9bfd8f2a78c566fcbcb0842eacc91c09efdef72d719d9f13b535
 
-# vz + virtiofs mounts /workspace from fstab at boot, so agentd.service can
-# order itself after the mount with RequiresMountsFor.
 vmType: vz
 mountType: virtiofs
 
@@ -30,8 +24,6 @@ mounts:
     mountPoint: /workspace
     writable: true
 
-# Forward only agentd. vm/vm.sh reads hostPort, cpus, and memory (in GiB)
-# from this file.
 portForwards:
   - guestIP: 127.0.0.1
     guestPort: 3000
@@ -47,23 +39,17 @@ provision:
       #!/bin/sh
       set -eu
 
-      # Pin apt to the Debian snapshot matching the image, so installs and
-      # unattended-upgrades cannot move packages past it.
-      snapshot=https://snapshot.debian.org/archive
-      echo "$snapshot/debian/20261103T000000Z/" > /etc/apt/mirrors/debian.list
-      echo "$snapshot/debian-security/20261103T000000Z/" > /etc/apt/mirrors/debian-security.list
+      image_snapshot=20261103T000000Z
+      echo "https://snapshot.debian.org/archive/debian/$image_snapshot/" > /etc/apt/mirrors/debian.list
+      echo "https://snapshot.debian.org/archive/debian-security/$image_snapshot/" > /etc/apt/mirrors/debian-security.list
       echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot
 
-      # Lima runs this on every boot; only the first boot needs the network.
       packages="build-essential ca-certificates rustup"
       if ! dpkg-query -W $packages > /dev/null 2>&1; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
       fi
 
-      # The rustup proxy installs the toolchain from rust-toolchain.toml the
-      # first time agentd.service runs cargo. Builds stay in the guest so they
-      # never share /workspace/target with the host.
       runuser -u "{{.User}}" -- sh -euc '
         mkdir -p "$HOME/.cargo"
         printf "[build]\ntarget-dir = \"%s\"\n" "$HOME/target" > "$HOME/.cargo/config.toml"
@@ -80,7 +66,6 @@ provision:
       User={{.User}}
       WorkingDirectory=/workspace
       ExecStart=/usr/bin/cargo run --locked -p agentd -- 127.0.0.1:3000
-      # agentd shuts down gracefully on SIGINT.
       KillSignal=SIGINT
 
       [Install]

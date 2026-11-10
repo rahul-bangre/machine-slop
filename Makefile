@@ -23,6 +23,5 @@ format:
 	cargo fmt --all
 	deno task format
 
-# Development VM; see vm/vm.sh.
 $(VM_TARGETS):
 	vm/vm.sh $(@:vm-%=%)
