@@ -1,0 +1,18 @@
+{
+  "provider": "e2b",
+  "sdk": "e2b@2.63.0",
+  "input_sha256": "9853e4b677dd49d1324b0b8738d621db67d435c0fd887c47da8a8637a52332bd",
+  "resources": {
+    "vcpus": 2,
+    "memory_mib": 4096
+  },
+  "image": {
+    "ref": "slop-browser:9853e4b677dd",
+    "id": "iq36tovvungoh32p43t7",
+    "details": {
+      "build_id": "069ad076-956a-438d-bb06-9d8b941346bf",
+      "tag": "9853e4b677dd"
+    }
+  },
+  "built_at": "2026-11-10T06:46:04.941Z"
+}

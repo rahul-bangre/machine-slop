@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>environment smoke fixture</title>
+  </head>
+  <body>
+    <p id="status">script did not run</p>
+    <p id="agent"></p>
+    <script>
+    document.getElementById("status").textContent = "fixture script ran";
+    document.getElementById("agent").textContent = navigator.userAgent;
+    </script>
+  </body>
+</html>
