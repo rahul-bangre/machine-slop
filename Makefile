@@ -1,6 +1,6 @@
 VM_TARGETS := vm-start vm-stop vm-smoke vm-shell vm-delete
 
-.PHONY: setup dev build check format $(VM_TARGETS)
+.PHONY: setup dev build check format generate test $(VM_TARGETS)
 
 setup:
 	deno install --frozen-lockfile
@@ -13,6 +13,7 @@ build:
 	cargo build --locked --workspace --release
 
 check:
+	cargo run --locked -p slop-process --bin export-types -- --check
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	deno task format:check
@@ -25,3 +26,11 @@ format:
 
 $(VM_TARGETS):
 	vm/vm.sh $(@:vm-%=%)
+
+generate:
+	cargo run --locked -p slop-process --bin export-types
+
+test:
+	cargo test --locked --workspace
+	cargo build --locked -p agentd
+	deno task test

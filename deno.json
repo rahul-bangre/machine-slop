@@ -1,6 +1,11 @@
 {
-  "workspace": ["./packages/sdk"],
-  "exclude": ["target", "node_modules"],
+  "workspace": [
+    "./packages/sdk"
+  ],
+  "exclude": [
+    "target",
+    "node_modules"
+  ],
   "compilerOptions": {
     "strict": true,
     "noUncheckedIndexedAccess": true,
@@ -11,9 +16,15 @@
     "noFallthroughCasesInSwitch": true
   },
   "tasks": {
-    "check": "deno check --frozen-lockfile packages/sdk/src/mod.ts",
+    "check": "deno check --frozen-lockfile packages/sdk/src/mod.ts packages/sdk/test/*.test.ts",
     "lint": "deno lint",
     "format": "deno fmt",
-    "format:check": "deno fmt --check"
+    "format:check": "deno fmt --check",
+    "test": "deno test --frozen-lockfile --allow-run=./target/debug/agentd --allow-net=127.0.0.1 --allow-read --allow-write packages/sdk/test/"
+  },
+  "fmt": {
+    "exclude": [
+      "packages/sdk/src/process.gen.ts"
+    ]
   }
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/agentd"]
+members = ["apps/agentd", "crates/process"]
 resolver = "3"
 
 [workspace.package]
@@ -9,8 +9,8 @@ rust-version = "1.93"
 publish = false
 
 [workspace.dependencies]
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "process", "io-util", "sync", "time"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
