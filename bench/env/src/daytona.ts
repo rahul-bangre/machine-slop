@@ -21,9 +21,7 @@ import {
 
 const snapshot_prefix = "slop-browser";
 const entrypoint = ["sleep", "infinity"];
-// A sandbox the smoke run loses track of stops after this many idle minutes
-// and, being ephemeral, is deleted when it stops.
-const auto_stop_minutes = 15;
+const abandoned_sandbox_stop_minutes = 15;
 const delete_timeout_s = 120;
 const activate_timeout_ms = 120_000;
 const gone = new Set<string>([SandboxState.DESTROYED]);
@@ -40,8 +38,6 @@ function builtImage(snapshot: Snapshot): BuiltImage {
     return {
         ref: snapshot.name,
         id: snapshot.id,
-        // The registry image the snapshot was built into; `imageName` is empty
-        // for a snapshot built from a Dockerfile.
         details: Object.fromEntries(
             Object.entries({
                 image_ref: snapshot.ref,
@@ -64,9 +60,7 @@ export function daytonaProvider(): Provider {
         }
     }
 
-    // Activation may finish after the request returns; record the snapshot
-    // only once it can be used.
-    async function activeSnapshot(name: string): Promise<Snapshot> {
+    async function waitUntilActive(name: string): Promise<Snapshot> {
         const deadline = Date.now() + activate_timeout_ms;
         while (true) {
             const snapshot = await daytona.snapshot.get(name);
@@ -89,15 +83,12 @@ export function daytonaProvider(): Provider {
             if (memory_mib % 1024 !== 0) {
                 throw new Error("Daytona allocates memory in whole GiB");
             }
-            // Snapshot names are unique per organization and this one is
-            // derived from the inputs, so a snapshot already under it was built
-            // from them: reuse it if it built, replace it if it failed.
             const name = daytonaSnapshotName(input_sha256);
             const found = await existing(name);
             if (found?.state === SnapshotState.ACTIVE) return builtImage(found);
             if (found?.state === SnapshotState.INACTIVE) {
                 await daytona.snapshot.activate(found);
-                return builtImage(await activeSnapshot(name));
+                return builtImage(await waitUntilActive(name));
             }
             if (found && failed.has(found.state)) {
                 console.error(`deleting failed snapshot ${name}`);
@@ -132,11 +123,9 @@ export function daytonaProvider(): Provider {
                 snapshot: image.ref,
                 labels: owner,
                 ephemeral: true,
-                autoStopInterval: auto_stop_minutes,
+                autoStopInterval: abandoned_sandbox_stop_minutes,
                 networkBlockAll: true,
             });
-            // The sandbox names its snapshot; a snapshot deleted and rebuilt
-            // under the same name has a different ID.
             const snapshot = sandbox.snapshot
                 ? await existing(sandbox.snapshot)
                 : null;

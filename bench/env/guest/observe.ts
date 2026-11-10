@@ -1,7 +1,3 @@
-// Runs inside a provider's sandbox with the image's own Deno. It only reports
-// what it sees; the host decides whether that matches the environment. It must
-// stay a single file with no imports, because it is uploaded on its own.
-
 export type CgroupLimits = {
     path: string;
     cpu_max: string | null;
@@ -52,9 +48,7 @@ async function readOrNull(path: string): Promise<string | null> {
     }
 }
 
-// Every cgroup from this process's own up to the root, because a limit set on
-// an ancestor applies too.
-async function cgroupLimits(): Promise<CgroupLimits[]> {
+async function cgroupLimitsUpToRoot(): Promise<CgroupLimits[]> {
     const membership = await Deno.readTextFile("/proc/self/cgroup");
     const own = membership.match(/^0::(\S*)$/m)?.[1];
     if (own === undefined) return [];
@@ -153,9 +147,6 @@ async function openFixture(
     }
 }
 
-// Chromium's helper processes can outlive the browser process briefly. Give
-// them a grace period, report what is still running, then kill it so the
-// sandbox is left clean either way.
 async function reapChromium(install_root: string): Promise<number[]> {
     const deadline = Date.now() + leftover_grace_ms;
     let leftover = await chromiumPids(install_root);
@@ -187,8 +178,6 @@ export async function observe(
     try {
         run = await openFixture(chromium, fixture, profile);
     } finally {
-        // Reap first, so no helper process writes into the profile after it
-        // is removed.
         leftover_chromium_pids = await reapChromium(install_root);
         await Deno.remove(profile, { recursive: true }).catch(() => {});
     }
@@ -201,7 +190,7 @@ export async function observe(
         chromium_version,
         nproc: Number(await command("nproc", [])),
         mem_total_kib: await memTotalKib(),
-        cgroups: await cgroupLimits(),
+        cgroups: await cgroupLimitsUpToRoot(),
         chromium: run,
         leftover_chromium_pids,
         profile_removed,

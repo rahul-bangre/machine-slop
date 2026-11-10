@@ -1,8 +1,5 @@
 import { type Environment, type Resources, sha256 } from "./environment.ts";
 
-// What a provider built: `ref` is what a sandbox is created from, `id` is the
-// provider's identifier for the built image, and `details` holds whatever else
-// the provider needs to prove a sandbox came from this build.
 export type BuiltImage = {
     ref: string;
     id: string;
@@ -32,19 +29,10 @@ export type Owner = Record<string, string>;
 export interface Provider {
     readonly name: string;
     readonly sdk: string;
-    // Everything the provider's build takes besides the Dockerfile and the
-    // resources, so the input digest covers the whole build.
     readonly build_settings: Record<string, unknown>;
-    // Builds the image, or returns the one an earlier build with the same
-    // inputs already produced.
     build(environment: Environment, input_sha256: string): Promise<BuiltImage>;
-    // Creates a sandbox labelled with `owner` from exactly this build, or
-    // throws ImageMismatch. If it throws, a sandbox may still exist; `owned`
-    // finds it.
     start(image: BuiltImage, owner: Owner): Promise<Guest>;
     owned(owner: Owner): Promise<string[]>;
-    // Resolves only once a lookup by ID shows the sandbox is gone, not when
-    // deletion is accepted.
     destroy(id: string): Promise<void>;
 }
 

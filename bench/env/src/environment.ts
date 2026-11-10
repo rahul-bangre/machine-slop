@@ -10,8 +10,6 @@ export type Environment = {
     deno: { version: string };
 };
 
-// Both providers run x86_64 guests, so only the linux-x86_64 archives are
-// pinned here.
 const base_image =
     "docker.io/library/debian:trixie-20261027-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4";
 const debian_snapshot = "20261103T000000Z";
@@ -19,8 +17,7 @@ const deno_linux_x86_64_sha256: Record<string, string> = {
     "2.9.7": "c6527f24f4b16031d3ae4fa9f658d5f11534c8d84ce7dc8502420280919c3490",
 };
 
-// Chrome for Testing's deb.deps for 157.0.8103.50, under their trixie names.
-const chromium_packages = [
+const chromium_deb_deps_on_trixie = [
     "fonts-liberation",
     "libasound2t64",
     "libatk-bridge2.0-0t64",
@@ -72,8 +69,6 @@ function renderDockerfile(deno_version: string): string {
     const deno_url =
         `https://github.com/denoland/deno/releases/download/v${deno_version}/deno-x86_64-unknown-linux-gnu.zip`;
     const snapshot = `http://snapshot.debian.org/archive`;
-    // One logical line per instruction: no continuations, ARG or heredocs, so
-    // every provider's Dockerfile parser reads the same steps.
     return [
         `FROM ${base_image}`,
         "ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 TZ=UTC",
@@ -85,7 +80,7 @@ function renderDockerfile(deno_version: string): string {
             `echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot`,
             "apt-get update",
             `apt-get install -y --no-install-recommends ${
-                [...tool_packages, ...chromium_packages].join(" ")
+                [...tool_packages, ...chromium_deb_deps_on_trixie].join(" ")
             }`,
             "rm -rf /var/lib/apt/lists/*",
         ].join(" && ").replace(/^/, "RUN "),

@@ -1,6 +1,3 @@
-// Credentials only ever come from the environment. Every file this package
-// writes goes through here and is refused if it would contain one, so an SDK
-// error that echoes a key cannot end up in a record or a report.
 export const credential_variables = [
     "E2B_API_KEY",
     "E2B_ACCESS_TOKEN",

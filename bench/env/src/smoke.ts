@@ -14,11 +14,9 @@ const observe_timeout_ms = 180_000;
 
 export type GuestFiles = { observer: string; fixture: string };
 
-// `failed` holds every sandbox whose destruction could not be confirmed, and
-// `listing_error` says why sandboxes from a lost create may have been missed.
 export type Release = {
     destroyed: string[];
-    failed: string[];
+    unconfirmed: string[];
     listing_error: string | null;
 };
 
@@ -80,12 +78,7 @@ async function observeIn(
     return JSON.parse(last_line);
 }
 
-// Destroys every sandbox labelled with this run's owner, which includes one
-// whose create response was lost, and the sandbox it started, which a
-// provider's listing may not show yet. A listing can also still show a sandbox
-// after it is gone, so each destruction is confirmed by its own ID instead of
-// by listing again.
-async function release(
+async function destroyOwnedAndStarted(
     provider: Provider,
     owner: Owner,
     started: string | null,
@@ -99,17 +92,17 @@ async function release(
     }
     if (started) ids.add(started);
     const destroyed: string[] = [];
-    const failed: string[] = [];
+    const unconfirmed: string[] = [];
     for (const id of ids) {
         try {
             await provider.destroy(id);
             destroyed.push(id);
         } catch (error) {
             console.error(`cannot destroy ${id}: ${error}`);
-            failed.push(id);
+            unconfirmed.push(id);
         }
     }
-    return { destroyed, failed, listing_error };
+    return { destroyed, unconfirmed, listing_error };
 }
 
 export async function smoke(
@@ -138,19 +131,20 @@ export async function smoke(
     } catch (error) {
         failure = error instanceof Error ? error.message : String(error);
     }
-    const released = await release(provider, owner, started_id);
+    const released = await destroyOwnedAndStarted(provider, owner, started_id);
 
     const checks = guest && observation
         ? evaluate(environment, guest, observation)
         : [];
     checks.push({
         name: "every sandbox this run created was destroyed",
-        ok: released.failed.length === 0 && released.listing_error === null,
+        ok: released.unconfirmed.length === 0 &&
+            released.listing_error === null,
         expected: "every one confirmed gone",
         observed: [
             `${released.destroyed.length} confirmed gone`,
-            ...released.failed.length
-                ? [`not confirmed: ${released.failed.join(", ")}`]
+            ...released.unconfirmed.length
+                ? [`not confirmed: ${released.unconfirmed.join(", ")}`]
                 : [],
             ...released.listing_error
                 ? [`listing failed: ${released.listing_error}`]

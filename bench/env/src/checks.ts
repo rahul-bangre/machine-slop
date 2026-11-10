@@ -10,8 +10,6 @@ export type Check = {
 
 export type GuestFacts = { reported: Resources };
 
-// A VM guest kernel sees only its vCPUs and memory; a container sees the host's
-// and is limited by its cgroups. The effective limit is the tightest of both.
 const min_memory_fraction = 0.9;
 
 export function effectiveCpus(nproc: number, cgroups: CgroupLimits[]): number {
@@ -19,7 +17,6 @@ export function effectiveCpus(nproc: number, cgroups: CgroupLimits[]): number {
     for (const { cpu_max } of cgroups) {
         const [quota, period] = (cpu_max ?? "max").split(" ");
         if (quota === "max" || !quota || !period) continue;
-        // Exact, not rounded: a 1.5 CPU quota is not 2 vCPUs.
         cpus = Math.min(cpus, Number(quota) / Number(period));
     }
     return cpus;
@@ -63,8 +60,6 @@ export function evaluate(
     const min_memory_mib = Math.floor(want.memory_mib * min_memory_fraction);
     const { chromium, deno } = environment;
     const run = observation.chromium;
-    // The user agent is reduced to the major version; `--version` pins the
-    // full one.
     const agent = `HeadlessChrome/${chromium.version.split(".")[0]}.`;
     const fixture_ran = run.exit_code === 0 && !run.timed_out &&
         run.dom.includes("fixture script ran") && run.dom.includes(agent) &&

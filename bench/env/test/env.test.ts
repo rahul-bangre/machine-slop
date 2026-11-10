@@ -22,7 +22,6 @@ import { guestFiles, smoke, StaleImage } from "../src/smoke.ts";
 
 const environment = await browserEnvironment();
 
-// Observed in a 2 CPU, 4 GiB container of the image on a 4 GiB host.
 const container: Observation = {
     deno_version: "2.9.7",
     chromium_version: "Google Chrome for Testing 157.0.8103.50",
@@ -44,8 +43,6 @@ const container: Observation = {
     profile_removed: true,
 };
 
-// A microVM's kernel sees only its own vCPUs and memory, minus what the kernel
-// reserves, and its cgroups set no limits.
 const microvm: Observation = {
     ...container,
     nproc: 2,
@@ -225,8 +222,6 @@ type FakeCloud = {
         create_response_lost: boolean;
         image_moved: boolean;
         destroy_fails: boolean;
-        // The listing is a stale view: it still shows destroyed sandboxes and
-        // does not show new ones yet.
         listing_stale: boolean;
         listing_fails: boolean;
         observer_output: string;
@@ -319,7 +314,7 @@ Deno.test("a smoke run observes the guest, passes, and destroys only its own san
     assert.ok(report.passed, JSON.stringify(report.checks, null, 2));
     assert.deepEqual(report.release, {
         destroyed: ["sandbox-1"],
-        failed: [],
+        unconfirmed: [],
         listing_error: null,
     });
     assert.deepEqual([...provider.cloud.sandboxes.keys()], ["someone-else"]);
@@ -342,7 +337,7 @@ Deno.test("a sandbox whose create response was lost is still destroyed, and the 
     assert.deepEqual(provider.cloud.destroyed, ["sandbox-1"]);
     assert.deepEqual(report.release, {
         destroyed: ["sandbox-1"],
-        failed: [],
+        unconfirmed: [],
         listing_error: null,
     });
 });
@@ -362,7 +357,7 @@ Deno.test("a run that cannot destroy its sandbox fails even when every check pas
     assert.equal(report.passed, false);
     assert.deepEqual(report.release, {
         destroyed: [],
-        failed: ["sandbox-1"],
+        unconfirmed: ["sandbox-1"],
         listing_error: null,
     });
     assert.deepEqual(
@@ -494,7 +489,7 @@ Deno.test("a failed listing still destroys the sandbox the run started, and fail
     assert.equal(report.passed, false);
     assert.deepEqual(report.release, {
         destroyed: ["sandbox-1"],
-        failed: [],
+        unconfirmed: [],
         listing_error: "bad gateway",
     });
     assert.equal(provider.cloud.sandboxes.size, 0);

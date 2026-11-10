@@ -11,17 +11,13 @@ import {
 } from "./provider.ts";
 
 const template_name = "slop-browser";
-// A sandbox the smoke run loses track of is killed by E2B after this long.
-const sandbox_lifetime_ms = 15 * 60_000;
+const abandoned_sandbox_lifetime_ms = 15 * 60_000;
 
 export function e2bRef(input_sha256: string): { ref: string; tag: string } {
     const tag = input_sha256.slice(0, 12);
     return { ref: `${template_name}:${tag}`, tag };
 }
 
-// Every build of a template shares its template ID, and a sandbox does not
-// report which build it runs. The tag is what selects the build, so it must
-// still name the recorded one when the sandbox is created.
 async function requireTaggedBuild(image: BuiltImage): Promise<void> {
     const tag = image.details.tag;
     const tags = await Template.getTags(image.id);
@@ -42,8 +38,6 @@ export function e2bProvider(): Provider {
         name: "e2b",
         sdk: "e2b@2.63.0",
         build_settings: { template_name },
-        // Rebuilding with the same inputs is safe: it makes a new build and
-        // moves the tag to it, and the record written afterwards names it.
         async build(environment, input_sha256) {
             const { ref, tag } = e2bRef(input_sha256);
             const built = await Template.build(
@@ -65,7 +59,7 @@ export function e2bProvider(): Provider {
             await requireTaggedBuild(image);
             const sandbox = await Sandbox.create(image.ref, {
                 metadata: owner,
-                timeoutMs: sandbox_lifetime_ms,
+                timeoutMs: abandoned_sandbox_lifetime_ms,
                 allowInternetAccess: false,
             });
             const info = await sandbox.getInfo();

@@ -55,8 +55,6 @@ const environment = await browserEnvironment();
 
 if (command === "build") {
     const target = provider(name);
-    // Before the build, so a finished build is never lost to a missing
-    // directory. A build that is lost anyway is recovered by building again.
     await Deno.mkdir(new URL("../images/", import.meta.url), {
         recursive: true,
     });
