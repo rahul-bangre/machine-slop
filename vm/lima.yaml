@@ -1,0 +1,75 @@
+minimumLimaVersion: 1.1.0
+
+images:
+  - location: https://cloud.debian.org/images/cloud/trixie/20261103-2651/debian-13-genericcloud-arm64-20261103-2651.qcow2
+    arch: aarch64
+    digest: sha512:5d3ecec46fd29605db4084388a1e2eb82fd19a80202898f962840ea73793261de721e505e3877c829ae86c37fdd2f6c205b0b3b1337a89d0d4b98d9081adc0c2
+  - location: https://cloud.debian.org/images/cloud/trixie/20261103-2651/debian-13-genericcloud-amd64-20261103-2651.qcow2
+    arch: x86_64
+    digest: sha512:d25999de0770d4cde1be72c299ba3ad94eac7ea8fd4d18f8cc86c69df69337e2e8a91d64465a9bfd8f2a78c566fcbcb0842eacc91c09efdef72d719d9f13b535
+
+vmType: vz
+mountType: virtiofs
+
+cpus: 4
+memory: 4GiB
+disk: 20GiB
+
+containerd:
+  system: false
+  user: false
+
+mounts:
+  - location: "@WORKSPACE@"
+    mountPoint: /workspace
+    writable: true
+
+portForwards:
+  - guestIP: 127.0.0.1
+    guestPort: 3000
+    hostIP: 127.0.0.1
+    hostPort: 3001
+  - guestIP: 0.0.0.0
+    guestPortRange: [1, 65535]
+    ignore: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eu
+
+      image_snapshot=20261103T000000Z
+      echo "https://snapshot.debian.org/archive/debian/$image_snapshot/" > /etc/apt/mirrors/debian.list
+      echo "https://snapshot.debian.org/archive/debian-security/$image_snapshot/" > /etc/apt/mirrors/debian-security.list
+      echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot
+
+      packages="build-essential ca-certificates rustup"
+      if ! dpkg-query -W $packages > /dev/null 2>&1; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
+      fi
+
+      runuser -u "{{.User}}" -- sh -euc '
+        mkdir -p "$HOME/.cargo"
+        printf "[build]\ntarget-dir = \"%s\"\n" "$HOME/target" > "$HOME/.cargo/config.toml"
+      '
+
+      cat > /etc/systemd/system/agentd.service <<'UNIT'
+      [Unit]
+      Description=Machine Slop agentd (built from /workspace)
+      RequiresMountsFor=/workspace
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User={{.User}}
+      WorkingDirectory=/workspace
+      ExecStart=/usr/bin/cargo run --locked -p agentd -- 127.0.0.1:3000
+      KillSignal=SIGINT
+
+      [Install]
+      WantedBy=multi-user.target
+      UNIT
+      systemctl daemon-reload
+      systemctl enable agentd.service
