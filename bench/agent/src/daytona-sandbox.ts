@@ -11,7 +11,6 @@ const create_ms = 120_000;
 const directory = "/tmp/agent-task";
 const image = "python:3.12-slim";
 
-// A structural boundary keeps the lifecycle tests independent of cloud access.
 export type DaytonaRemote = {
     process: {
         executeCommand(
@@ -123,7 +122,6 @@ export function daytonaProvider(client?: DaytonaClient): SandboxProvider {
                 autoStopInterval: 0,
                 autoDeleteInterval: 0,
             }, { timeout: create_ms / 1000 });
-            // The local deadline cannot cancel creation. Clean up a late response too.
             creation.then(async (remote) => {
                 if (!usable || closing) {
                     owned.set(name, remote);
@@ -184,7 +182,7 @@ export function daytonaProvider(client?: DaytonaClient): SandboxProvider {
                     } catch (error) {
                         clearTimeout(timer);
                         usable = false;
-                        await remove(name); // Only report timeout after confirmed destruction.
+                        await remove(name);
                         if (expired) {
                             return {
                                 exit_code: null,
