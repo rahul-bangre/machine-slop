@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import { armOrder } from "../../common/schedule.ts";
 import { wholeNumber } from "../../common/stats.ts";
 import type { Limits } from "./agent.ts";
-import { agentdProvider } from "./agentd_sandbox.ts";
+import { agentdProvider, machinedProvider } from "./agentd_sandbox.ts";
 import { type AttemptRecord, runAttempt } from "./attempt.ts";
 import { e2bProvider } from "./e2b_sandbox.ts";
 import { claudeCliModel } from "./claude_cli_model.ts";
@@ -27,6 +27,7 @@ const { values: flags } = parseArgs({
         "command-timeout-ms": { type: "string", default: "60000" },
         "agentd-url": { type: "string" },
         "agentd-binary": { type: "string", default: "./target/debug/agentd" },
+        "machined-url": { type: "string", default: "http://127.0.0.1:4001" },
         "e2b-template": { type: "string", default: "base" },
         out: { type: "string" },
     },
@@ -49,13 +50,14 @@ function provider(name: string): SandboxProvider {
                 : { binary: flags["agentd-binary"] },
         );
     }
+    if (name === "machined") return machinedProvider(flags["machined-url"]);
     if (name === "e2b") {
         if (!Deno.env.get("E2B_API_KEY")) {
             fail("the e2b sandbox needs E2B_API_KEY");
         }
         return e2bProvider(flags["e2b-template"]);
     }
-    fail(`unknown sandbox "${name}"; choose agentd or e2b`);
+    fail(`unknown sandbox "${name}"; choose agentd, machined or e2b`);
 }
 
 function pinnedModel(spec: string): Model {

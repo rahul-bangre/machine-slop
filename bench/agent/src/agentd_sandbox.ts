@@ -1,4 +1,4 @@
-import { Machine, type Process } from "@machine-slop/sdk";
+import { Host, Machine, type Process } from "@machine-slop/sdk";
 
 import {
     type CommandResult,
@@ -9,13 +9,34 @@ import {
 
 const setup_timeout_ms = 30_000;
 const startup_timeout_ms = 20_000;
+const machine_boot_timeout_ms = 60_000;
 
-type Daemon = { machine: Machine; stop(): Promise<void> };
+type Daemon = {
+    machine: Machine;
+    keeps_files_after_stop: boolean;
+    stop(): Promise<void>;
+};
 
 async function connect(url: string): Promise<Daemon> {
     const machine = new Machine(url);
     await machine.health(AbortSignal.timeout(startup_timeout_ms));
-    return { machine, stop: () => Promise.resolve() };
+    return {
+        machine,
+        keeps_files_after_stop: true,
+        stop: () => Promise.resolve(),
+    };
+}
+
+async function boot(host: Host): Promise<Daemon> {
+    const { machine } = await host.createMachine(
+        {},
+        AbortSignal.timeout(machine_boot_timeout_ms),
+    );
+    return {
+        machine,
+        keeps_files_after_stop: false,
+        stop: () => machine.destroy(),
+    };
 }
 
 async function spawn(binary: string): Promise<Daemon> {
@@ -40,6 +61,7 @@ async function spawn(binary: string): Promise<Daemon> {
                 const drained = child.stderr.pipeTo(new WritableStream());
                 return {
                     machine: new Machine(url),
+                    keeps_files_after_stop: true,
                     async stop() {
                         child.kill("SIGINT");
                         await child.status;
@@ -149,11 +171,39 @@ class AgentdSandbox implements Sandbox {
 
     async close(): Promise<void> {
         try {
-            await this.run(`rm -rf "${this.work_directory}"`, setup_timeout_ms);
+            if (this.daemon.keeps_files_after_stop) {
+                await this.run(
+                    `rm -rf "${this.work_directory}"`,
+                    setup_timeout_ms,
+                );
+            }
         } finally {
             await this.daemon.stop();
         }
     }
+}
+
+async function open(daemon: Daemon): Promise<Sandbox> {
+    try {
+        return await AgentdSandbox.open(daemon);
+    } catch (error) {
+        await daemon.stop();
+        throw error;
+    }
+}
+
+export function machinedProvider(url: string): SandboxProvider {
+    const host = new Host(url);
+    return {
+        name: "machined",
+        describe: () => ({
+            url,
+            isolation: "one Firecracker microVM per attempt, no network",
+            create_measures:
+                "cold boot of a new microVM until agentd is healthy, and a new work directory",
+        }),
+        create: async () => open(await boot(host)),
+    };
 }
 
 export function agentdProvider(
@@ -168,16 +218,11 @@ export function agentdProvider(
                 ? "a new work directory on an already running agentd"
                 : "starting agentd and a new work directory",
         }),
-        async create() {
-            const daemon = "url" in target
-                ? await connect(target.url)
-                : await spawn(target.binary);
-            try {
-                return await AgentdSandbox.open(daemon);
-            } catch (error) {
-                await daemon.stop();
-                throw error;
-            }
-        },
+        create: async () =>
+            open(
+                "url" in target
+                    ? await connect(target.url)
+                    : await spawn(target.binary),
+            ),
     };
 }
