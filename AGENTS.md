@@ -9,6 +9,10 @@
   implementations.
 - Prefer small, direct changes that follow neighboring code. Add shared
   abstractions when they remove concrete duplication.
+- Do not add code comments in any language, including shell, YAML, and
+  Makefiles. Express intent through function and variable names and clear
+  structure. Put rationale in the PR description or component README. Shebangs
+  and tool directives are fine.
 
 ## Rust and TypeScript
 
