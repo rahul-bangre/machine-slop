@@ -30,17 +30,27 @@ require_instance_matches_config() {
     die "$NAME was created from a different vm/lima.yaml or checkout; run 'make vm-delete vm-start'"
 }
 
-host_port_owner() {
-  lsof -nP -iTCP:"$HOST_PORT" -sTCP:LISTEN -Fc 2>/dev/null | sed -n 's/^c//p' | sort -u
+host_port_listener_pid() {
+  lsof -nP -tiTCP:"$HOST_PORT" -sTCP:LISTEN 2>/dev/null | sort -u
 }
 
-require_host_port_free_for_lima() {
-  owner=$(host_port_owner)
-  [ -z "$owner" ] || [ "$owner" = limactl ] || die "host port $HOST_PORT is already used by: $owner"
+this_vm_hostagent_pid() {
+  cat "$LIMA_HOME/$NAME/ha.pid" 2>/dev/null || true
+}
+
+host_port_is_served_by_this_vm() {
+  listener=$(host_port_listener_pid)
+  [ -n "$listener" ] && [ "$listener" = "$(this_vm_hostagent_pid)" ]
+}
+
+require_host_port_free_for_this_vm() {
+  listener=$(host_port_listener_pid)
+  [ -z "$listener" ] || host_port_is_served_by_this_vm ||
+    die "host port $HOST_PORT is already used by: $(ps -o comm= -p "$listener" | tr '\n' ' ')"
 }
 
 vm_agentd_is_healthy() {
-  [ "$(host_port_owner)" = limactl ] &&
+  host_port_is_served_by_this_vm &&
     [ "$(curl -fsS --max-time 2 "$HEALTH_URL" 2>/dev/null)" = ok ]
 }
 
@@ -68,13 +78,13 @@ rebuild_agentd_from_workspace() {
 start() {
   case $(instance_status) in
     "")
-      require_host_port_free_for_lima
+      require_host_port_free_for_this_vm
       config_for_this_checkout | limactl create --tty=false --name="$NAME" -
       limactl start --tty=false "$NAME"
       ;;
     Stopped)
       require_instance_matches_config
-      require_host_port_free_for_lima
+      require_host_port_free_for_this_vm
       limactl start --tty=false "$NAME"
       ;;
     Running) require_instance_matches_config ;;
