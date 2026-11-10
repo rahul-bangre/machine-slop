@@ -1,3 +1,4 @@
+import type { Endpoint } from "./http.ts";
 import { duplex, openTunnel, type Tunnel } from "./tunnel.ts";
 
 export class Forward {
@@ -6,7 +7,7 @@ export class Forward {
 
     constructor(
         private readonly listener: Deno.Listener<Deno.TcpConn, Deno.NetAddr>,
-        machine: URL,
+        machine: Endpoint,
         port: number,
     ) {
         this.serving = this.serve(machine, port);
@@ -30,7 +31,7 @@ export class Forward {
         await this.serving;
     }
 
-    private async serve(machine: URL, port: number): Promise<void> {
+    private async serve(machine: Endpoint, port: number): Promise<void> {
         const pending = new Set<Promise<void>>();
         try {
             for await (const conn of this.listener) {
@@ -48,7 +49,7 @@ export class Forward {
 
     private async pipe(
         local: Tunnel,
-        machine: URL,
+        machine: Endpoint,
         port: number,
     ): Promise<void> {
         const tunnels = [local];

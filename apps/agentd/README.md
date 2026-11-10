@@ -96,4 +96,5 @@ tunnels.
 
 Non-2xx responses throw `HttpError` with the status. This API assumes a trusted
 machine; it provides no authentication, and file access runs with `agentd`'s
-privileges.
+privileges. In a machine, `agentd` is reached only through `machined`, which
+authenticates the tenant; see [machines](../../crates/machines/README.md).

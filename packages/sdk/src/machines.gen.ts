@@ -10,8 +10,12 @@ export type MachineInfo = { id: string, state: MachineState, vcpus: number, memo
 
 export type CreateSnapshot = { machine_id: string, };
 
-export type SnapshotInfo = { id: string, machine_id: string, vcpus: number, memory_mib: number, allowed_hosts: Array<string>, created_unix_ms: number, };
+export type SnapshotInfo = { id: string, machine_id: string, vcpus: number, memory_mib: number, allowed_hosts: Array<string>, created_unix_ms: number, stored_bytes: number, };
 
 export type CreatePreview = { machine_id: string, port: number, ttl_secs?: number | null, };
 
 export type PreviewInfo = { id: string, machine_id: string, port: number, url: string, expires_unix_ms: number, };
+
+export type Quotas = { running_machines: number, memory_mib: number, disk_gib: number, creates_per_second: number, };
+
+export type TenantUsage = { tenant: string, quotas: Quotas, vcpu_ms: number, memory_mib_ms: number, snapshot_mib_ms: number, as_of_unix_ms: number, };

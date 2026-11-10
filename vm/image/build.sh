@@ -138,9 +138,11 @@ fetch "https://github.com/firecracker-microvm/firecracker/releases/download/$FIR
   "$FIRECRACKER_SHA256" "$firecracker_tgz"
 fetch "http://spec.ccfc.min.s3.amazonaws.com/$(echo "$KERNEL_PATH" | sed "s/ARCH/$ARCH/")" \
   "$KERNEL_SHA256" "$OUT/vmlinux"
-tar -xzf "$firecracker_tgz" -O "release-$FIRECRACKER_VERSION-$ARCH/firecracker-$FIRECRACKER_VERSION-$ARCH" > "$OUT/firecracker.part"
-chmod 0755 "$OUT/firecracker.part"
-mv "$OUT/firecracker.part" "$OUT/firecracker"
+for program in firecracker jailer; do
+  tar -xzf "$firecracker_tgz" -O "release-$FIRECRACKER_VERSION-$ARCH/$program-$FIRECRACKER_VERSION-$ARCH" > "$OUT/$program.part"
+  chmod 0755 "$OUT/$program.part"
+  mv "$OUT/$program.part" "$OUT/$program"
+done
 
 fetch "$DENO_URL" "$DENO_SHA256" "$CACHE/deno-$DENO_VERSION-$ARCH.zip"
 fetch "$NODE_URL" "$NODE_SHA256" "$CACHE/node-$NODE_SHA256.tar.xz"

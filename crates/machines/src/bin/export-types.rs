@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use slop_machines::{
     CreateMachine, CreatePreview, CreateSnapshot, EgressCredential, MachineInfo, MachineState,
-    PreviewInfo, SnapshotInfo, UpdateMachine,
+    PreviewInfo, Quotas, SnapshotInfo, TenantUsage, UpdateMachine,
 };
 use ts_rs::TS;
 
@@ -18,6 +18,8 @@ fn main() -> std::io::Result<()> {
         SnapshotInfo::decl(&config),
         CreatePreview::decl(&config),
         PreviewInfo::decl(&config),
+        Quotas::decl(&config),
+        TenantUsage::decl(&config),
     ];
     let output = format!(
         "{}\n",

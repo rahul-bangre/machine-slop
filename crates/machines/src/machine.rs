@@ -19,11 +19,12 @@ use tokio::{
 
 use crate::{
     contract::{EgressCredential, MachineInfo, MachineState},
-    egress::{Egress, EgressPolicy, MachineEgress},
+    egress::{Egress, EgressPolicy},
     files,
-    firecracker::Vm,
+    firecracker::{FIRECRACKER, Jail, Launch, ROOTFS, SAVED_STATE, SCRATCH, Vm},
     gateway::Gateway,
-    machines::{Admission, MachineError},
+    machines::{Admission, MachineError, lock},
+    tenants::{Held, Idempotency, Storage, Tenant, TenantCharge, Tenants},
 };
 
 const SCRATCH_BYTES: u64 = 8 << 30;
@@ -35,14 +36,11 @@ const RECORD: &str = "machine.json";
 const CHECKPOINT: &str = "checkpoint";
 const CHECKPOINT_STAGING: &str = "checkpoint.tmp";
 const CHECKPOINT_WITHDRAWN: &str = "checkpoint.withdrawn";
-const RESTORED: &str = "restored";
-const FIRECRACKER: &str = "firecracker";
-const ROOTFS: &str = "rootfs.ext4";
-const SAVED_STATE: [&str; 2] = ["vmstate", "memory"];
-const SCRATCH: &str = "scratch.ext4";
+const CHECKPOINT_RETIRED: &str = "checkpoint.retired";
 
 #[derive(Clone, Debug)]
 pub struct Image {
+    jailer: PathBuf,
     firecracker: PathBuf,
     kernel: PathBuf,
     rootfs: PathBuf,
@@ -61,10 +59,15 @@ impl Image {
             }
         };
         Ok(Self {
+            jailer: file("jailer")?,
             firecracker: file("firecracker")?,
             kernel: file("vmlinux")?,
             rootfs: file("rootfs.ext4")?,
         })
+    }
+
+    pub(crate) fn jailer(&self) -> PathBuf {
+        self.jailer.clone()
     }
 }
 
@@ -131,10 +134,12 @@ pub struct Booted {
 }
 
 impl Booted {
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_image(
         id: String,
         dir: PathBuf,
         image: &Image,
+        jail: &Jail,
         vcpus: u8,
         memory_mib: u32,
         egress: Egress,
@@ -145,9 +150,15 @@ impl Booted {
             files::link_immutable(&image.firecracker, &dir.join(FIRECRACKER)).await?;
             files::link_immutable(&image.rootfs, &dir.join(ROOTFS)).await?;
             create_scratch_disk(&dir.join(SCRATCH)).await?;
-            let config = firecracker_config(image, vcpus, memory_mib).to_string();
-            tokio::fs::write(dir.join("config.json"), config).await?;
-            Vm::boot(&dir, admission, egress.route())
+            let launch = Launch {
+                dir: &dir,
+                jail,
+                admission,
+                egress: egress.route(),
+                vcpus,
+                memory_mib,
+            };
+            Vm::boot(launch, &image.kernel, firecracker_config(vcpus, memory_mib)).await
         };
         let vm = boot.await;
         Self::once_ready(id, dir, vm, vcpus, memory_mib, egress).await
@@ -159,6 +170,7 @@ impl Booted {
         dir: PathBuf,
         saved: &Path,
         disk: Disk,
+        jail: &Jail,
         vcpus: u8,
         memory_mib: u32,
         egress: Egress,
@@ -169,15 +181,19 @@ impl Booted {
             for name in [FIRECRACKER, ROOTFS] {
                 files::link_immutable(&saved.join(name), &dir.join(name)).await?;
             }
-            tokio::fs::create_dir(dir.join(RESTORED)).await?;
-            for name in SAVED_STATE {
-                files::link_immutable(&saved.join(name), &dir.join(RESTORED).join(name)).await?;
-            }
             match disk {
                 Disk::Copy => files::copy_disk(&saved.join(SCRATCH), &dir.join(SCRATCH)).await?,
                 Disk::Take => tokio::fs::rename(saved.join(SCRATCH), dir.join(SCRATCH)).await?,
             }
-            let vm = restore(&dir, RESTORED, admission, egress.route()).await?;
+            let launch = Launch {
+                dir: &dir,
+                jail,
+                admission,
+                egress: egress.route(),
+                vcpus,
+                memory_mib,
+            };
+            let vm = Vm::restore(launch, saved).await?;
             if let Err(error) = vm.resume().await {
                 vm.kill().await;
                 return Err(error);
@@ -226,9 +242,14 @@ impl Booted {
         self.vm.exited().is_none()
     }
 
-    pub async fn record(
+    pub(crate) fn charge(&self, charge: TenantCharge) -> Result<(), TenantCharge> {
+        self.vm.charge(charge)
+    }
+
+    pub(crate) async fn record(
         self,
         request_started: Instant,
+        ownership: Ownership,
         idle_timeout_secs: u32,
         egress: EgressPolicy,
     ) -> Result<Machine, BootError> {
@@ -236,6 +257,9 @@ impl Booted {
         let machine = Machine {
             id: self.id,
             dir: self.dir,
+            tenant: ownership.tenant,
+            idempotency: ownership.idempotency,
+            storage: std::sync::Mutex::new(Some(Tenant::store_unmetered(ownership.disk))),
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
             boot_ms: request_started
@@ -262,6 +286,7 @@ impl Booted {
             }
             return Err(error.into());
         }
+        self.vm.start_metering();
         Ok(machine)
     }
 
@@ -271,8 +296,21 @@ impl Booted {
     }
 }
 
+pub(crate) struct Ownership {
+    pub tenant: Arc<Tenant>,
+    pub idempotency: Option<Idempotency>,
+    pub disk: Held,
+}
+
+pub(crate) fn provisioned_disk_mib(memory_mib: u32) -> u64 {
+    (SCRATCH_BYTES >> 20) + u64::from(memory_mib)
+}
+
 #[derive(Deserialize, Serialize)]
 struct Record {
+    tenant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idempotency: Option<Idempotency>,
     vcpus: u8,
     memory_mib: u32,
     boot_ms: u64,
@@ -329,6 +367,9 @@ impl Drop for MachineUse {
 pub struct Machine {
     id: String,
     dir: PathBuf,
+    tenant: Arc<Tenant>,
+    idempotency: Option<Idempotency>,
+    storage: std::sync::Mutex<Option<Storage>>,
     vcpus: u8,
     memory_mib: u32,
     boot_ms: u64,
@@ -340,9 +381,10 @@ pub struct Machine {
 }
 
 impl Machine {
-    pub async fn recover(
+    pub(crate) async fn recover(
         id: String,
         dir: PathBuf,
+        tenants: &Tenants,
         gateway: Arc<Gateway>,
     ) -> io::Result<Option<Self>> {
         if !tokio::fs::try_exists(dir.join(RECORD)).await? {
@@ -356,12 +398,17 @@ impl Machine {
             record.egress_address,
         )
         .map_err(io::Error::other)?;
-        for stale in [CHECKPOINT_STAGING, CHECKPOINT_WITHDRAWN, RESTORED] {
+        let tenant = tenants.owner(&record.tenant);
+        let disk = tenant.keep_disk(provisioned_disk_mib(record.memory_mib));
+        for stale in [CHECKPOINT_STAGING, CHECKPOINT_WITHDRAWN, CHECKPOINT_RETIRED] {
             files::remove_dir_if_present(&dir.join(stale)).await?;
         }
         let machine = Self {
             id,
             dir,
+            storage: std::sync::Mutex::new(Some(Tenant::store_unmetered(disk))),
+            tenant,
+            idempotency: record.idempotency,
             vcpus: record.vcpus,
             memory_mib: record.memory_mib,
             boot_ms: record.boot_ms,
@@ -383,12 +430,24 @@ impl Machine {
         Ok(Some(machine))
     }
 
-    pub(crate) fn egress_source(&self) -> Option<IpAddr> {
-        self.egress.policy().source()
-    }
-
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn tenant(&self) -> &Arc<Tenant> {
+        &self.tenant
+    }
+
+    pub(crate) fn belongs_to(&self, tenant: &Tenant) -> bool {
+        self.tenant.id() == tenant.id()
+    }
+
+    pub(crate) fn idempotency(&self) -> Option<&Idempotency> {
+        self.idempotency.as_ref()
+    }
+
+    pub(crate) fn egress_source(&self) -> Option<IpAddr> {
+        self.egress.policy().source()
     }
 
     pub fn info(&self) -> MachineInfo {
@@ -408,6 +467,8 @@ impl Machine {
 
     fn record(&self, egress: &EgressPolicy) -> Record {
         Record {
+            tenant: self.tenant.id().to_owned(),
+            idempotency: self.idempotency.clone(),
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
             boot_ms: self.boot_ms,
@@ -549,7 +610,7 @@ impl Exclusive<'_> {
         }
         self.set(Phase::Paused);
         vm.kill().await;
-        files::remove_dir_logged(&self.dir.join(RESTORED)).await;
+        files::remove_dir_logged(&self.dir.join(CHECKPOINT_RETIRED)).await;
         Ok(())
     }
 
@@ -594,11 +655,19 @@ impl Exclusive<'_> {
         Ok(matches!(self.live()?, Live::Paused))
     }
 
-    pub async fn resume(&self, admission: Admission) -> Result<(), MachineError> {
+    pub async fn resume(&self, jail: &Jail, admission: Admission) -> Result<(), MachineError> {
         let Live::Paused = self.live()? else {
             return Ok(());
         };
-        let vm = match restore(&self.dir, CHECKPOINT, admission, self.egress.route()).await {
+        let launch = Launch {
+            dir: &self.dir,
+            jail,
+            admission,
+            egress: self.egress.route(),
+            vcpus: self.vcpus,
+            memory_mib: self.memory_mib,
+        };
+        let vm = match Vm::restore(launch, &self.dir.join(CHECKPOINT)).await {
             Ok(vm) => vm,
             Err(error) => return Err(self.failed("resume", error)),
         };
@@ -607,7 +676,7 @@ impl Exclusive<'_> {
             let reinstated = async {
                 let checkpoint = self.dir.join(CHECKPOINT);
                 if !tokio::fs::try_exists(&checkpoint).await? {
-                    tokio::fs::rename(self.dir.join(RESTORED), checkpoint).await?;
+                    tokio::fs::rename(self.dir.join(CHECKPOINT_RETIRED), checkpoint).await?;
                 }
                 files::sync(&self.dir).await
             };
@@ -622,6 +691,7 @@ impl Exclusive<'_> {
         };
         match ready.await {
             Ok(()) => {
+                vm.start_metering();
                 self.set(Phase::Running(vm));
                 Ok(())
             }
@@ -634,8 +704,8 @@ impl Exclusive<'_> {
     }
 
     async fn retire_checkpoint(&self) -> io::Result<()> {
-        files::remove_dir_if_present(&self.dir.join(RESTORED)).await?;
-        tokio::fs::rename(self.dir.join(CHECKPOINT), self.dir.join(RESTORED)).await?;
+        files::remove_dir_if_present(&self.dir.join(CHECKPOINT_RETIRED)).await?;
+        tokio::fs::rename(self.dir.join(CHECKPOINT), self.dir.join(CHECKPOINT_RETIRED)).await?;
         files::sync(&self.dir).await
     }
 
@@ -718,6 +788,9 @@ impl Exclusive<'_> {
             vm.kill().await;
         }
         let discarded = files::discard(&self.dir, RECORD).await;
+        if discarded.is_ok() {
+            drop(lock(&self.storage).take());
+        }
         if let Err(error) = &discarded {
             let still_recorded = tokio::fs::try_exists(self.dir.join(RECORD)).await;
             self.set(if was_paused && matches!(still_recorded, Ok(true)) {
@@ -728,20 +801,6 @@ impl Exclusive<'_> {
         }
         discarded
     }
-}
-
-async fn restore(
-    dir: &Path,
-    saved: &str,
-    admission: Admission,
-    egress: MachineEgress,
-) -> io::Result<Vm> {
-    let vm = Vm::unconfigured(dir, admission, egress)?;
-    if let Err(error) = vm.load(saved).await {
-        vm.kill().await;
-        return Err(error);
-    }
-    Ok(vm)
 }
 
 async fn wait_until_ready(vm: &Vm, dir: &Path) -> Result<(), BootError> {
@@ -807,10 +866,10 @@ async fn create_scratch_disk(path: &Path) -> io::Result<()> {
     }
 }
 
-fn firecracker_config(image: &Image, vcpus: u8, memory_mib: u32) -> serde_json::Value {
+fn firecracker_config(vcpus: u8, memory_mib: u32) -> serde_json::Value {
     json!({
         "boot-source": {
-            "kernel_image_path": image.kernel,
+            "kernel_image_path": "vmlinux",
             "boot_args": "console=ttyS0 reboot=k panic=1 quiet loglevel=1 ro init=/sbin/slop-init",
         },
         "drives": [

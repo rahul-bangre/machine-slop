@@ -1,12 +1,13 @@
 mod preview;
+mod tenants;
 
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{Path, Request, State},
-    http::{StatusCode, Uri, header},
+    extract::{FromRequestParts, Path, Request, State},
+    http::{StatusCode, Uri, header, request::Parts},
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
@@ -14,17 +15,25 @@ use hyper::{client::conn::http1::SendRequest, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use slop_machines::{
-    CreateMachine, CreatePreview, CreateSnapshot, Machine, MachineError, MachineInfo, MachineState,
-    Machines, PreviewInfo, SnapshotInfo, UpdateMachine,
+    CreateMachine, CreatePreview, CreateSnapshot, IdempotencyKey, Machine, MachineError,
+    MachineInfo, MachineState, Machines, PreviewInfo, SnapshotInfo, Tenant, TenantUsage,
+    UpdateMachine,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 pub use preview::serve_previews;
+pub use tenants::{ApiKeys, parse as parse_tenants};
 
-pub fn app(machines: Arc<Machines>) -> Router {
+pub struct Host {
+    pub machines: Arc<Machines>,
+    pub keys: ApiKeys,
+}
+
+pub fn app(host: Arc<Host>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/metrics", get(metrics))
+        .route("/usage", get(usage))
         .route("/machines", get(list).post(create))
         .route("/machines/{id}", get(info).patch(update).delete(destroy))
         .route("/machines/{id}/pause", post(pause))
@@ -38,20 +47,64 @@ pub fn app(machines: Arc<Machines>) -> Router {
         )
         .route("/previews", get(list_previews).post(create_preview))
         .route("/previews/{id}", get(preview_info).delete(delete_preview))
-        .with_state(machines)
+        .with_state(host)
 }
 
-async fn metrics(State(machines): State<Arc<Machines>>) -> impl IntoResponse {
+struct Caller(Arc<Tenant>);
+
+impl FromRequestParts<Arc<Host>> for Caller {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, host: &Arc<Host>) -> Result<Self, Response> {
+        parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .and_then(|key| host.keys.tenant_of(key))
+            .and_then(|tenant| host.machines.tenant(tenant))
+            .map(Self)
+            .ok_or_else(|| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::WWW_AUTHENTICATE, "Bearer")],
+                    "a valid API key is required as a Bearer token",
+                )
+                    .into_response()
+            })
+    }
+}
+
+struct Retry(Option<IdempotencyKey>);
+
+impl<S: Sync> FromRequestParts<S> for Retry {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, ApiError> {
+        match parts.headers.get("idempotency-key") {
+            None => Ok(Self(None)),
+            Some(value) => {
+                let key = value.to_str().map_err(|_| {
+                    MachineError::Invalid("an idempotency key is visible ASCII".into())
+                })?;
+                Ok(Self(Some(IdempotencyKey::parse(key)?)))
+            }
+        }
+    }
+}
+
+async fn usage(Caller(tenant): Caller) -> Json<TenantUsage> {
+    Json(tenant.usage())
+}
+
+async fn metrics(State(host): State<Arc<Host>>) -> impl IntoResponse {
+    let machines = &host.machines;
     let (active, reserved, budget) = machines.resource_usage();
     let (successes, failures) = machines.create_counts();
     let spares = machines.spares().await;
-    let listed = machines.list().await;
-    let in_state = |wanted: fn(&MachineState) -> bool| {
-        listed
-            .iter()
-            .filter(|machine| wanted(&machine.state))
-            .count()
-    };
+    let states = machines.states().await;
+    let in_state =
+        |wanted: fn(&MachineState) -> bool| states.iter().filter(|state| wanted(state)).count();
     let running = in_state(|state| matches!(state, MachineState::Running));
     let paused = in_state(|state| matches!(state, MachineState::Paused));
     let exited = in_state(|state| matches!(state, MachineState::Exited { .. }));
@@ -64,150 +117,172 @@ async fn metrics(State(machines): State<Arc<Machines>>) -> impl IntoResponse {
 }
 
 async fn create(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
+    Retry(key): Retry,
     body: Bytes,
 ) -> Result<(StatusCode, Json<MachineInfo>), ApiError> {
     let request: CreateMachine = json_body(if body.is_empty() { b"{}" } else { &body })?;
-    let machine = machines.create(request).await?;
+    let machine = host.machines.create(&tenant, request, key).await?;
     Ok((StatusCode::CREATED, Json(machine.info())))
 }
 
 async fn update(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<MachineInfo>, ApiError> {
     let request: UpdateMachine = json_body(&body)?;
-    Ok(Json(machines.update(&id, request).await?))
+    Ok(Json(host.machines.update(&tenant, &id, request).await?))
 }
 
 fn json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
     serde_json::from_slice(body)
-        .map_err(|error| ApiError(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))
+        .map_err(|error| ApiError(StatusCode::UNPROCESSABLE_ENTITY, error.to_string(), None))
 }
 
-async fn list(State(machines): State<Arc<Machines>>) -> Json<Vec<MachineInfo>> {
-    Json(machines.list().await)
+async fn list(State(host): State<Arc<Host>>, Caller(tenant): Caller) -> Json<Vec<MachineInfo>> {
+    Json(host.machines.list(&tenant).await)
 }
 
 async fn info(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     Path(id): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    let machine = machines.get(&id).await;
+    let machine = host.machines.get(&tenant, &id).await;
     Ok(Json(machine.ok_or(MachineError::UnknownMachine)?.info()))
 }
 
 async fn destroy(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    machines.destroy(&id).await?;
+    host.machines.destroy(&tenant, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn pause(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     Path(id): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    Ok(Json(machines.pause(&id).await?))
+    Ok(Json(host.machines.pause(&tenant, &id).await?))
 }
 
 async fn resume(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     Path(id): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    Ok(Json(machines.resume(&id).await?))
+    Ok(Json(host.machines.resume(&tenant, &id).await?))
 }
 
 async fn fork(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
+    Retry(key): Retry,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<MachineInfo>), ApiError> {
-    let machine = machines.fork(&id).await?;
+    let machine = host.machines.fork(&tenant, &id, key).await?;
     Ok((StatusCode::CREATED, Json(machine.info())))
 }
 
 async fn create_snapshot(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
+    Retry(key): Retry,
     body: Bytes,
 ) -> Result<(StatusCode, Json<SnapshotInfo>), ApiError> {
     let request: CreateSnapshot = json_body(&body)?;
-    let snapshot = machines.create_snapshot(request).await?;
+    let snapshot = host.machines.create_snapshot(&tenant, request, key).await?;
     Ok((StatusCode::CREATED, Json(snapshot)))
 }
 
-async fn list_snapshots(State(machines): State<Arc<Machines>>) -> Json<Vec<SnapshotInfo>> {
-    Json(machines.snapshots().await)
+async fn list_snapshots(
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
+) -> Json<Vec<SnapshotInfo>> {
+    Json(host.machines.snapshots(&tenant).await)
 }
 
 async fn snapshot_info(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     Path(id): Path<String>,
 ) -> Result<Json<SnapshotInfo>, ApiError> {
-    let snapshot = machines.snapshot_info(&id).await;
+    let snapshot = host.machines.snapshot_info(&tenant, &id).await;
     Ok(Json(snapshot.ok_or(MachineError::UnknownSnapshot)?))
 }
 
 async fn delete_snapshot(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    machines.delete_snapshot(&id).await?;
+    host.machines.delete_snapshot(&tenant, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_preview(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     body: Bytes,
 ) -> Result<(StatusCode, Json<PreviewInfo>), ApiError> {
     let request: CreatePreview = json_body(&body)?;
-    let preview = machines.create_preview(request).await?;
+    let preview = host.machines.create_preview(&tenant, request).await?;
     Ok((StatusCode::CREATED, Json(preview)))
 }
 
-async fn list_previews(State(machines): State<Arc<Machines>>) -> Json<Vec<PreviewInfo>> {
-    Json(machines.previews().await)
+async fn list_previews(
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
+) -> Json<Vec<PreviewInfo>> {
+    Json(host.machines.previews(&tenant).await)
 }
 
 async fn preview_info(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     Path(id): Path<String>,
 ) -> Result<Json<PreviewInfo>, ApiError> {
-    let preview = machines.preview(&id).await;
+    let preview = host.machines.preview(&tenant, &id).await;
     Ok(Json(preview.ok_or(MachineError::UnknownPreview)?))
 }
 
 async fn delete_preview(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    machines.delete_preview(&id).await?;
+    host.machines.delete_preview(&tenant, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn proxy(
-    State(machines): State<Arc<Machines>>,
+    State(host): State<Arc<Host>>,
+    Caller(tenant): Caller,
     Path((id, _)): Path<(String, String)>,
     mut request: Request,
 ) -> Result<Response, ApiError> {
-    let machine = machines
-        .begin_use(&id)
+    let machine = host
+        .machines
+        .begin_use(&tenant, &id)
         .await
         .ok_or(MachineError::UnknownMachine)?;
     if machine.state() == MachineState::Paused {
         return Err(ApiError(
             StatusCode::CONFLICT,
             "machine is paused; resume it first".into(),
+            None,
         ));
     }
     let machine = Arc::new(machine);
     let client_upgrade = hyper::upgrade::on(&mut request);
     let (mut parts, body) = request.into_parts();
-    parts.uri = agentd_uri(&parts.uri, &id)?;
-    parts
-        .headers
-        .insert(header::HOST, header::HeaderValue::from_static("agentd"));
+    address_to_agentd(&mut parts, &id)?;
 
     let mut sender = agentd(&machine, machine.clone()).await?;
     let mut response = sender
@@ -260,27 +335,52 @@ async fn relay_until_either_side_ends(
     }
 }
 
+fn address_to_agentd(parts: &mut Parts, id: &str) -> Result<(), ApiError> {
+    parts.uri = agentd_uri(&parts.uri, id)?;
+    parts.headers.remove(header::AUTHORIZATION);
+    parts
+        .headers
+        .insert(header::HOST, header::HeaderValue::from_static("agentd"));
+    Ok(())
+}
+
 fn agentd_uri(uri: &Uri, id: &str) -> Result<Uri, ApiError> {
     let prefix = format!("/machines/{id}");
     uri.path_and_query()
         .and_then(|path| path.as_str().strip_prefix(&prefix))
         .and_then(|path| path.parse().ok())
-        .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "malformed machine path".into()))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "malformed machine path".into(),
+                None,
+            )
+        })
 }
 
 fn unreachable_agentd(error: impl std::fmt::Display) -> ApiError {
     ApiError(
         StatusCode::BAD_GATEWAY,
         format!("machine agent is unreachable: {error}"),
+        None,
     )
 }
 
-struct ApiError(StatusCode, String);
+struct ApiError(StatusCode, String, Option<u64>);
 
 impl From<MachineError> for ApiError {
     fn from(error: MachineError) -> Self {
+        let retry_after_secs = match &error {
+            MachineError::RateLimited { retry_after } => {
+                Some(retry_after.as_secs_f64().ceil().max(1.0) as u64)
+            }
+            _ => None,
+        };
         let status = match error {
             MachineError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            MachineError::QuotaExceeded(_) | MachineError::RateLimited { .. } => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
             MachineError::UnknownMachine
             | MachineError::UnknownSnapshot
             | MachineError::UnknownPreview => StatusCode::NOT_FOUND,
@@ -290,12 +390,39 @@ impl From<MachineError> for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
-        Self(status, error.to_string())
+        Self(status, error.to_string(), retry_after_secs)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, self.1).into_response()
+        match self.2 {
+            Some(secs) => {
+                (self.0, [(header::RETRY_AFTER, secs.to_string())], self.1).into_response()
+            }
+            None => (self.0, self.1).into_response(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_forwarded_request_leaves_the_api_key_outside_the_machine() {
+        let (mut parts, ()) = Request::builder()
+            .uri("/machines/m1/processes?cursor=3")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header(header::HOST, "machined")
+            .header("x-kept", "yes")
+            .body(())
+            .expect("request")
+            .into_parts();
+        assert!(address_to_agentd(&mut parts, "m1").is_ok());
+        assert_eq!(parts.uri, "/processes?cursor=3");
+        assert!(parts.headers.get(header::AUTHORIZATION).is_none());
+        assert_eq!(parts.headers[header::HOST], "agentd");
+        assert_eq!(parts.headers["x-kept"], "yes");
     }
 }

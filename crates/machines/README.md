@@ -8,7 +8,7 @@ and snapshotted to start any number of new machines from the same moment.
 ```ts
 import { Host } from "@machine-slop/sdk";
 
-const host = new Host("http://127.0.0.1:4001");
+const host = new Host("http://127.0.0.1:4001", { apiKey: "..." });
 const { machine, info } = await host.createMachine();
 const waiting = await machine.startProcess({
   program: "/bin/sh",
@@ -60,9 +60,11 @@ original machine's shell is still waiting after the pause and resume.
 | `GET /previews`              | `host.previews()`                     | Lists previews that have not expired                           |
 | `GET /previews/{id}`         | none                                  | `PreviewInfo`                                                  |
 | `DELETE /previews/{id}`      | `host.deletePreview(id)`              | Ends the preview and its open connections; 204                 |
+| `GET /usage`                 | `host.usage()`                        | The tenant's quotas and recorded usage; `TenantUsage`          |
 
 `HostedMachine` is a `Machine`, so processes, files and ports work the same as
-against a local `agentd`. `GET /health` returns `ok`.
+against a local `agentd`. `GET /health` returns `ok`. Every other request needs
+an API key as `Authorization: Bearer <key>`, and acts as the key's tenant.
 
 | Field                | Default | Range     |
 | -------------------- | ------- | --------- |
@@ -74,15 +76,16 @@ against a local `agentd`. `GET /health` returns `ok`.
 | `egress_address`     | none    | see below |
 | `snapshot_id`        | none    | see below |
 
-A machine is `running`, `paused` or `exited`. An invalid request returns 422, an
-unknown machine or snapshot 404, a request that does not apply to the machine's
-state 409, a host with no room for another VM or a shutting-down `machined` 503,
-a failed boot 500 with the console tail, a failed save or restore 500, and an
-unreachable `agentd` 502. Forwarding to a paused machine is a 409; pausing,
-resuming, forking or snapshotting an exited one is a 409. An exited machine can
-only be deleted or left to expire. A machine becomes exited when its VM exits on
-its own, when a resume fails after its checkpoint was given up, and when
-`machined` stops without saving it.
+A machine is `running`, `paused` or `exited`. A missing or unknown API key
+returns 401, an invalid request 422, an unknown machine or snapshot 404, a
+request that does not apply to the machine's state 409, a request beyond the
+tenant's quotas or create rate 429, a host with no room for another VM or a
+shutting-down `machined` 503, a failed boot 500 with the console tail, a failed
+save or restore 500, and an unreachable `agentd` 502. Forwarding to a paused
+machine is a 409; pausing, resuming, forking or snapshotting an exited one is
+a 409. An exited machine can only be deleted or left to expire. A machine
+becomes exited when its VM exits on its own, when a resume fails after its
+checkpoint was given up, and when `machined` stops without saving it.
 
 At most 16 VMs run at once, and each running VM reserves its guest memory plus
 64 MiB of host overhead from a memory budget before it launches. The budget is
@@ -101,11 +104,31 @@ room outside the budget; use a smaller explicit budget when sharing the host.
 
 `boot_ms` is how long the request that created the machine took until `agentd`
 was healthy. A create, delete, pause, resume, fork or snapshot finishes even if
-its client disconnects. Creates, forks and snapshots are not idempotent: after a
-lost response, find the result with `host.machines()` or `host.snapshots()`,
-where `machine_id` and `created_unix_ms` identify a snapshot, instead of
-retrying. A delete that fails to remove a machine's or snapshot's record returns
-500 and leaves it listed; retry it.
+its client disconnects. A delete that fails to remove a machine's or snapshot's
+record returns 500 and leaves it listed; retry it.
+
+## Retries
+
+A create, fork or snapshot that carries an `Idempotency-Key` header can be
+retried after a lost response. The SDK takes the key as the last argument of
+`createMachine`, `fork` and `snapshot`. A key is 1 to 255 visible ASCII
+characters and belongs to the tenant that sent it.
+
+The key is written into the machine's or snapshot's record in the same step that
+makes it exist, so a request either made its result with the key or made
+nothing. A request with a key that already made a machine or snapshot returns
+it, as it is now, with the original status and without checking quotas or the
+create rate. Requests with the same key run one at a time: a retry that arrives
+while the first attempt is still running waits for it. A failed attempt makes
+nothing, so its retry tries again. Reusing a key for a different request, such
+as another body, another source machine or another kind of request, returns 422.
+
+A key refers to its result for as long as that machine or snapshot exists,
+across `machined` restarts. Deleting or expiring a keyed result also takes the
+key's turn, so a retry waits for it and then finds the result still listed if
+the delete failed. Once the result is gone, the key makes a new one. A request
+without a key is not retry-safe; after a lost response, find its result with
+`host.machines()` or `host.snapshots()`.
 
 A running or exited machine expires after `idle_timeout_secs` without an open
 request to its `agentd`, and is then destroyed as if deleted. The clock restarts
@@ -405,6 +428,10 @@ terminator for `*.preview.example.com` at the listener. The id is 128 random
 bits and is the only credential; anyone with the URL can use the preview until
 it ends.
 
+Creating, listing and deleting previews needs the API key of the tenant that
+owns the machine; another tenant's preview is a 404 there. Using a preview URL
+needs no API key, and the app receives each request as its client sent it.
+
 A request to a preview is forwarded to the port on the machine's loopback as it
 arrived, with its `Host`, and the response comes back the same way, so web
 servers, server-sent events and WebSockets work. A request with
@@ -432,9 +459,100 @@ connections, upgrades included, are closed. Deleting the machine ends its
 previews. A machine may have 64 previews. Previews are held in memory: a
 `machined` restart ends them all, and forks and snapshots do not copy them.
 
+## Tenants
+
+Every machine and snapshot belongs to the tenant that created it; a fork belongs
+to its source's tenant. A tenant sees and changes only its own: another tenant's
+machine, snapshot or port is a 404, and so is creating from another tenant's
+snapshot. `machined` reads its tenants at start from a JSON file:
+
+```json
+{
+  "tenants": [
+    {
+      "id": "acme",
+      "api_key_sha256": ["<hex SHA-256 of each API key>"],
+      "quotas": {
+        "running_machines": 8,
+        "memory_mib": 16384,
+        "disk_gib": 200,
+        "creates_per_second": 2
+      }
+    }
+  ]
+}
+```
+
+The file holds digests, not keys; `printf %s "$key" | sha256sum` makes one. A
+tenant may have several keys, so a key can be rotated by adding the new one
+before removing the old. An id is 1 to 64 letters, digits, `-` or `_`. A tenant
+removed from the file keeps its machines, snapshots and usage, but no key
+reaches them; they still count toward its usage until an operator deletes them.
+
+| Quota                | Counts                                                               | Checked by             |
+| -------------------- | -------------------------------------------------------------------- | ---------------------- |
+| `running_machines`   | VMs running for the tenant                                           | create, fork, resume   |
+| `memory_mib`         | guest memory of those VMs                                            | create, fork, resume   |
+| `disk_gib`           | each machine's 8 GiB scratch disk plus its memory, and each snapshot | create, fork, snapshot |
+| `creates_per_second` | creates and forks, with bursts of up to one second's worth           | create, fork           |
+
+A running VM holds its machine and memory quota until its process exits, so a
+pause gives them back and a resume takes them again; paused and exited machines
+hold only disk. Disk is provisioned rather than measured: a machine counts the
+most it can store, whether or not it is paused, and a snapshot counts what it
+stored, `SnapshotInfo.stored_bytes`. A request over a quota or the rate returns
+429 before anything starts and changes nothing; a rate refusal carries
+`Retry-After`, and a `creates_per_second` of 0 refuses every create and fork.
+`GET /usage` reports the quotas.
+
+## Usage
+
+`machined` meters each tenant's
+
+- `vcpu_ms`: vCPU-milliseconds, each machine's vCPUs times how long it runs:
+  from when a create or fork records it, or a resume finds `agentd` answering,
+  until its VM process exits. A boot, restore or resume that fails is not
+  metered, nor is a paused machine;
+- `memory_mib_ms`: MiB-milliseconds of guest memory over the same time;
+- `snapshot_mib_ms`: MiB-milliseconds of `stored_bytes` for each snapshot, from
+  its creation until it is deleted, including while `machined` is down.
+
+Divide by 1000 for seconds and by 1024 for GiB. Usage is recorded in
+`usage.json` in the state dir every 5 seconds and at shutdown, and `GET /usage`
+reports only what has been recorded, with `as_of_unix_ms`, so it never goes
+down, even across a crash. A crash loses at most the VM time of the 5 seconds
+before it; it is never counted twice. Metering uses the host's wall clock. For
+every tenant, configured or not, `usage.json` is the export for billing.
+
+## Isolation
+
+Every VM runs under Firecracker's `jailer`, which `machined` runs as root:
+
+- a chroot holding only that VM's files: hard links to its disks, its kernel or
+  the saved state it restores from, and its sockets;
+- a user and group of its own: `machined` keeps one id per running-VM place,
+  from `SLOP_FIRST_JAIL_UID` (default 1000000000) up, so no two running VMs
+  share one, and an id is reused only after its VM has exited;
+- a cgroup under `/sys/fs/cgroup/machine-slop-<state dir device>-<inode>` with
+  `memory.max` at the admitted reservation (guest memory plus 64 MiB),
+  `memory.swap.max` 0, `cpu.max` at its vCPUs and `pids.max` at its vCPUs plus
+  32;
+- Firecracker's own seccomp filters.
+
+The machine's scratch disk is writable inside its jail; the root image, kernel
+and saved state are read-only to it. Because the jail's root belongs to the VM's
+user, `machined` treats everything in it as the VM's to change: it connects to
+the VM's API and `agentd` sockets only when the process serving them is that
+VM's Firecracker, and takes saved memory and device state only as regular files
+owned by the VM's user, opened without following links. It then makes them owned
+by root and read-only, and links that same file out of the jail, before any
+other machine or snapshot shares it. The state dir's `machines` and `snapshots`
+are readable only by root. `machined` removes the API key from requests it
+forwards to a machine, so the key never enters a guest.
+
 ## Host
 
-`machined <listen address> <image dir> <state dir>`
+`machined <listen address> <image dir> <state dir> <tenants file>`
 
 | Variable                | Effect                                            |
 | ----------------------- | ------------------------------------------------- |
@@ -444,7 +562,11 @@ previews. A machine may have 64 previews. Previews are held in memory: a
 | `SLOP_PREVIEW_LISTEN`   | The public address previews are served on         |
 | `SLOP_EGRESS_ADDRESSES` | Comma-separated addresses machines may leave from |
 
-The image dir holds `firecracker`, `vmlinux` and `rootfs.ext4`, built by
+`machined` must run as root on cgroup v2 with the `cpu`, `memory` and `pids`
+controllers available. Machine and snapshot records written before tenants
+existed name no tenant; `machined` logs them as unreadable and leaves their
+directories in place, so remove the old state dir when upgrading. The image dir
+holds `jailer`, `firecracker`, `vmlinux` and `rootfs.ext4`, built by
 `vm/image/build.sh <image dir> <agentd binary>`. The script pins Firecracker,
 the guest kernel, Chrome for Testing, Node and Deno by hash and Debian by
 snapshot date, installing from its `trixie`, `trixie-updates` and
@@ -459,13 +581,14 @@ they do not, so saved memory is always restored against the root filesystem and
 Firecracker it was saved with. Replace image files, as the build script does;
 never modify them in place.
 
-The state dir holds one directory per machine and per snapshot. A directory
-counts only once its record file is written, after everything else in it is
-complete and synced, and stops counting when the record is removed. A paused
-machine's saved state is published the same way, by renaming a complete
-directory into place, and is renamed out of place before a VM restored from it
-may write to the disk. So nothing half-written is ever restored, and saved
-memory is never paired with a disk that a later run changed.
+The state dir holds one directory per machine and per snapshot, a `jails`
+directory with one chroot per running VM, and `usage.json`. A directory counts
+only once its record file is written, after everything else in it is complete
+and synced, and stops counting when the record is removed. A paused machine's
+saved state is published the same way, by renaming a complete directory into
+place, and is renamed out of place before a VM restored from it may write to the
+disk. So nothing half-written is ever restored, and saved memory is never paired
+with a disk that a later run changed.
 
 A paused machine uses its memory size on disk, plus what it wrote to its scratch
 disk. Saved memory is one file shared by every machine and snapshot that holds
@@ -485,18 +608,21 @@ created from a snapshot share its memory file until each is next paused.
   listed as paused; none is resumed automatically. A machine that was running
   when `machined` was killed, or when the host lost power, has lost its memory:
   its Firecracker process, if still alive, is killed, and the machine is listed
-  as exited until it is deleted or expires. Creates, forks, snapshots and saves
-  that did not finish are removed, and so are spares.
+  as exited until it is deleted or expires. Every process left in its cgroup is
+  killed, and leftover jails removed. Creates, forks, snapshots and saves that
+  did not finish are removed, and so are spares.
 
 Both daemons emit JSON logs to stderr, with `RUST_LOG` controlling filtering
 (default `info`). Machine lifecycle events (create, pause, resume, fork,
 snapshot, destroy, spare boots and the admission limits at startup) include
-machine and snapshot IDs, boot duration and requested resources; failures
-include errors. `agentd` process-start events are available at `debug`.
+machine and snapshot IDs, the tenant on create, boot duration and requested
+resources; failures include errors. `agentd` process-start events are available
+at `debug`.
 
-`GET /metrics` exposes Prometheus text. `machined_machines_active` counts
-running VMs, spares and in-flight boots included, and
-`machined_memory_reserved_mib` the memory they reserve, while
+`GET /metrics` exposes Prometheus text without authentication; it reports the
+host, not tenants, so serve it only where the operator can reach it.
+`machined_machines_active` counts running VMs, spares and in-flight boots
+included, and `machined_memory_reserved_mib` the memory they reserve, while
 `machined_memory_budget_mib` reports the admission budget.
 `machined_spare_machines` counts spares ready to be taken, and
 `machined_machines{state="running"|"paused"|"exited"}` the listed machines.
@@ -507,8 +633,11 @@ restart. `agentd` exposes `agentd_processes_running` and
 `agentd_processes_retained`; the latter includes finished records kept for
 replay.
 
-CI runs the live machine contracts on a Linux KVM runner, serially to bound
-memory use, and runs the ordinary checks on Linux and macOS.
+CI runs the live machine contracts on a Linux KVM runner as root, serially to
+bound memory use, and runs the ordinary checks on Linux and macOS.
 
-Firecracker runs without its jailer, and the API has no authentication. The host
-is trusted. Only the preview listener is meant to face the internet.
+A machine's own processes run as root inside its guest, and its `agentd` serves
+whoever reaches it; `machined` is that machine's only entrance. Egress leaves
+from the host's address, as described above. The host itself, its operator and
+`machined` are trusted. The preview listener is the only one meant to face the
+internet without an API key.

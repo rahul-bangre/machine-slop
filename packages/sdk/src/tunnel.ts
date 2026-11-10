@@ -1,4 +1,4 @@
-import { HttpError } from "./http.ts";
+import { type Endpoint, HttpError } from "./http.ts";
 
 const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_HEAD_BYTES = 16 * 1024;
@@ -11,23 +11,24 @@ export type Tunnel = {
 };
 
 export async function openTunnel(
-    base: URL,
+    endpoint: Endpoint,
     port: number,
     signal?: AbortSignal,
 ): Promise<Tunnel> {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
         throw new RangeError(`port must be between 1 and 65535, got ${port}`);
     }
-    const path = `${base.pathname.replace(/\/+$/, "")}/ports/${port}`;
-    return await openUpgrade(base, path, signal);
+    const path = `${endpoint.url.pathname.replace(/\/+$/, "")}/ports/${port}`;
+    return await openUpgrade(endpoint, path, signal);
 }
 
 export async function openUpgrade(
-    origin: URL,
+    endpoint: Endpoint,
     path: string,
     signal?: AbortSignal,
 ): Promise<Tunnel> {
-    const conn = await connect(origin);
+    const base = endpoint.url;
+    const conn = await connect(base);
     let closed = false;
     const closeConnection = () => {
         if (closed) return;
@@ -40,7 +41,11 @@ export async function openUpgrade(
         await writeAll(
             conn,
             new TextEncoder().encode(
-                `GET ${path} HTTP/1.1\r\nHost: ${origin.host}\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n`,
+                `GET ${path} HTTP/1.1\r\nHost: ${base.host}\r\n${
+                    Object.entries(endpoint.headers).map(([name, value]) =>
+                        `${name}: ${value}\r\n`
+                    ).join("")
+                }Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n`,
             ),
         );
         const { status, headers, rest } = await readHead(conn);
@@ -62,7 +67,7 @@ export function connectPreview(
     url: string | URL,
     signal?: AbortSignal,
 ): Promise<Tunnel> {
-    return openUpgrade(new URL(url), "/", signal);
+    return openUpgrade({ url: new URL(url), headers: {} }, "/", signal);
 }
 
 export function duplex(

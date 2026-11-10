@@ -83,6 +83,7 @@ async fn forward(machines: &Machines, mut request: Request) -> Result<Response, 
         ApiError(
             StatusCode::NOT_FOUND,
             "no such preview, or it has expired".into(),
+            None,
         )
     })?;
     match preview.machine.state() {
@@ -91,12 +92,14 @@ async fn forward(machines: &Machines, mut request: Request) -> Result<Response, 
             return Err(ApiError(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the machine is paused".into(),
+                None,
             ));
         }
         MachineState::Exited { .. } => {
             return Err(ApiError(
                 StatusCode::BAD_GATEWAY,
                 "the machine has exited".into(),
+                None,
             ));
         }
     }
@@ -136,7 +139,13 @@ async fn forward(machines: &Machines, mut request: Request) -> Result<Response, 
         .path_and_query()
         .map_or("/", |path| path.as_str())
         .parse()
-        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "malformed request target".into()))?;
+        .map_err(|_| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "malformed request target".into(),
+                None,
+            )
+        })?;
     *request.uri_mut() = origin_form;
     let client_version = request.version();
     let mut response = sender
@@ -186,6 +195,7 @@ async fn port_tunnel(
         return Err(ApiError(
             status,
             String::from_utf8_lossy(&body).into_owned(),
+            None,
         ));
     }
     hyper::upgrade::on(&mut response)
@@ -197,6 +207,7 @@ fn unreachable_port(error: impl std::fmt::Display) -> ApiError {
     ApiError(
         StatusCode::BAD_GATEWAY,
         format!("the machine's port did not answer: {error}"),
+        None,
     )
 }
 

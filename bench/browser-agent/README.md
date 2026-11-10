@@ -30,6 +30,8 @@ deno task bench:browser-agent
 | `--deno`               | `deno`                                        |
 | `--out`                | `bench-results/browser-agent-<timestamp>/`    |
 
+The `machined` provider sends `SLOP_API_KEY` as its API key.
+
 The model runs through the local `claude` CLI with its subscription login and
 tools disabled; no model API key is needed. Each model command is parsed as
 browser JSON, never executed as shell code.

@@ -94,7 +94,7 @@ async function withStubHost(run: (host: StubHost) => Promise<void>) {
 
 Deno.test("a machined sandbox runs commands in its own machine, reports the host's boot time, and destroys the machine on close", () =>
     withStubHost(async (host) => {
-        const provider = machinedProvider(host.url);
+        const provider = machinedProvider(host.url, "test-key");
         await provider.prepare();
 
         const sandbox = await provider.create();
@@ -116,7 +116,7 @@ Deno.test("a machined sandbox is created with the machine settings it was given"
             memory_mib: 4096,
             allowed_hosts: ["registry.npmjs.org"],
         };
-        const provider = machinedProvider(host.url, machine);
+        const provider = machinedProvider(host.url, "test-key", machine);
 
         const sandbox = await provider.create();
         assert.deepEqual(host.create_requests, [machine]);
@@ -126,7 +126,7 @@ Deno.test("a machined sandbox is created with the machine settings it was given"
 
 Deno.test("machines the bench lost track of are destroyed before the next create, when setup fails, and when the run ends", () =>
     withStubHost(async (host) => {
-        const provider = machinedProvider(host.url);
+        const provider = machinedProvider(host.url, "test-key");
 
         host.running.add("booted-after-a-lost-create-response");
         const sandbox = await provider.create();
@@ -151,14 +151,14 @@ Deno.test("a host that already runs machines is refused before the run starts", 
     withStubHost(async (host) => {
         host.running.add("someone-elses-machine");
         await assert.rejects(
-            machinedProvider(host.url).prepare(),
+            machinedProvider(host.url, "test-key").prepare(),
             ProviderNotReady,
         );
         assert.deepEqual(host.destroyed, []);
 
         await host.stop();
         await assert.rejects(
-            machinedProvider(host.url).prepare(),
+            machinedProvider(host.url, "test-key").prepare(),
             ProviderNotReady,
         );
     }));
@@ -170,7 +170,7 @@ Deno.test({
     sanitizeResources: false,
     fn: () =>
         withStubHost(async (host) => {
-            const provider = machinedProvider(host.url);
+            const provider = machinedProvider(host.url, "test-key");
             const sandbox = await provider.create();
             host.faults.output_never_ends = true;
 

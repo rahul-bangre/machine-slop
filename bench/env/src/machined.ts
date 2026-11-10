@@ -10,16 +10,17 @@ const abandoned_machine_idle_secs = 15 * 60;
 
 export async function machinedSandboxes(
     url: string,
+    apiKey: string,
     resources: Resources,
 ): Promise<Sandboxes> {
-    const host = new Host(url);
+    const host = new Host(url, { apiKey });
     const running = await host.machines(AbortSignal.timeout(request_timeout_ms))
         .catch(() => {
             throw new ProviderNotReady(`machined at ${url} is not reachable`);
         });
     if (running.length > 0) {
         throw new ProviderNotReady(
-            `machined at ${url} already has ${running.length} machines, running, paused or exited. Machines carry no owner, so the smoke test needs the host to itself and destroys every machine it finds. Delete them first; they survive a machined restart.`,
+            `machined at ${url} already has ${running.length} machines, running, paused or exited. The smoke test needs the tenant to itself and destroys every machine it finds. Delete them first; they survive a machined restart.`,
         );
     }
     return {

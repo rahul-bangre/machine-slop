@@ -1,4 +1,4 @@
-import { request } from "./http.ts";
+import { type Endpoint, request } from "./http.ts";
 import { Machine } from "./machine.ts";
 import type {
     CreateMachine,
@@ -8,12 +8,21 @@ import type {
     MachineInfo,
     PreviewInfo,
     SnapshotInfo,
+    TenantUsage,
     UpdateMachine,
 } from "./machines.gen.ts";
 
+export type HostOptions = { apiKey: string };
+
+function retrySafe(idempotencyKey: string | undefined): Record<string, string> {
+    return idempotencyKey === undefined
+        ? {}
+        : { "idempotency-key": idempotencyKey };
+}
+
 export class HostedMachine extends Machine {
-    constructor(private readonly host: URL, readonly id: string) {
-        super(new URL(`machines/${id}`, host));
+    constructor(private readonly host: Endpoint, readonly id: string) {
+        super(new URL(`machines/${id}`, host.url), host.headers);
     }
 
     async info(signal?: AbortSignal): Promise<MachineInfo> {
@@ -76,20 +85,28 @@ export class HostedMachine extends Machine {
 
     async fork(
         signal?: AbortSignal,
+        idempotencyKey?: string,
     ): Promise<{ machine: HostedMachine; info: MachineInfo }> {
         const response = await request(this.host, `/machines/${this.id}/fork`, {
             method: "POST",
+            headers: retrySafe(idempotencyKey),
             signal: signal ?? null,
         });
         const info: MachineInfo = await response.json();
         return { machine: new HostedMachine(this.host, info.id), info };
     }
 
-    async snapshot(signal?: AbortSignal): Promise<SnapshotInfo> {
+    async snapshot(
+        signal?: AbortSignal,
+        idempotencyKey?: string,
+    ): Promise<SnapshotInfo> {
         const snapshot: CreateSnapshot = { machine_id: this.id };
         return (await request(this.host, "/snapshots", {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: {
+                "content-type": "application/json",
+                ...retrySafe(idempotencyKey),
+            },
             body: JSON.stringify(snapshot),
             signal: signal ?? null,
         })).json();
@@ -114,20 +131,28 @@ export class HostedMachine extends Machine {
 }
 
 export class Host {
-    private readonly url: URL;
+    private readonly endpoint: Endpoint;
 
-    constructor(url: string | URL) {
-        this.url = new URL(url);
-        if (!this.url.pathname.endsWith("/")) this.url.pathname += "/";
+    constructor(url: string | URL, options: HostOptions) {
+        const base = new URL(url);
+        if (!base.pathname.endsWith("/")) base.pathname += "/";
+        this.endpoint = {
+            url: base,
+            headers: { authorization: `Bearer ${options.apiKey}` },
+        };
     }
 
     async createMachine(
         options: CreateMachine = {},
         signal?: AbortSignal,
+        idempotencyKey?: string,
     ): Promise<{ machine: HostedMachine; info: MachineInfo }> {
-        const response = await request(this.url, "/machines", {
+        const response = await request(this.endpoint, "/machines", {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: {
+                "content-type": "application/json",
+                ...retrySafe(idempotencyKey),
+            },
             body: JSON.stringify(options),
             signal: signal ?? null,
         });
@@ -136,44 +161,50 @@ export class Host {
     }
 
     async machines(signal?: AbortSignal): Promise<MachineInfo[]> {
-        return (await request(this.url, "/machines", {
+        return (await request(this.endpoint, "/machines", {
             signal: signal ?? null,
         })).json();
     }
 
     async snapshots(signal?: AbortSignal): Promise<SnapshotInfo[]> {
-        return (await request(this.url, "/snapshots", {
+        return (await request(this.endpoint, "/snapshots", {
             signal: signal ?? null,
         })).json();
     }
 
     async snapshot(id: string, signal?: AbortSignal): Promise<SnapshotInfo> {
-        return (await request(this.url, `/snapshots/${id}`, {
+        return (await request(this.endpoint, `/snapshots/${id}`, {
             signal: signal ?? null,
         })).json();
     }
 
     async deleteSnapshot(id: string, signal?: AbortSignal): Promise<void> {
-        await request(this.url, `/snapshots/${id}`, {
+        await request(this.endpoint, `/snapshots/${id}`, {
             method: "DELETE",
             signal: signal ?? null,
         });
     }
 
     async previews(signal?: AbortSignal): Promise<PreviewInfo[]> {
-        return (await request(this.url, "/previews", {
+        return (await request(this.endpoint, "/previews", {
             signal: signal ?? null,
         })).json();
     }
 
     async deletePreview(id: string, signal?: AbortSignal): Promise<void> {
-        await request(this.url, `/previews/${id}`, {
+        await request(this.endpoint, `/previews/${id}`, {
             method: "DELETE",
             signal: signal ?? null,
         });
     }
 
     machine(id: string): HostedMachine {
-        return new HostedMachine(this.url, id);
+        return new HostedMachine(this.endpoint, id);
+    }
+
+    async usage(signal?: AbortSignal): Promise<TenantUsage> {
+        return (await request(this.endpoint, "/usage", {
+            signal: signal ?? null,
+        })).json();
     }
 }
