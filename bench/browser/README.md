@@ -108,3 +108,49 @@ startup.
 
 Arms run interleaved per task, and their order rotates every round and every
 task, so each arm runs in each position equally often.
+
+## Held-out workflows
+
+`src/workflows/` is a pack of small web apps for a model-driven agent: the agent
+gets a goal in plain language and has to reach it in the browser. The pack is
+held out. Do not use it to tune prompts, observers or the model loop; tune on
+the fixture tasks instead.
+
+`src/workflows/mod.ts` exports them as `workflows`. Each has an `id`, the
+capabilities it `covers`, a list of `seeds`, and `open(seed)`, which returns a
+prompt and a site with fresh state:
+
+- `site.handle(request)` serves the app and its JSON API. Every path is rooted
+  at `/`, and the start page is `/`. Pages fetch their data from the API, so the
+  server owns all state.
+- `site.outcome()` resolves to `null` when the goal was met, otherwise the
+  reason it was not. It first waits for every request the site has already
+  received to finish, so a submit still in flight when the agent stops is
+  counted. It reads only the server's committed records, never the page or a
+  request log, and fails on no action, the wrong target, wrong values, and extra
+  or duplicate side effects. The server validates every write and rejects
+  malformed ones instead of committing them.
+- The prompt states the goal and the facts needed (names, amounts, credentials,
+  fallback rule), not how to reach it: no URLs, selectors, labels or steps.
+
+A seed builds one scenario, and the prompt, the served data and the expected
+outcome all come from it. Seeds change the people, amounts, targets and which
+slot conflicts, not just labels. Latency is fixed per endpoint, dates are fixed,
+and nothing is random at request time.
+
+| Workflow             | Covers                           | Goal                                                                                                                     |
+| -------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `invoice-dispute`    | async loading, dialogs           | Dispute the largest unpaid invoice from a customer in a given month. Invoices load slowly, a page at a time.             |
+| `member-offboarding` | dialogs                          | Remove a member and hand their projects to someone else, past a blocking announcement and a typed confirmation.          |
+| `expense-claim`      | multi-step form, async loading   | File a claim through a four-step wizard with a section that depends on the category and a cost-centre search.            |
+| `room-rebooking`     | recovery, dialogs, async loading | Book a room. The requested slot shows as free but is taken when booked; the prompt gives the fallback rule.              |
+| `address-change`     | recovery                         | Change the shipping address. The session expires on the first save, so the agent signs in again and re-enters the input. |
+
+Dialogs are in-page `<dialog>` elements opened with `showModal()`. The apps
+never use `alert`, `confirm`, `prompt` or `beforeunload`, because how the model
+loop handles native dialogs is unspecified. Every control works with click, fill
+and Enter: choices are radio buttons rather than `<select>`, dates are text
+fields, and forms start empty so nothing has to be cleared.
+
+`test/workflows.test.ts` drives each site through the HTTP requests its pages
+make: a reference solution must pass and representative mistakes must fail.
