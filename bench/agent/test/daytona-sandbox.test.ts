@@ -5,7 +5,7 @@ import {
     type DaytonaRemote,
 } from "../src/daytona-sandbox.ts";
 
-function fixture() {
+function fixture(snapshot?: string) {
     const remotes = new Map<string, DaytonaRemote>();
     const deleted: DaytonaRemote[] = [];
     const state = {
@@ -13,13 +13,23 @@ function fixture() {
         fail_setup: false,
         lost_create: false,
         hang: false,
+        memory: 4,
     };
     const client: DaytonaClient = {
         create(params, options) {
-            assert.deepEqual(params.resources, { cpu: 2, memory: 4 });
+            if (snapshot) {
+                assert.ok("snapshot" in params);
+                assert.equal(params.snapshot, snapshot);
+                assert.ok(!("image" in params));
+            } else {
+                assert.ok("image" in params);
+                assert.deepEqual(params.resources, { cpu: 2, memory: 4 });
+            }
             assert.equal(options.timeout, 120);
             assert.equal(params.ttlMinutes, 30);
             const remote: DaytonaRemote = {
+                cpu: 2,
+                memory: state.memory,
                 process: {
                     executeCommand(command, _cwd, _env, timeout) {
                         assert.ok(timeout! > 0);
@@ -57,29 +67,43 @@ function fixture() {
             return Promise.resolve();
         },
     };
-    return { provider: daytonaProvider(client), state, remotes, deleted };
+    return {
+        provider: daytonaProvider(client, snapshot),
+        state,
+        remotes,
+        deleted,
+    };
 }
 
 Deno.test("Daytona pins resources, preserves exits, and reclaims only its own sandboxes", async () => {
-    const f = fixture();
-    const other = fixture();
-    await f.provider.prepare();
-    const sandbox = await f.provider.create();
-    await other.provider.create();
-    assert.deepEqual(await sandbox.run("false", 1000), {
-        exit_code: 1,
-        stdout: "output",
-        stderr: "",
-        timed_out: false,
-    });
-    await sandbox.writeFile("nested/with space.txt", "'hello'");
-    await assert.rejects(sandbox.writeFile("../escape", "x"));
-    await sandbox.close();
-    await sandbox.close();
-    await f.provider.reclaim();
+    for (const source of [undefined, "prepared-browser-snapshot"]) {
+        const f = fixture(source);
+        const other = fixture();
+        await f.provider.prepare();
+        const sandbox = await f.provider.create();
+        await other.provider.create();
+        assert.deepEqual(await sandbox.run("false", 1000), {
+            exit_code: 1,
+            stdout: "output",
+            stderr: "",
+            timed_out: false,
+        });
+        await sandbox.writeFile("nested/with space.txt", "'hello'");
+        await assert.rejects(sandbox.writeFile("../escape", "x"));
+        await sandbox.close();
+        await sandbox.close();
+        await f.provider.reclaim();
+        assert.equal(f.deleted.length, 1);
+        assert.equal(other.deleted.length, 0);
+        await other.provider.reclaim();
+    }
+});
+
+Deno.test("Daytona rejects and destroys a snapshot with different resource limits", async () => {
+    const f = fixture("wrong-size-snapshot");
+    f.state.memory = 1;
+    await assert.rejects(f.provider.create(), /expected 2 \/ 4/);
     assert.equal(f.deleted.length, 1);
-    assert.equal(other.deleted.length, 0);
-    await other.provider.reclaim();
 });
 
 Deno.test("Daytona cleans up failed setup and a lost create response by owned name", async () => {
@@ -118,6 +142,8 @@ Deno.test("Daytona failed destruction is a failure, remains tracked, and is retr
 Deno.test("Daytona transport failures remain failures even when cleanup crosses the command deadline", async () => {
     let calls = 0;
     const remote: DaytonaRemote = {
+        cpu: 2,
+        memory: 4,
         process: {
             executeCommand() {
                 return ++calls === 1
@@ -158,6 +184,8 @@ Deno.test("Daytona creation rejects when reclaim wins during setup", async () =>
     const entered = Promise.withResolvers<void>();
     let deleted = 0;
     const remote: DaytonaRemote = {
+        cpu: 2,
+        memory: 4,
         process: {
             executeCommand() {
                 entered.resolve();

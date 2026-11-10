@@ -21,4 +21,6 @@ jobs:
       - run: make setup
       - run: make check
       - run: make test
+      - run: deno task bench:chromium
+      - run: deno task test:browser-agent
       - run: make build

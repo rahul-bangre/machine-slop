@@ -30,14 +30,18 @@ function html(body: string): Response {
 
 export class FixtureServer {
     private requests: RequestRecord[] = [];
-    private readonly server: Deno.HttpServer;
+    private readonly server: Deno.HttpServer<Deno.NetAddr>;
 
-    constructor() {
-        const { port, hostname } = new URL(fixture_origin);
+    constructor(origin = fixture_origin) {
+        const { port, hostname } = new URL(origin);
         this.server = Deno.serve(
             { port: Number(port), hostname, onListen: () => {} },
             (request) => this.handle(request),
         );
+    }
+
+    get origin(): string {
+        return `http://127.0.0.1:${this.server.addr.port}`;
     }
 
     startRecording(): void {

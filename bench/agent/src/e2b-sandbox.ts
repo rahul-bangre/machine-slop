@@ -61,12 +61,16 @@ class E2bSandbox implements Sandbox {
     }
 }
 
-export function e2bProvider(template: string): SandboxProvider {
+export function e2bProvider(
+    template: string,
+    expected_resources?: { cpu_count: number; memory_mb: number },
+): SandboxProvider {
     const open = new OpenSandboxes();
     return {
         name: "e2b",
         describe: () => ({
             template,
+            expected_resources,
             isolation: "E2B cloud sandbox",
             create_measures: "starting a new sandbox from the template",
         }),
@@ -80,8 +84,20 @@ export function e2bProvider(template: string): SandboxProvider {
         async create() {
             const remote = await E2b.create(template, {
                 timeoutMs: sandbox_lifetime_ms,
+                allowInternetAccess: true,
             });
             try {
+                if (expected_resources) {
+                    const info = await remote.getInfo();
+                    if (
+                        info.cpuCount !== expected_resources.cpu_count ||
+                        info.memoryMB !== expected_resources.memory_mb
+                    ) {
+                        throw new Error(
+                            `E2B reported ${info.cpuCount} CPUs / ${info.memoryMB} MiB; expected ${expected_resources.cpu_count} / ${expected_resources.memory_mb}`,
+                        );
+                    }
+                }
                 await remote.commands.run(`mkdir -p ${work_directory}`);
                 return open.track(new E2bSandbox(remote));
             } catch (error) {

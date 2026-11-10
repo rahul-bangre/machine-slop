@@ -1,4 +1,8 @@
-import { type CreateSandboxFromImageParams, Daytona } from "@daytona/sdk";
+import {
+    type CreateSandboxFromImageParams,
+    type CreateSandboxFromSnapshotParams,
+    Daytona,
+} from "@daytona/sdk";
 import {
     type CommandResult,
     ProviderNotReady,
@@ -12,6 +16,8 @@ const directory = "/tmp/agent-task";
 const image = "python:3.12-slim";
 
 export type DaytonaRemote = {
+    cpu: number;
+    memory: number;
     process: {
         executeCommand(
             command: string,
@@ -23,7 +29,7 @@ export type DaytonaRemote = {
 };
 export type DaytonaClient = {
     create(
-        params: CreateSandboxFromImageParams,
+        params: CreateSandboxFromImageParams | CreateSandboxFromSnapshotParams,
         options: { timeout: number },
     ): Promise<DaytonaRemote>;
     get(name: string): Promise<DaytonaRemote>;
@@ -54,7 +60,10 @@ async function within<T>(promise: Promise<T>, ms: number): Promise<T> {
     }
 }
 
-export function daytonaProvider(client?: DaytonaClient): SandboxProvider {
+export function daytonaProvider(
+    client?: DaytonaClient,
+    snapshot?: string,
+): SandboxProvider {
     const owned = new Map<string, DaytonaRemote | null>();
     const deleting = new Map<string, Promise<void>>();
     let closing = false;
@@ -80,12 +89,12 @@ export function daytonaProvider(client?: DaytonaClient): SandboxProvider {
     return {
         name: "daytona",
         describe: () => ({
-            image,
+            ...(snapshot ? { snapshot } : { image }),
             cpu: 2,
             memory_gib: 4,
             isolation: "Daytona cloud sandbox",
             create_measures:
-                "image sandbox creation until ready, plus work directory setup",
+                "sandbox creation until ready, plus work directory setup",
         }),
         prepare() {
             if (!client && !Deno.env.get("DAYTONA_API_KEY")) {
@@ -116,8 +125,10 @@ export function daytonaProvider(client?: DaytonaClient): SandboxProvider {
             let busy = false;
             const creation = api().create({
                 name,
-                image,
-                resources: { cpu: 2, memory: 4 },
+                ...(snapshot
+                    ? { snapshot }
+                    : { image, resources: { cpu: 2, memory: 4 } }),
+                networkBlockAll: false,
                 ttlMinutes: 30,
                 autoStopInterval: 0,
                 autoDeleteInterval: 0,
@@ -131,6 +142,11 @@ export function daytonaProvider(client?: DaytonaClient): SandboxProvider {
             try {
                 const remote = await within(creation, create_ms + 5_000);
                 owned.set(name, remote);
+                if (remote.cpu !== 2 || remote.memory !== 4) {
+                    throw new SandboxError(
+                        `Daytona reported ${remote.cpu} CPUs / ${remote.memory} GiB; expected 2 / 4`,
+                    );
+                }
                 if (closing) {
                     throw new SandboxError("Daytona provider is closed");
                 }

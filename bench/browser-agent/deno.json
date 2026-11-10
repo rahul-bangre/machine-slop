@@ -1,0 +1,6 @@
+{
+  "imports": {
+    "playwright-core": "npm:playwright-core@1.65.0",
+    "gpt-tokenizer/": "npm:/gpt-tokenizer@4.1.0/"
+  }
+}

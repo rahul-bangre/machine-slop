@@ -38,22 +38,34 @@ export class OpenSandboxes {
     private readonly open = new Set<Sandbox>();
 
     track(sandbox: Sandbox): Sandbox {
+        const cleanup: { pending: Promise<void> | null } = { pending: null };
         const tracked: Sandbox = {
             reported_boot_ms: sandbox.reported_boot_ms,
             writeFile: (path, content) => sandbox.writeFile(path, content),
             run: (script, timeout_ms) => sandbox.run(script, timeout_ms),
-            close: async () => {
-                this.open.delete(tracked);
-                await sandbox.close();
-            },
+            close: () =>
+                cleanup.pending ??= Promise.resolve().then(() =>
+                    sandbox.close()
+                ).then(() => {
+                    this.open.delete(tracked);
+                }).catch((error) => {
+                    cleanup.pending = null;
+                    throw error;
+                }),
         };
         this.open.add(tracked);
         return tracked;
     }
 
     async closeAll(): Promise<void> {
-        await Promise.allSettled(
+        const results = await Promise.allSettled(
             [...this.open].map((sandbox) => sandbox.close()),
         );
+        const failures = results.flatMap((result) =>
+            result.status === "rejected" ? [result.reason] : []
+        );
+        if (failures.length) {
+            throw new AggregateError(failures, "sandbox cleanup incomplete");
+        }
     }
 }
