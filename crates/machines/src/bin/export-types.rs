@@ -1,12 +1,13 @@
 use std::{fs, path::Path};
 
-use slop_machines::{CreateMachine, MachineInfo, MachineState};
+use slop_machines::{CreateMachine, MachineInfo, MachineState, UpdateMachine};
 use ts_rs::TS;
 
 fn main() -> std::io::Result<()> {
     let config = ts_rs::Config::default();
     let declarations = [
         CreateMachine::decl(&config),
+        UpdateMachine::decl(&config),
         MachineState::decl(&config),
         MachineInfo::decl(&config),
     ];

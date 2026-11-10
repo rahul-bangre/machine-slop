@@ -64,14 +64,17 @@ impl Host {
     }
 
     async fn create(&self) -> String {
-        self.create_with(None).await
+        self.create_with(None).await["id"]
+            .as_str()
+            .expect("machine id")
+            .to_owned()
     }
 
-    async fn create_with(&self, body: Option<Value>) -> String {
+    async fn create_with(&self, body: Option<Value>) -> Value {
         let (status, info) = self.request("POST", "/machines", body).await;
         assert_eq!(status, 201, "create machine: {info}");
         assert_eq!(info["state"], json!({ "state": "running" }));
-        info["id"].as_str().expect("machine id").to_owned()
+        info
     }
 
     async fn start_process(&self, machine: &str, script: &str) -> String {
@@ -211,6 +214,9 @@ async fn invalid_requests_are_rejected_without_booting() {
         json!({ "idle_timeout_secs": 0 }),
         json!({ "idle_timeout_secs": 86401 }),
         json!({ "disk": 1 }),
+        json!({ "allowed_hosts": ["*.*.example.com"] }),
+        json!({ "allowed_hosts": "example.com" }),
+        json!({ "allowed_hosts": null }),
     ] {
         let (status, _) = host.request("POST", "/machines", Some(body.clone())).await;
         assert_eq!(status, 422, "{body}");
@@ -302,7 +308,10 @@ async fn an_open_agent_request_keeps_a_machine_from_expiring() {
     let host = Host::start("in-use").await;
     let machine = host
         .create_with(Some(json!({ "idle_timeout_secs": 1 })))
-        .await;
+        .await["id"]
+        .as_str()
+        .expect("machine id")
+        .to_owned();
     let process = host.start_process(&machine, "sleep 600").await;
 
     let mut events = TcpStream::connect(&host.address).await.expect("connect");
@@ -331,5 +340,158 @@ async fn an_open_agent_request_keeps_a_machine_from_expiring() {
     drop(events);
     host.wait_until_gone(&machine, Duration::from_secs(10))
         .await;
+    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+}
+
+fn proxy_status_for(url: &str) -> String {
+    format!("test \"$(curl -sS --noproxy '' -o /dev/null -w '%{{http_connect}}' {url})\" = 403")
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, SLOP_IMAGE_DIR and internet access; run with make vm-test"]
+async fn egress_reaches_only_allowed_public_hosts() {
+    let host = Host::start("egress").await;
+
+    let allowed = host
+        .create_with(Some(json!({ "allowed_hosts": ["Example.com"] })))
+        .await;
+    assert_eq!(allowed["allowed_hosts"], json!(["example.com"]));
+    let allowed = allowed["id"].as_str().expect("machine id");
+    assert_eq!(
+        host.exit_code(allowed, "curl -fsS -o /dev/null https://example.com/")
+            .await,
+        json!(0)
+    );
+    assert_eq!(
+        host.exit_code(allowed, &proxy_status_for("https://example.org/"))
+            .await,
+        json!(0)
+    );
+
+    let offline = host.create_with(Some(json!({ "allowed_hosts": [] }))).await;
+    assert_eq!(offline["allowed_hosts"], json!([]));
+    let offline = offline["id"].as_str().expect("machine id");
+    assert_eq!(
+        host.exit_code(offline, &proxy_status_for("https://example.com/"))
+            .await,
+        json!(0)
+    );
+
+    let unrestricted = host.create_with(None).await;
+    assert_eq!(unrestricted["allowed_hosts"], json!(["*"]));
+    let unrestricted = unrestricted["id"].as_str().expect("machine id");
+    assert_eq!(
+        host.exit_code(unrestricted, &proxy_status_for("https://127.0.0.1/"))
+            .await,
+        json!(0)
+    );
+    assert_eq!(
+        host.exit_code(unrestricted, "curl -fsS -o /dev/null https://example.org/")
+            .await,
+        json!(0)
+    );
+
+    for machine in [allowed, offline, unrestricted] {
+        let (status, _) = host
+            .request("DELETE", &format!("/machines/{machine}"), None)
+            .await;
+        assert_eq!(status, 204);
+    }
+    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+}
+
+const HOLD_TUNNEL_UNTIL_CLOSED: &str = r#"
+import socket, sys
+tunnel = socket.create_connection(("127.0.0.1", 3128))
+tunnel.sendall(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+head = b""
+while b"\r\n\r\n" not in head:
+    head += tunnel.recv(1024)
+if not head.startswith(b"HTTP/1.1 200"):
+    sys.exit(2)
+open("/tmp/tunnel-open", "w").close()
+tunnel.settimeout(30)
+sys.exit(0 if tunnel.recv(1) == b"" else 1)
+"#;
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, SLOP_IMAGE_DIR and internet access; run with make vm-test"]
+async fn allowed_hosts_change_while_a_machine_runs_and_revocation_closes_tunnels() {
+    let host = Host::start("egress-update").await;
+    let machine = host.create_with(Some(json!({ "allowed_hosts": [] }))).await;
+    let machine = machine["id"].as_str().expect("machine id");
+    let path = format!("/machines/{machine}");
+    assert_eq!(
+        host.exit_code(machine, &proxy_status_for("https://example.com/"))
+            .await,
+        json!(0)
+    );
+
+    let (status, info) = host
+        .request(
+            "PATCH",
+            &path,
+            Some(json!({ "allowed_hosts": ["example.com"] })),
+        )
+        .await;
+    assert_eq!(status, 200, "{info}");
+    assert_eq!(info["allowed_hosts"], json!(["example.com"]));
+    assert_eq!(
+        host.exit_code(machine, "curl -fsS -o /dev/null https://example.com/")
+            .await,
+        json!(0)
+    );
+
+    let (status, process) = host
+        .request(
+            "POST",
+            &format!("{path}/processes"),
+            Some(json!({ "program": "python3", "args": ["-c", HOLD_TUNNEL_UNTIL_CLOSED] })),
+        )
+        .await;
+    assert_eq!(status, 201, "{process}");
+    let process = format!("{path}/processes/{}", process["id"].as_str().expect("id"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while host.exit_code(machine, "test -f /tmp/tunnel-open").await != json!(0) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tunnel never opened"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (_, running) = host.request("GET", &process, None).await;
+    assert_eq!(running["status"]["state"], json!("running"), "{running}");
+
+    let (status, info) = host
+        .request("PATCH", &path, Some(json!({ "allowed_hosts": [] })))
+        .await;
+    assert_eq!(status, 200, "{info}");
+    assert_eq!(info["allowed_hosts"], json!([]));
+    let (_, result) = tokio::time::timeout(
+        Duration::from_secs(5),
+        host.request("GET", &format!("{process}/wait"), None),
+    )
+    .await
+    .expect("revoking the host closes its open tunnel");
+    assert_eq!(result["code"], json!(0), "{result}");
+    assert_eq!(
+        host.exit_code(machine, &proxy_status_for("https://example.com/"))
+            .await,
+        json!(0)
+    );
+
+    for (path, body, expected) in [
+        (path.as_str(), json!({ "allowed_hosts": ["*.*"] }), 422),
+        (path.as_str(), json!({}), 422),
+        ("/machines/unknown", json!({ "allowed_hosts": [] }), 404),
+    ] {
+        let (status, response) = host.request("PATCH", path, Some(body.clone())).await;
+        assert_eq!(status, expected, "{body}: {response}");
+    }
+    let (_, info) = host.request("GET", &path, None).await;
+    assert_eq!(info["allowed_hosts"], json!([]));
+
+    let (status, _) = host.request("DELETE", &path, None).await;
+    assert_eq!(status, 204);
     std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
 }

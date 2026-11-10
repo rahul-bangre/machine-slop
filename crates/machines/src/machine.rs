@@ -10,13 +10,16 @@ use std::{
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
+    net::{UnixListener, UnixStream},
     process::{Child, Command},
     sync::{Mutex, OwnedSemaphorePermit, oneshot, watch},
     time::Instant,
 };
 
-use crate::contract::{MachineInfo, MachineState};
+use crate::{
+    contract::{MachineInfo, MachineState},
+    egress::{self, EGRESS_PORT, EgressPolicy},
+};
 
 pub const AGENTD_PORT: u32 = 3000;
 const SCRATCH_BYTES: u64 = 8 << 30;
@@ -82,11 +85,19 @@ impl From<io::Error> for BootError {
     }
 }
 
+pub(crate) struct MachineSpec {
+    pub vcpus: u8,
+    pub memory_mib: u32,
+    pub idle_timeout_secs: u32,
+    pub egress: EgressPolicy,
+}
+
 pub struct Machine {
     id: String,
     dir: PathBuf,
     vcpus: u8,
     memory_mib: u32,
+    egress: watch::Sender<EgressPolicy>,
     boot_ms: u64,
     idle_timeout_secs: u32,
     activity: watch::Sender<Activity>,
@@ -129,29 +140,36 @@ impl Drop for MachineUse {
 }
 
 impl Machine {
-    pub async fn boot(
+    pub(crate) async fn boot(
         id: String,
         dir: PathBuf,
         image: &Image,
-        vcpus: u8,
-        memory_mib: u32,
-        idle_timeout_secs: u32,
+        spec: MachineSpec,
         slot: OwnedSemaphorePermit,
     ) -> Result<Self, BootError> {
+        let MachineSpec {
+            vcpus,
+            memory_mib,
+            idle_timeout_secs,
+            egress,
+        } = spec;
         let started = Instant::now();
-        let child = match launch(&dir, image, vcpus, memory_mib).await {
-            Ok(child) => child,
+        let (child, egress_listener) = match launch(&dir, image, vcpus, memory_mib).await {
+            Ok(launched) => launched,
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(&dir).await;
                 return Err(error.into());
             }
         };
         let (exit, kill) = supervise(child);
+        let (egress, egress_policy) = watch::channel(egress);
+        serve_egress_until_exit(egress_listener, egress_policy, exit.clone());
         let mut machine = Self {
             id,
             dir,
             vcpus,
             memory_mib,
+            egress,
             boot_ms: 0,
             idle_timeout_secs,
             activity: watch::Sender::new(Activity {
@@ -191,6 +209,16 @@ impl Machine {
             memory_mib: self.memory_mib,
             boot_ms: self.boot_ms,
             idle_timeout_secs: self.idle_timeout_secs,
+            allowed_hosts: self.egress.borrow().patterns(),
+        }
+    }
+
+    pub fn set_egress(&self, policy: EgressPolicy) -> MachineInfo {
+        let allowed_hosts = policy.patterns();
+        self.egress.send_replace(policy);
+        MachineInfo {
+            allowed_hosts,
+            ..self.info()
         }
     }
 
@@ -275,8 +303,14 @@ impl Machine {
     }
 }
 
-async fn launch(dir: &Path, image: &Image, vcpus: u8, memory_mib: u32) -> io::Result<Child> {
+async fn launch(
+    dir: &Path,
+    image: &Image,
+    vcpus: u8,
+    memory_mib: u32,
+) -> io::Result<(Child, UnixListener)> {
     tokio::fs::create_dir_all(dir).await?;
+    let egress_listener = UnixListener::bind(dir.join(format!("vsock.sock_{EGRESS_PORT}")))?;
     create_scratch_disk(&dir.join("scratch.ext4")).await?;
     tokio::fs::write(
         dir.join("config.json"),
@@ -287,7 +321,7 @@ async fn launch(dir: &Path, image: &Image, vcpus: u8, memory_mib: u32) -> io::Re
     if let Some(pid) = child.id() {
         tokio::fs::write(dir.join("firecracker.pid"), pid.to_string()).await?;
     }
-    Ok(child)
+    Ok((child, egress_listener))
 }
 
 async fn create_scratch_disk(path: &Path) -> io::Result<()> {
@@ -366,6 +400,19 @@ fn supervise(mut child: Child) -> (watch::Receiver<Option<String>>, oneshot::Sen
         exit_sender.send_replace(Some(message));
     });
     (exit, kill)
+}
+
+fn serve_egress_until_exit(
+    listener: UnixListener,
+    policy: watch::Receiver<EgressPolicy>,
+    mut exit: watch::Receiver<Option<String>>,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            () = egress::serve(listener, policy) => {}
+            _ = exit.wait_for(Option::is_some) => {}
+        }
+    });
 }
 
 pub async fn connect_vsock(path: &Path, port: u32) -> io::Result<UnixStream> {

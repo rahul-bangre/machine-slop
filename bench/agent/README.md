@@ -34,12 +34,14 @@ adapter.
 
 - `machined` asks a running `machined` (`--machined-url`, by default the one
   `make vm-start` forwards to `127.0.0.1:4001`) for a new Firecracker microVM
-  per attempt, and destroys it afterwards. Machines have no network. Its create
-  time is a cold boot until `agentd` answers, plus the requests around it; the
-  boot time `machined` itself reports is recorded separately. The bench needs
-  the host to itself: it refuses to start if machines are already running, and
-  destroys every machine it finds before each create and when the run ends. That
-  is how a machine from a lost create response gets cleaned up.
+  per attempt, and destroys it afterwards. It creates machines with an empty
+  `allowed_hosts`, so they have no network and runs do not depend on outside
+  services. Its create time is a cold boot until `agentd` answers, plus the
+  requests around it; the boot time `machined` itself reports is recorded
+  separately. The bench needs the host to itself: it refuses to start if
+  machines are already running, and destroys every machine it finds before each
+  create and when the run ends. That is how a machine from a lost create
+  response gets cleaned up.
 - `agentd` starts a local `agentd` for each attempt, or uses a running one with
   `--agentd-url`. It has no isolation: commands run as the `agentd` user on its
   host, so use it only for trusted tasks. Its create time is a daemon start or a
