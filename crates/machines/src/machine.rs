@@ -1,8 +1,10 @@
 use std::{
     io,
+    ops::Deref,
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
 use serde_json::json;
@@ -11,6 +13,7 @@ use tokio::{
     net::UnixStream,
     process::{Child, Command},
     sync::{Mutex, OwnedSemaphorePermit, oneshot, watch},
+    time::Instant,
 };
 
 use crate::contract::{MachineInfo, MachineState};
@@ -85,9 +88,44 @@ pub struct Machine {
     vcpus: u8,
     memory_mib: u32,
     boot_ms: u64,
+    idle_timeout_secs: u32,
+    activity: watch::Sender<Activity>,
     exit: watch::Receiver<Option<String>>,
     kill: Mutex<Option<oneshot::Sender<()>>>,
     _slot: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Activity {
+    in_use: usize,
+    idle_since: Instant,
+}
+
+impl Activity {
+    pub(crate) fn idle_deadline(&self, idle_timeout: Duration) -> Option<Instant> {
+        (self.in_use == 0).then(|| self.idle_since + idle_timeout)
+    }
+}
+
+pub struct MachineUse(Arc<Machine>);
+
+impl Deref for MachineUse {
+    type Target = Machine;
+
+    fn deref(&self) -> &Machine {
+        &self.0
+    }
+}
+
+impl Drop for MachineUse {
+    fn drop(&mut self) {
+        self.0.activity.send_modify(|activity| {
+            activity.in_use -= 1;
+            if activity.in_use == 0 {
+                activity.idle_since = Instant::now();
+            }
+        });
+    }
 }
 
 impl Machine {
@@ -97,6 +135,7 @@ impl Machine {
         image: &Image,
         vcpus: u8,
         memory_mib: u32,
+        idle_timeout_secs: u32,
         slot: OwnedSemaphorePermit,
     ) -> Result<Self, BootError> {
         let started = Instant::now();
@@ -114,6 +153,11 @@ impl Machine {
             vcpus,
             memory_mib,
             boot_ms: 0,
+            idle_timeout_secs,
+            activity: watch::Sender::new(Activity {
+                in_use: 0,
+                idle_since: started,
+            }),
             exit,
             kill: Mutex::new(Some(kill)),
             _slot: slot,
@@ -123,6 +167,10 @@ impl Machine {
             return Err(error);
         }
         machine.boot_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        machine.activity.send_replace(Activity {
+            in_use: 0,
+            idle_since: Instant::now(),
+        });
         Ok(machine)
     }
 
@@ -142,7 +190,28 @@ impl Machine {
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
             boot_ms: self.boot_ms,
+            idle_timeout_secs: self.idle_timeout_secs,
         }
+    }
+
+    pub(crate) fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_secs.into())
+    }
+
+    pub(crate) fn activity(&self) -> watch::Receiver<Activity> {
+        self.activity.subscribe()
+    }
+
+    pub(crate) fn is_expired(&self) -> bool {
+        self.activity
+            .borrow()
+            .idle_deadline(self.idle_timeout())
+            .is_some_and(|deadline| deadline <= Instant::now())
+    }
+
+    pub(crate) fn begin_use(self: &Arc<Self>) -> MachineUse {
+        self.activity.send_modify(|activity| activity.in_use += 1);
+        MachineUse(self.clone())
     }
 
     pub async fn connect(&self) -> io::Result<UnixStream> {

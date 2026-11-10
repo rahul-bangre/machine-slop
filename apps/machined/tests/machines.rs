@@ -64,13 +64,17 @@ impl Host {
     }
 
     async fn create(&self) -> String {
-        let (status, info) = self.request("POST", "/machines", None).await;
+        self.create_with(None).await
+    }
+
+    async fn create_with(&self, body: Option<Value>) -> String {
+        let (status, info) = self.request("POST", "/machines", body).await;
         assert_eq!(status, 201, "create machine: {info}");
         assert_eq!(info["state"], json!({ "state": "running" }));
         info["id"].as_str().expect("machine id").to_owned()
     }
 
-    async fn exit_code(&self, machine: &str, script: &str) -> Value {
+    async fn start_process(&self, machine: &str, script: &str) -> String {
         let (status, process) = self
             .request(
                 "POST",
@@ -79,7 +83,29 @@ impl Host {
             )
             .await;
         assert_eq!(status, 201, "start process: {process}");
-        let id = process["id"].as_str().expect("process id");
+        process["id"].as_str().expect("process id").to_owned()
+    }
+
+    async fn wait_until_gone(&self, machine: &str, within: Duration) {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let (status, info) = self
+                .request("GET", &format!("/machines/{machine}"), None)
+                .await;
+            if status == 404 {
+                return;
+            }
+            assert_eq!(status, 200, "machine info: {info}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "machine {machine} still listed after {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn exit_code(&self, machine: &str, script: &str) -> Value {
+        let id = self.start_process(machine, script).await;
         let (status, result) = self
             .request(
                 "GET",
@@ -182,6 +208,8 @@ async fn invalid_requests_are_rejected_without_booting() {
     for body in [
         json!({ "vcpus": 0 }),
         json!({ "memory_mib": 64 }),
+        json!({ "idle_timeout_secs": 0 }),
+        json!({ "idle_timeout_secs": 86401 }),
         json!({ "disk": 1 }),
     ] {
         let (status, _) = host.request("POST", "/machines", Some(body.clone())).await;
@@ -222,5 +250,86 @@ async fn a_create_abandoned_by_its_client_still_produces_a_listed_machine() {
         .request("DELETE", &format!("/machines/{id}"), None)
         .await;
     assert_eq!(status, 204);
+    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn a_machine_unused_for_its_idle_timeout_is_destroyed() {
+    let host = Host::start("idle").await;
+    let requested = tokio::time::Instant::now();
+    let (status, info) = host
+        .request("POST", "/machines", Some(json!({ "idle_timeout_secs": 2 })))
+        .await;
+    assert_eq!(status, 201, "create machine: {info}");
+    assert_eq!(info["idle_timeout_secs"], json!(2));
+    let machine = info["id"].as_str().expect("machine id").to_owned();
+    let pid = host.firecracker_pid(&machine);
+
+    host.wait_until_gone(&machine, Duration::from_secs(10))
+        .await;
+    assert!(
+        requested.elapsed() >= Duration::from_secs(2),
+        "machine destroyed before its idle timeout"
+    );
+    let machine_dir = host.state_dir.join("machines").join(&machine);
+    let destroyed_by = tokio::time::Instant::now() + Duration::from_secs(5);
+    while running(&pid) || machine_dir.exists() {
+        assert!(
+            tokio::time::Instant::now() < destroyed_by,
+            "an expired machine's firecracker exits and its files are removed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (status, _) = host
+        .request("DELETE", &format!("/machines/{machine}"), None)
+        .await;
+    assert_eq!(status, 404);
+
+    let (_, info) = host.request("POST", "/machines", None).await;
+    assert_eq!(info["idle_timeout_secs"], json!(600));
+    let id = info["id"].as_str().expect("machine id");
+    let (status, _) = host
+        .request("DELETE", &format!("/machines/{id}"), None)
+        .await;
+    assert_eq!(status, 204);
+    std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn an_open_agent_request_keeps_a_machine_from_expiring() {
+    let host = Host::start("in-use").await;
+    let machine = host
+        .create_with(Some(json!({ "idle_timeout_secs": 1 })))
+        .await;
+    let process = host.start_process(&machine, "sleep 600").await;
+
+    let mut events = TcpStream::connect(&host.address).await.expect("connect");
+    events
+        .write_all(
+            format!(
+                "GET /machines/{machine}/processes/{process}/events HTTP/1.1\r\nHost: machined\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write");
+    let mut head = [0; 12];
+    events.read_exact(&mut head).await.expect("read status");
+    assert_eq!(&head, b"HTTP/1.1 200");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (status, info) = host
+        .request("GET", &format!("/machines/{machine}"), None)
+        .await;
+    assert_eq!(
+        status, 200,
+        "machine expired while a request was open: {info}"
+    );
+
+    drop(events);
+    host.wait_until_gone(&machine, Duration::from_secs(10))
+        .await;
     std::fs::remove_dir_all(&host.state_dir).expect("remove state dir");
 }

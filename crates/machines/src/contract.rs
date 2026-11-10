@@ -10,6 +10,9 @@ pub struct CreateMachine {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub memory_mib: Option<u32>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub idle_timeout_secs: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]
@@ -27,4 +30,5 @@ pub struct MachineInfo {
     pub memory_mib: u32,
     #[ts(type = "number")]
     pub boot_ms: u64,
+    pub idle_timeout_secs: u32,
 }

@@ -1,5 +1,5 @@
-export type CreateMachine = { vcpus?: number | null, memory_mib?: number | null, };
+export type CreateMachine = { vcpus?: number | null, memory_mib?: number | null, idle_timeout_secs?: number | null, };
 
 export type MachineState = { "state": "running" } | { "state": "exited", message: string, };
 
-export type MachineInfo = { id: string, state: MachineState, vcpus: number, memory_mib: number, boot_ms: number, };
+export type MachineInfo = { id: string, state: MachineState, vcpus: number, memory_mib: number, boot_ms: number, idle_timeout_secs: number, };
