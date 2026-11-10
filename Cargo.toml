@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/agentd", "apps/machined", "crates/machines", "crates/process"]
+members = ["apps/agentd", "apps/controld", "apps/machined", "crates/machines", "crates/process"]
 resolver = "3"
 
 [workspace.package]

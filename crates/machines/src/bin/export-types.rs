@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use slop_machines::{
-    CreateMachine, CreatePreview, CreateSnapshot, EgressCredential, MachineInfo, MachineState,
-    PreviewInfo, Quotas, SnapshotInfo, TenantUsage, UpdateMachine,
+    CreateMachine, CreatePreview, CreateSnapshot, EgressCredential, HostInfo, MachineInfo,
+    MachineState, PreviewInfo, Quotas, Room, SnapshotInfo, TenantUsage, UpdateMachine,
 };
 use ts_rs::TS;
 
@@ -20,6 +20,8 @@ fn main() -> std::io::Result<()> {
         PreviewInfo::decl(&config),
         Quotas::decl(&config),
         TenantUsage::decl(&config),
+        Room::decl(&config),
+        HostInfo::decl(&config),
     ];
     let output = format!(
         "{}\n",

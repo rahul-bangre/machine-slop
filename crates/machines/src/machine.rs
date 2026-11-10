@@ -24,6 +24,7 @@ use crate::{
     firecracker::{FIRECRACKER, Jail, Launch, ROOTFS, SAVED_STATE, SCRATCH, Vm},
     gateway::Gateway,
     machines::{Admission, MachineError, lock},
+    store::StoredAs,
     tenants::{Held, Idempotency, Storage, Tenant, TenantCharge, Tenants},
 };
 
@@ -37,6 +38,13 @@ const CHECKPOINT: &str = "checkpoint";
 const CHECKPOINT_STAGING: &str = "checkpoint.tmp";
 const CHECKPOINT_WITHDRAWN: &str = "checkpoint.withdrawn";
 const CHECKPOINT_RETIRED: &str = "checkpoint.retired";
+pub(crate) const SAVED_FILES: [(&str, StoredAs); 5] = [
+    (FIRECRACKER, StoredAs::ContentAddressed),
+    (ROOTFS, StoredAs::ContentAddressed),
+    (SAVED_STATE[0], StoredAs::PerSnapshot),
+    (SAVED_STATE[1], StoredAs::PerSnapshot),
+    (SCRATCH, StoredAs::PerSnapshot),
+];
 
 #[derive(Clone, Debug)]
 pub struct Image {
@@ -68,6 +76,10 @@ impl Image {
 
     pub(crate) fn jailer(&self) -> PathBuf {
         self.jailer.clone()
+    }
+
+    pub(crate) fn saved_with(&self) -> [&Path; 2] {
+        [&self.firecracker, &self.rootfs]
     }
 }
 
@@ -286,7 +298,7 @@ impl Booted {
             }
             return Err(error.into());
         }
-        self.vm.start_metering();
+        self.vm.start_metering(&machine.id);
         Ok(machine)
     }
 
@@ -302,7 +314,7 @@ pub(crate) struct Ownership {
     pub disk: Held,
 }
 
-pub(crate) fn provisioned_disk_mib(memory_mib: u32) -> u64 {
+pub fn provisioned_disk_mib(memory_mib: u32) -> u64 {
     (SCRATCH_BYTES >> 20) + u64::from(memory_mib)
 }
 
@@ -691,7 +703,7 @@ impl Exclusive<'_> {
         };
         match ready.await {
             Ok(()) => {
-                vm.start_metering();
+                vm.start_metering(&self.id);
                 self.set(Phase::Running(vm));
                 Ok(())
             }

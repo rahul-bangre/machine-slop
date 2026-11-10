@@ -1,6 +1,9 @@
 use std::{path::PathBuf, sync::Arc};
 
-use slop_machines::{Limits, Machines, Network, PreviewOrigin, default_memory_budget_mib};
+use machined::{Access, ControlKey};
+use slop_machines::{
+    Limits, Machines, Network, PreviewOrigin, Store, Tenancy, cpu_pool, default_memory_budget_mib,
+};
 use tokio::net::TcpListener;
 
 const MAX_RUNNING_VMS: usize = 16;
@@ -17,18 +20,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
     let mut args = std::env::args().skip(1);
-    let (Some(address), Some(image_dir), Some(state_dir), Some(tenants_file), None) = (
+    let (Some(address), Some(image_dir), Some(state_dir), tenants_file, None) = (
         args.next(),
         args.next(),
         args.next(),
         args.next(),
         args.next(),
     ) else {
-        return Err(
-            "usage: machined <listen address> <image dir> <state dir> <tenants file>".into(),
-        );
+        return Err("usage: machined <listen address> <image dir> <state dir> <tenants file>, or without the tenants file as a fleet host".into());
     };
-    let (tenants, keys) = machined::parse_tenants(&std::fs::read_to_string(&tenants_file)?)?;
+    let fleet = (
+        env_text("SLOP_STORE")?,
+        env_text("SLOP_CONTROL_URL")?,
+        env_text("SLOP_ADVERTISE_URL")?,
+        env_text("SLOP_CONTROL_KEY_FILE")?,
+    );
+    let (tenancy, access, reporting) = match (tenants_file, fleet) {
+        (Some(tenants_file), (None, None, None, None)) => {
+            let (tenants, keys) =
+                machined::parse_tenants(&std::fs::read_to_string(&tenants_file)?)?;
+            tracing::info!(tenants = tenants.len(), "tenants configured");
+            (Tenancy::Local(tenants), Access::TenantKeys(keys), None)
+        }
+        (None, (Some(store), Some(control), Some(advertised), Some(key_file))) => {
+            let store = Arc::new(Store::open(&store)?);
+            let control_key = std::fs::read_to_string(&key_file)?.trim().to_owned();
+            let pool = cpu_pool()?;
+            tracing::info!(%pool, store = store.url(), %control, %advertised, "fleet host");
+            (
+                Tenancy::Fleet { pool, store },
+                Access::ControlPlane(ControlKey::new(&control_key)),
+                Some((control, advertised, control_key)),
+            )
+        }
+        (None, _) => {
+            return Err("a fleet host needs SLOP_STORE, SLOP_CONTROL_URL, SLOP_ADVERTISE_URL and SLOP_CONTROL_KEY_FILE".into());
+        }
+        (Some(_), _) => {
+            return Err("a standalone machined takes a tenants file and none of SLOP_STORE, SLOP_CONTROL_URL, SLOP_ADVERTISE_URL or SLOP_CONTROL_KEY_FILE".into());
+        }
+    };
     let default_budget = default_memory_budget_mib()?;
     let limits = Limits {
         running_vms: MAX_RUNNING_VMS,
@@ -44,7 +75,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         first_jail_uid = limits.first_jail_uid,
         "admission limits"
     );
-    tracing::info!(tenants = tenants.len(), "tenants configured");
     let (previews, preview_listener) = match (
         env_text("SLOP_PREVIEW_URL")?,
         env_text("SLOP_PREVIEW_LISTEN")?,
@@ -75,15 +105,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(image_dir),
         PathBuf::from(state_dir),
         limits,
-        tenants,
+        tenancy,
         network,
     )
     .await?;
     let listener = TcpListener::bind(&address).await?;
     let app = machined::app(Arc::new(machined::Host {
         machines: machines.clone(),
-        keys,
+        access,
     }));
+    if let Some((control, advertised, control_key)) = reporting {
+        tokio::spawn(machined::report_to_control_plane(
+            machines.clone(),
+            control,
+            advertised,
+            control_key,
+        ));
+    }
     if let Some(preview_listener) = preview_listener {
         tracing::info!(address = %format!("http://{}", preview_listener.local_addr()?), "previews listening");
         tokio::spawn(machined::serve_previews(preview_listener, machines.clone()));

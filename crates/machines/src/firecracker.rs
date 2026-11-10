@@ -251,9 +251,9 @@ impl Vm {
         })
     }
 
-    pub(crate) fn start_metering(&self) {
+    pub(crate) fn start_metering(&self, machine_id: &str) {
         if let Some(admission) = &mut *lock(&self.admission) {
-            admission.start_metering();
+            admission.start_metering(machine_id);
         }
     }
 

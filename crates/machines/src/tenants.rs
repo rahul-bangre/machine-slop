@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    contract::{Quotas, TenantUsage},
+    contract::{ExecutionUsage, Quotas, TenantUsage},
     files,
     machines::MachineError,
 };
@@ -49,6 +49,10 @@ pub(crate) struct Idempotency {
 impl Idempotency {
     pub(crate) fn of(key: Option<IdempotencyKey>, request: String) -> Option<Self> {
         key.map(|IdempotencyKey(key)| Self { key, request })
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
     }
 
     pub(crate) fn replays(recorded: Option<&Self>, attempt: &Self) -> Result<bool, MachineError> {
@@ -152,16 +156,46 @@ struct Bucket {
     refilled: Instant,
 }
 
+#[derive(Clone)]
+struct Execution {
+    id: String,
+    machine_id: String,
+}
+
 #[derive(Default)]
 struct Meter {
     closed: Usage,
-    open: HashMap<u64, (u64, Rate)>,
+    open: HashMap<u64, (u64, Rate, Option<Execution>)>,
+    ended: HashMap<String, ExecutionUsage>,
     next: u64,
+}
+
+impl Meter {
+    fn execution_usage(
+        &self,
+        tenant: &str,
+        execution: &Execution,
+        rate: Rate,
+        elapsed_ms: u64,
+        ended: bool,
+    ) -> ExecutionUsage {
+        let mut usage = Usage::default();
+        usage.accrue(rate, elapsed_ms);
+        ExecutionUsage {
+            id: execution.id.clone(),
+            tenant: tenant.to_owned(),
+            machine_id: execution.machine_id.clone(),
+            vcpu_ms: usage.vcpu_ms,
+            memory_mib_ms: usage.memory_mib_ms,
+            ended,
+        }
+    }
 }
 
 pub struct Tenant {
     id: String,
     quotas: Quotas,
+    tracks_executions: bool,
     running_machines: Arc<Allowance>,
     memory_mib: Arc<Allowance>,
     disk_mib: Arc<Allowance>,
@@ -180,8 +214,14 @@ impl Drop for Metered {
     fn drop(&mut self) {
         let now = unix_ms();
         let mut meter = lock(&self.tenant.meter);
-        if let Some((since, rate)) = meter.open.remove(&self.span) {
-            meter.closed.accrue(rate, now.saturating_sub(since));
+        if let Some((since, rate, execution)) = meter.open.remove(&self.span) {
+            let elapsed_ms = now.saturating_sub(since);
+            meter.closed.accrue(rate, elapsed_ms);
+            if let Some(execution) = execution {
+                let ended =
+                    meter.execution_usage(&self.tenant.id, &execution, rate, elapsed_ms, true);
+                meter.ended.insert(execution.id, ended);
+            }
         }
     }
 }
@@ -195,9 +235,13 @@ pub(crate) struct TenantCharge {
 }
 
 impl TenantCharge {
-    pub(crate) fn start_metering(&mut self) {
+    pub(crate) fn start_metering(&mut self, machine_id: &str) {
         if self.metered.is_none() {
-            self.metered = Some(self.tenant.meter(self.rate, unix_ms()));
+            let execution = self.tenant.tracks_executions.then(|| Execution {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                machine_id: machine_id.to_owned(),
+            });
+            self.metered = Some(self.tenant.metered(self.rate, unix_ms(), execution));
         }
     }
 }
@@ -209,7 +253,18 @@ pub(crate) struct Storage {
 
 impl Tenant {
     fn new(id: String, quotas: Quotas, recorded: Usage, as_of: u64) -> Arc<Self> {
+        Self::with_executions(id, quotas, recorded, as_of, false)
+    }
+
+    fn with_executions(
+        id: String,
+        quotas: Quotas,
+        recorded: Usage,
+        as_of: u64,
+        tracks_executions: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            tracks_executions,
             running_machines: Allowance::new("running machines", quotas.running_machines.into()),
             memory_mib: Allowance::new("running memory MiB", quotas.memory_mib.into()),
             disk_mib: Allowance::new("disk MiB", u64::from(quotas.disk_gib) << 10),
@@ -269,10 +324,19 @@ impl Tenant {
     }
 
     fn meter(self: &Arc<Self>, rate: Rate, since_unix_ms: u64) -> Metered {
+        self.metered(rate, since_unix_ms, None)
+    }
+
+    fn metered(
+        self: &Arc<Self>,
+        rate: Rate,
+        since_unix_ms: u64,
+        execution: Option<Execution>,
+    ) -> Metered {
         let mut meter = lock(&self.meter);
         let span = meter.next;
         meter.next += 1;
-        meter.open.insert(span, (since_unix_ms, rate));
+        meter.open.insert(span, (since_unix_ms, rate, execution));
         Metered {
             tenant: self.clone(),
             span,
@@ -323,10 +387,25 @@ impl Tenant {
     fn usage_at(&self, now: u64) -> Usage {
         let meter = lock(&self.meter);
         let mut usage = meter.closed;
-        for (since, rate) in meter.open.values() {
+        for (since, rate, _) in meter.open.values() {
             usage.accrue(*rate, now.saturating_sub(*since));
         }
         usage
+    }
+
+    fn executions_at(&self, now: u64) -> Vec<ExecutionUsage> {
+        let meter = lock(&self.meter);
+        let open = meter.open.values().filter_map(|(since, rate, execution)| {
+            let execution = execution.as_ref()?;
+            Some(meter.execution_usage(
+                &self.id,
+                execution,
+                *rate,
+                now.saturating_sub(*since),
+                false,
+            ))
+        });
+        meter.ended.values().cloned().chain(open).collect()
     }
 
     pub fn usage(&self) -> TenantUsage {
@@ -350,17 +429,31 @@ fn creates_burst(quotas: &Quotas) -> f64 {
 struct Ledger {
     as_of_unix_ms: u64,
     tenants: BTreeMap<String, Usage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    executions: Vec<ExecutionUsage>,
 }
 
 pub(crate) struct Tenants {
     state_dir: PathBuf,
+    enforced_here: bool,
     recorded_as_of: u64,
+    recorded_executions: Mutex<Vec<ExecutionUsage>>,
     by_id: Mutex<HashMap<String, Arc<Tenant>>>,
     flushing: tokio::sync::Mutex<()>,
 }
 
 impl Tenants {
     pub(crate) async fn open(state_dir: &Path, configs: Vec<TenantConfig>) -> io::Result<Self> {
+        Self::open_with(state_dir, Some(configs)).await
+    }
+
+    pub(crate) async fn open_for_fleet(state_dir: &Path) -> io::Result<Self> {
+        Self::open_with(state_dir, None).await
+    }
+
+    async fn open_with(state_dir: &Path, configs: Option<Vec<TenantConfig>>) -> io::Result<Self> {
+        let enforced_here = configs.is_some();
+        let configs = configs.unwrap_or_default();
         let ledger: Ledger = match files::read_record(state_dir, LEDGER).await {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ledger::default(),
             ledger => ledger?,
@@ -376,11 +469,23 @@ impl Tenants {
         }
         for (id, recorded) in &ledger.tenants {
             by_id.entry(id.clone()).or_insert_with(|| {
-                Tenant::new(id.clone(), Quotas::none(), *recorded, ledger.as_of_unix_ms)
+                Self::unconfigured(enforced_here, id, *recorded, ledger.as_of_unix_ms)
             });
+        }
+        let mut ended = ledger.executions;
+        for execution in &mut ended {
+            execution.ended = true;
+            let tenant = by_id.entry(execution.tenant.clone()).or_insert_with(|| {
+                Self::unconfigured(enforced_here, &execution.tenant, Usage::default(), 0)
+            });
+            lock(&tenant.meter)
+                .ended
+                .insert(execution.id.clone(), execution.clone());
         }
         Ok(Self {
             state_dir: state_dir.to_owned(),
+            enforced_here,
+            recorded_executions: Mutex::new(ended),
             recorded_as_of: ledger.as_of_unix_ms,
             by_id: Mutex::new(by_id),
             flushing: tokio::sync::Mutex::new(()),
@@ -395,10 +500,49 @@ impl Tenants {
         lock(&self.by_id)
             .entry(id.to_owned())
             .or_insert_with(|| {
-                tracing::warn!(tenant = %id, "state belongs to a tenant that is not configured");
-                Tenant::new(id.to_owned(), Quotas::none(), Usage::default(), 0)
+                if self.enforced_here {
+                    tracing::warn!(tenant = %id, "state belongs to a tenant that is not configured");
+                }
+                Self::unconfigured(self.enforced_here, id, Usage::default(), 0)
             })
             .clone()
+    }
+
+    fn unconfigured(enforced_here: bool, id: &str, recorded: Usage, as_of: u64) -> Arc<Tenant> {
+        if enforced_here {
+            Tenant::new(id.to_owned(), Quotas::none(), recorded, as_of)
+        } else {
+            Tenant::with_executions(id.to_owned(), Quotas::unenforced(), recorded, as_of, true)
+        }
+    }
+
+    pub(crate) fn recorded_executions(&self) -> Vec<ExecutionUsage> {
+        lock(&self.recorded_executions).clone()
+    }
+
+    pub(crate) async fn forget_executions(&self, ids: &[String]) -> io::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let _one_flush_at_a_time = self.flushing.lock().await;
+        let mut forgotten = Vec::new();
+        for tenant in lock(&self.by_id).values() {
+            let mut meter = lock(&tenant.meter);
+            for id in ids {
+                if let Some(execution) = meter.ended.remove(id) {
+                    forgotten.push((tenant.clone(), execution));
+                }
+            }
+        }
+        let flushed = self.flush_now().await;
+        if flushed.is_err() {
+            for (tenant, execution) in forgotten {
+                lock(&tenant.meter)
+                    .ended
+                    .insert(execution.id.clone(), execution);
+            }
+        }
+        flushed
     }
 
     pub(crate) fn recorded_as_of(&self) -> u64 {
@@ -407,11 +551,19 @@ impl Tenants {
 
     pub(crate) async fn flush(&self) -> io::Result<()> {
         let _one_flush_at_a_time = self.flushing.lock().await;
+        self.flush_now().await
+    }
+
+    async fn flush_now(&self) -> io::Result<()> {
         let now = unix_ms();
         let tenants: Vec<_> = lock(&self.by_id).values().cloned().collect();
         let usages: Vec<_> = tenants
             .iter()
             .map(|tenant| (tenant.clone(), tenant.usage_at(now)))
+            .collect();
+        let executions: Vec<_> = tenants
+            .iter()
+            .flat_map(|tenant| tenant.executions_at(now))
             .collect();
         let ledger = Ledger {
             as_of_unix_ms: now,
@@ -419,8 +571,10 @@ impl Tenants {
                 .iter()
                 .map(|(tenant, usage)| (tenant.id.clone(), *usage))
                 .collect(),
+            executions,
         };
         files::replace_record(&self.state_dir, LEDGER, &ledger).await?;
+        *lock(&self.recorded_executions) = ledger.executions;
         for (tenant, usage) in usages {
             *lock(&tenant.reported) = (usage, now);
         }
@@ -473,8 +627,8 @@ mod tests {
         let tenant = Tenant::new("t".into(), quotas(1), Usage::default(), 0);
         let mut charge = tenant.charge(2, 512).expect("charge");
         assert!(lock(&tenant.meter).open.is_empty());
-        charge.start_metering();
-        charge.start_metering();
+        charge.start_metering("m");
+        charge.start_metering("m");
         assert_eq!(lock(&tenant.meter).open.len(), 1);
         drop(charge);
         assert!(lock(&tenant.meter).open.is_empty());
