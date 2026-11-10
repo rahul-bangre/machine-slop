@@ -3,14 +3,14 @@ import { parseArgs } from "node:util";
 import { armOrder } from "../../common/schedule.ts";
 import { wholeNumber } from "../../common/stats.ts";
 import type { Limits } from "./agent.ts";
-import { agentdProvider, machinedProvider } from "./agentd_sandbox.ts";
+import { agentdProvider, machinedProvider } from "./agentd-sandbox.ts";
 import { type AttemptRecord, runAttempt } from "./attempt.ts";
-import { e2bProvider } from "./e2b_sandbox.ts";
-import { claudeCliModel } from "./claude_cli_model.ts";
-import { claudeModel, default_claude_model } from "./claude_model.ts";
+import { e2bProvider } from "./e2b-sandbox.ts";
+import { claudeCliModel } from "./claude-cli-model.ts";
+import { claudeModel, default_claude_model } from "./claude-model.ts";
 import type { Model } from "./model.ts";
-import { openaiModel } from "./openai_model.ts";
-import type { SandboxProvider } from "./sandbox.ts";
+import { openaiModel } from "./openai-model.ts";
+import { ProviderNotReady, type SandboxProvider } from "./sandbox.ts";
 import { renderSummary } from "./summary.ts";
 import { loadTasks } from "./tasks.ts";
 
@@ -51,12 +51,7 @@ function provider(name: string): SandboxProvider {
         );
     }
     if (name === "machined") return machinedProvider(flags["machined-url"]);
-    if (name === "e2b") {
-        if (!Deno.env.get("E2B_API_KEY")) {
-            fail("the e2b sandbox needs E2B_API_KEY");
-        }
-        return e2bProvider(flags["e2b-template"]);
-    }
+    if (name === "e2b") return e2bProvider(flags["e2b-template"]);
     fail(`unknown sandbox "${name}"; choose agentd, machined or e2b`);
 }
 
@@ -108,6 +103,24 @@ const tasks = flags.tasks
     )
     : all_tasks;
 const model = pinnedModel(flags.model);
+
+for (const sandbox of providers) {
+    try {
+        await sandbox.prepare();
+    } catch (error) {
+        if (error instanceof ProviderNotReady) fail(error.message);
+        throw error;
+    }
+}
+
+async function reclaimSandboxes(): Promise<void> {
+    await Promise.allSettled(providers.map((sandbox) => sandbox.reclaim()));
+}
+
+Deno.addSignalListener("SIGINT", () => {
+    console.error("interrupted; releasing sandboxes");
+    reclaimSandboxes().finally(() => Deno.exit(130));
+});
 
 const started_at = new Date();
 const output_directory = flags.out ??
@@ -179,6 +192,7 @@ try {
     }
 } finally {
     attempt_log.close();
+    await reclaimSandboxes();
 }
 
 const summary = `# Agent bench ${started_at.toISOString()}\n\n` +

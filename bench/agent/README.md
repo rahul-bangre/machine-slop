@@ -35,7 +35,11 @@ adapter.
 - `machined` asks a running `machined` (`--machined-url`, by default the one
   `make vm-start` forwards to `127.0.0.1:4001`) for a new Firecracker microVM
   per attempt, and destroys it afterwards. Machines have no network. Its create
-  time is a cold boot until `agentd` answers.
+  time is a cold boot until `agentd` answers, plus the requests around it; the
+  boot time `machined` itself reports is recorded separately. The bench needs
+  the host to itself: it refuses to start if machines are already running, and
+  destroys every machine it finds before each create and when the run ends. That
+  is how a machine from a lost create response gets cleaned up.
 - `agentd` starts a local `agentd` for each attempt, or uses a running one with
   `--agentd-url`. It has no isolation: commands run as the `agentd` user on its
   host, so use it only for trusted tasks. Its create time is a daemon start or a
@@ -99,8 +103,13 @@ time, and total wall time.
   limited after the client's retries
 - `sandbox`: the sandbox could not be created, written to, run or closed
 
-Missing or rejected credentials and malformed requests stop the run instead of
-counting as failures.
+Missing or rejected credentials, malformed requests and a sandbox provider that
+is not ready stop the run instead of counting as failures.
+
+A command that passes its timeout is killed. If it still has not stopped a few
+seconds later, the attempt fails as a `sandbox` failure instead of waiting.
+
+Sandboxes are released when the run ends and when it is interrupted with Ctrl-C.
 
 Sandboxes run interleaved per task, and their order rotates every round and
 every task.
