@@ -46,9 +46,10 @@ file, and an upload that fails or is cut off leaves the previous file and no
 staging file. Repeating an upload is safe. `?mode=755` sets permission bits;
 without it a replaced file keeps its bits and a new file gets `644`. The file is
 visible to later requests and processes on the machine; it is not synced to
-disk. A symlink at the path is written through to its target. Replacing a file
-gives the path a new inode: a hard link to the old file keeps the old contents,
-and owner and extended attributes are not carried over.
+disk. A symlink at the path is written through to its target; a dangling symlink
+is replaced by the file. Replacing a file gives the path a new inode: a hard
+link to the old file keeps the old contents, and owner and extended attributes
+are not carried over.
 
 `DELETE` returns 204 once nothing is at the path, including when nothing was
 there. It removes a symlink, not its target.
@@ -77,7 +78,10 @@ never waits for a writer), full disk 507.
 `GET /ports/{port}` with `Connection: upgrade` and `Upgrade: tcp` connects to
 the port on the machine's loopback, `127.0.0.1` then `::1`, and answers 101 only
 once that connection is open. The HTTP connection then carries raw bytes both
-ways, including a half-close, until either side closes. A port with no listener
+ways. When either side ends its stream, the tunnel ends: bytes the port sent
+before closing reach the client first, and a client that closes, or only
+half-closes, its sending side closes the port's connection. Firecracker's vsock
+cannot carry a half-close, so no hop relies on one. A port with no listener
 returns 502, and a request without the upgrade headers 426. `machined` passes
 the upgrade through, so this works for hosted machines too.
 

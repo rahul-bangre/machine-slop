@@ -44,7 +44,8 @@ with HTTP 422 and `closeStdin` with HTTP 409; send `\x04` for end of input in
 canonical mode. `resize(size)` returns once the kernel has the new size, which
 also signals `SIGWINCH` to the terminal's foreground group; `info().terminal`
 reports the current size, and resizing a finished or non-terminal process
-returns HTTP 409.
+returns HTTP 409. Starts are serialized, so a terminal opened for one process is
+never inherited by another being spawned at the same moment.
 
 Each process runs in its own process group. `kill()` sends SIGKILL to the group,
 and when the program exits, anything still running in its group is killed. A

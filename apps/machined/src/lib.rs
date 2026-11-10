@@ -11,6 +11,7 @@ use axum::{
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use slop_machines::{CreateMachine, Machine, MachineError, MachineInfo, Machines, UpdateMachine};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 pub fn app(machines: Arc<Machines>) -> Router {
     Router::new()
@@ -101,15 +102,26 @@ async fn proxy(
         tokio::spawn(async move {
             let _machine_in_use_until_the_tunnel_ends = machine;
             if let (Ok(client), Ok(agentd)) = tokio::join!(client_upgrade, agentd_upgrade) {
-                let _ = tokio::io::copy_bidirectional(
-                    &mut TokioIo::new(client),
-                    &mut TokioIo::new(agentd),
-                )
-                .await;
+                relay_until_either_side_ends(TokioIo::new(client), TokioIo::new(agentd)).await;
             }
         });
     }
     Ok(response.map(Body::new))
+}
+
+async fn relay_until_either_side_ends(
+    client: impl AsyncRead + AsyncWrite + Unpin,
+    agentd: impl AsyncRead + AsyncWrite + Unpin,
+) {
+    let (mut from_client, mut to_client) = tokio::io::split(client);
+    let (mut from_agentd, mut to_agentd) = tokio::io::split(agentd);
+    tokio::select! {
+        _ = tokio::io::copy(&mut from_client, &mut to_agentd) => {}
+        _ = async {
+            let _ = tokio::io::copy(&mut from_agentd, &mut to_client).await;
+            let _ = to_client.shutdown().await;
+        } => {}
+    }
 }
 
 fn agentd_uri(uri: &Uri, id: &str) -> Result<Uri, ApiError> {

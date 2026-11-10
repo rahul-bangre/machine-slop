@@ -7,7 +7,10 @@ use axum::{
     response::Response,
 };
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
+};
 
 use crate::error::ApiError;
 
@@ -28,7 +31,7 @@ pub async fn tunnel(Path(port): Path<u16>, mut request: Request) -> Result<Respo
             "port must be between 1 and 65535".into(),
         ));
     }
-    let mut target = TcpStream::connect(&loopback(port)[..])
+    let target = TcpStream::connect(&loopback(port)[..])
         .await
         .map_err(|error| {
             ApiError(
@@ -39,7 +42,7 @@ pub async fn tunnel(Path(port): Path<u16>, mut request: Request) -> Result<Respo
     let upgrade = hyper::upgrade::on(&mut request);
     tokio::spawn(async move {
         if let Ok(upgraded) = upgrade.await {
-            let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(upgraded), &mut target).await;
+            relay_until_either_side_ends(TokioIo::new(upgraded), target).await;
         }
     });
     Ok(Response::builder()
@@ -48,6 +51,21 @@ pub async fn tunnel(Path(port): Path<u16>, mut request: Request) -> Result<Respo
         .header(header::UPGRADE, PROTOCOL)
         .body(Body::empty())
         .expect("static response is valid"))
+}
+
+async fn relay_until_either_side_ends(
+    client: impl AsyncRead + AsyncWrite + Unpin,
+    mut target: TcpStream,
+) {
+    let (mut from_client, mut to_client) = tokio::io::split(client);
+    let (mut from_target, mut to_target) = target.split();
+    tokio::select! {
+        _ = tokio::io::copy(&mut from_client, &mut to_target) => {}
+        _ = async {
+            let _ = tokio::io::copy(&mut from_target, &mut to_client).await;
+            let _ = to_client.shutdown().await;
+        } => {}
+    }
 }
 
 fn loopback(port: u16) -> [SocketAddr; 2] {

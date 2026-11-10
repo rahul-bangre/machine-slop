@@ -589,9 +589,9 @@ async fn files_and_ports_reach_the_machine_through_the_host() {
         .await
         .expect("write through tunnel");
     let mut response = Vec::new();
-    tunnel
-        .read_to_end(&mut response)
+    tokio::time::timeout(Duration::from_secs(20), tunnel.read_to_end(&mut response))
         .await
+        .expect("the tunnel ends once the web server closes its connection")
         .expect("read through tunnel");
     assert!(response.starts_with(b"HTTP/1.0 200 "));
     assert_eq!(body_of(&response), content);

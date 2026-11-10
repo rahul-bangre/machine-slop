@@ -24,34 +24,59 @@ function unusedPort(): number {
     return listener.addr.port;
 }
 
-Deno.test("a tunnel carries bytes both ways and delivers a half-close", () =>
+async function readUntilEnd(
+    conn: Deno.Conn,
+    limit = Infinity,
+): Promise<string> {
+    const decoder = new TextDecoder();
+    const buffer = new Uint8Array(1024);
+    let text = "";
+    let count;
+    while (text.length < limit && (count = await conn.read(buffer)) !== null) {
+        text += decoder.decode(buffer.subarray(0, count), { stream: true });
+    }
+    return text;
+}
+
+Deno.test("a tunnel carries bytes both ways and ends when the port closes", () =>
     withMachine(async (machine) => {
         const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
-        const echoed = (async () => {
+        const served = (async () => {
             const conn = await listener.accept();
-            const received = new Uint8Array(
-                await new Response(
-                    ReadableStream.from(
-                        (async function* () {
-                            const buffer = new Uint8Array(1024);
-                            let count;
-                            while ((count = await conn.read(buffer)) !== null) {
-                                yield buffer.slice(0, count);
-                            }
-                        })(),
-                    ),
-                ).arrayBuffer(),
+            const request = await readUntilEnd(conn, 3);
+            await conn.write(
+                new TextEncoder().encode([...request].reverse().join("")),
             );
-            await conn.write(received.reverse());
             conn.close();
         })();
         try {
             const tunnel = await machine.connect(listener.addr.port);
             const writer = tunnel.writable.getWriter();
             await writer.write(new TextEncoder().encode("abc"));
-            await writer.close();
             assert.equal(await new Response(tunnel.readable).text(), "cba");
-            await echoed;
+            await served;
+            tunnel.close();
+        } finally {
+            listener.close();
+        }
+    }));
+
+Deno.test("closing the client side of a tunnel ends the port's connection", () =>
+    withMachine(async (machine) => {
+        const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+        const received = (async () => {
+            const conn = await listener.accept();
+            const text = await readUntilEnd(conn);
+            conn.close();
+            return text;
+        })();
+        try {
+            const tunnel = await machine.connect(listener.addr.port);
+            const writer = tunnel.writable.getWriter();
+            await writer.write(new TextEncoder().encode("sent"));
+            await writer.close();
+            assert.equal(await received, "sent");
+            await tunnel.readable.cancel();
         } finally {
             listener.close();
         }
