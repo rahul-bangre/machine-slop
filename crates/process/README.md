@@ -20,13 +20,15 @@ Arguments pass directly; `env` overrides the daemon's environment. Optional
 `stdin` is initial UTF-8 input, after which stdin closes unless
 `keep_stdin_open` is true.
 
-`writeStdin(offset, data)` appends bytes and returns the next offset;
-`closeStdin(offset)` ends input. The offset counts bytes already written, so a
-retried write with the same offset and bytes is written once, and an offset
-ahead of the stream returns HTTP 409. A write returns once its bytes are in the
-stdin pipe, not when the program reads them. Writes after stdin closes return
-409. `info()` reports `stdin_offset` and `stdin_open` for resuming. Output data
-is base64.
+`writeStdin(offset, data)` appends at most 64 KiB and returns the next offset;
+`closeStdin(offset)` ends input. The offset counts bytes already written. A
+retried request covering bytes already written succeeds without writing them
+again, including after stdin closes, and an offset ahead of the stream returns
+HTTP 409. A write returns once its bytes are in the stdin pipe, not when the
+program reads them. New bytes after stdin closes return 409. An offset
+identifies bytes without comparing them, so each process has one stdin writer; a
+writer that reconnects resumes from `info().stdin_offset`. Output data is
+base64.
 
 Reconnect with `machine.process(id)` and `events(last_seq + 1)`. Disconnecting
 leaves execution running. State lasts until daemon restart or record eviction.

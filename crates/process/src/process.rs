@@ -157,9 +157,14 @@ struct StdinWrite {
 }
 
 impl StdinWrite {
+    fn end(&self) -> u64 {
+        self.offset + self.data.len() as u64
+    }
+
     fn admit(self, open: bool, offset: u64) -> Option<Self> {
         if !open {
-            self.reply(Err(ProcessError::StdinClosed { offset }));
+            let outcome = outcome_after_stdin_closed(self.end(), offset);
+            self.reply(outcome);
             return None;
         }
         if self.offset > offset {
@@ -251,13 +256,12 @@ impl Process {
             close,
             reply: Some(reply),
         };
-        let closed = || ProcessError::StdinClosed {
-            offset: self.info().stdin_offset,
-        };
+        let end = request.end();
+        let after_supervisor_exit = || outcome_after_stdin_closed(end, self.info().stdin_offset);
         if self.stdin.send(request).await.is_err() {
-            return Err(closed());
+            return after_supervisor_exit();
         }
-        outcome.await.unwrap_or_else(|_| Err(closed()))
+        outcome.await.unwrap_or_else(|_| after_supervisor_exit())
     }
 
     pub fn events(&self, cursor: u64) -> Result<EventBatch, ProcessError> {
@@ -349,6 +353,14 @@ impl Log {
     }
 }
 
+fn outcome_after_stdin_closed(end: u64, written: u64) -> Result<(), ProcessError> {
+    if end <= written {
+        Ok(())
+    } else {
+        Err(ProcessError::StdinClosed { offset: written })
+    }
+}
+
 fn end_process_group(group: Pid) {
     let _ = kill_process_group(group, Signal::KILL);
 }
@@ -378,20 +390,27 @@ async fn supervise(
     let result = loop {
         if status.is_some() {
             stdin.take();
-            if let Some(unwritten) = pending.take() {
-                stdin_complete = false;
-                unwritten.reply(Err(ProcessError::StdinClosed {
-                    offset: stdin_offset,
-                }));
-            }
         }
-        if let Some(written) = pending.take_if(|pending| pending.data.is_empty()) {
-            if written.close {
-                stdin.take();
-            }
-            written.reply(Ok(()));
-        }
+        let settled = pending
+            .take_if(|pending| pending.data.is_empty() || stdin.is_none())
+            .map(|settled| {
+                let outcome = if settled.data.is_empty() {
+                    if settled.close {
+                        stdin.take();
+                    }
+                    Ok(())
+                } else {
+                    stdin_complete = false;
+                    Err(ProcessError::StdinClosed {
+                        offset: stdin_offset,
+                    })
+                };
+                (settled, outcome)
+            });
         process.record_stdin(stdin_offset, stdin.is_some());
+        if let Some((settled, outcome)) = settled {
+            settled.reply(outcome);
+        }
         if let Some(exit) = status.take() {
             if !out_open && !err_open {
                 break exit_result(exit, output_complete, stdin_complete);
@@ -412,9 +431,7 @@ async fn supervise(
             requested = kill.wait_for(|requested| *requested), if status.is_none() && !kill_requested => {
                 if requested.is_ok() {
                     kill_requested = true;
-                    if let Err(error) = kill_process_group(group, Signal::KILL) {
-                        break ProcessResult::Unknown { message: error.to_string() };
-                    }
+                    end_process_group(group);
                 }
             }
             request = stdin_requests.recv(), if pending.is_none() => {
@@ -433,10 +450,6 @@ async fn supervise(
                     }
                     _ => {
                         stdin.take();
-                        stdin_complete = false;
-                        if let Some(unwritten) = pending.take() {
-                            unwritten.reply(Err(ProcessError::StdinClosed { offset: stdin_offset }));
-                        }
                     }
                 }
             }

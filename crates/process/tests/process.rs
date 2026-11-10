@@ -104,6 +104,24 @@ async fn shutdown_closes_admission_and_waits_for_owned_children() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_racing_exit_reports_the_observed_exit() {
+    let processes = Processes::default();
+    for attempt in 0..300u64 {
+        let process = processes.start(command("/usr/bin/true", &[])).unwrap();
+        let spin = Duration::from_micros(attempt * 7 % 3000);
+        let started = std::time::Instant::now();
+        while started.elapsed() < spin {
+            std::hint::spin_loop();
+        }
+        process.kill();
+        assert!(
+            matches!(finish(&process).await, ProcessResult::Exited { .. }),
+            "attempt {attempt}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn kill_ends_every_process_in_the_group() {
     let path = pid_file("kill");
@@ -191,6 +209,8 @@ async fn stdin_writes_are_ordered_by_offset_and_retries_write_once() {
         }
     ));
     assert_eq!(stdout(&process), "abc");
+    write(3, "", true).await.unwrap();
+    write(1, "bc", false).await.unwrap();
     assert!(matches!(
         write(3, "d", false).await,
         Err(ProcessError::StdinClosed { offset: 3 })
