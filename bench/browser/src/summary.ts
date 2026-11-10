@@ -1,16 +1,10 @@
+import {
+    formatSpread,
+    markdownTable,
+    spread,
+    sum,
+} from "../../common/stats.ts";
 import type { AttemptRecord, FailureKind } from "./attempt.ts";
-
-export type Spread = { median: number; min: number; max: number };
-
-export function spread(values: number[]): Spread | null {
-    if (values.length === 0) return null;
-    const sorted = [...values].sort((left, right) => left - right);
-    const middle = Math.floor(sorted.length / 2);
-    const median = sorted.length % 2 === 1
-        ? sorted[middle]!
-        : (sorted[middle - 1]! + sorted[middle]!) / 2;
-    return { median, min: sorted[0]!, max: sorted.at(-1)! };
-}
 
 export type Reliability = {
     runs: number;
@@ -43,9 +37,6 @@ export function reliability(attempts: AttemptRecord[]): Reliability {
         failed_attempts,
     };
 }
-
-const sum = (values: number[]) =>
-    values.reduce((total, value) => total + value, 0);
 
 const metrics: {
     label: string;
@@ -105,20 +96,6 @@ const metrics: {
     { label: "total CPU s", digits: 2, read: (attempt) => attempt.cpu_seconds },
 ];
 
-function table(header: string[], rows: string[][]): string {
-    return [
-        `| ${header.join(" | ")} |`,
-        `| ${header.map(() => "---").join(" | ")} |`,
-        ...rows.map((row) => `| ${row.join(" | ")} |`),
-    ].join("\n");
-}
-
-function formatSpread(value: Spread | null, digits: number): string {
-    if (!value) return "no passing run";
-    const show = (number: number) => number.toFixed(digits);
-    return `${show(value.median)} (${show(value.min)}–${show(value.max)})`;
-}
-
 export function renderSummary(
     attempts: AttemptRecord[],
     arm_names: string[],
@@ -135,7 +112,7 @@ export function renderSummary(
 
     sections.push(
         "## Reliability\n\nEvery attempt is counted, including failed ones and retries. A pass means the outcome check held; the last column shows how many observations in passing attempts were also checked for expected content.\n\n" +
-            table(
+            markdownTable(
                 [
                     "task",
                     "arm",
@@ -177,7 +154,7 @@ export function renderSummary(
         "## Cost per task\n\nMedian (min–max) over passing attempts. Step timings are summed over the task's steps.\n\n" +
             task_ids.map((task) =>
                 `### ${task}\n\n` +
-                table(
+                markdownTable(
                     ["metric", ...arm_names],
                     metrics.map((metric) => [
                         metric.label,
@@ -185,6 +162,7 @@ export function renderSummary(
                             formatSpread(
                                 spread(passing(arm, task).map(metric.read)),
                                 metric.digits,
+                                "no passing run",
                             )
                         ),
                     ]),
@@ -197,7 +175,7 @@ export function renderSummary(
             `## Ratio to ${baseline}\n\nRatio of medians; below 1.00 is cheaper than ${baseline}.\n\n` +
                 task_ids.map((task) =>
                     `### ${task}\n\n` +
-                    table(
+                    markdownTable(
                         ["metric", ...arm_names.slice(1)],
                         metrics.map((metric) => {
                             const reference = spread(

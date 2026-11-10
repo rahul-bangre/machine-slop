@@ -22,7 +22,8 @@ import { fixture_origin } from "./fixtures/data.ts";
 import { FixtureServer } from "./fixtures/server.ts";
 import { observers } from "./observers.ts";
 import { readiness } from "./page.ts";
-import { armOrder } from "./schedule.ts";
+import { armOrder } from "../../common/schedule.ts";
+import { wholeNumber } from "../../common/stats.ts";
 import { renderSummary } from "./summary.ts";
 import { tasks as all_tasks } from "./tasks.ts";
 import { cpu_time_resolution_seconds } from "./usage.ts";
@@ -55,14 +56,6 @@ const { values: flags } = parseArgs({
 function fail(message: string): never {
     console.error(message);
     Deno.exit(2);
-}
-
-function wholeNumber(flag: string, value: string, minimum: number): number {
-    const number = Number(value);
-    if (!Number.isInteger(number) || number < minimum) {
-        fail(`--${flag} must be a whole number of at least ${minimum}`);
-    }
-    return number;
 }
 
 function startFixtureServer(): FixtureServer {
@@ -126,17 +119,26 @@ if (uses_pinned_chromium && !await isPinnedChromiumInstalled()) {
     fail("pinned Chromium is not installed; run `deno task bench:chromium`");
 }
 
-const conditions: Conditions = {
-    rounds: wholeNumber("rounds", flags.rounds, 1),
-    retries: wholeNumber("retries", flags.retries, 0),
-    think_ms: wholeNumber("think-ms", flags["think-ms"], 0),
-    step_timeout_ms: wholeNumber(
-        "step-timeout-ms",
-        flags["step-timeout-ms"],
-        1,
-    ),
-    usage_sample_ms: 200,
-};
+function conditionsFromFlags(): Conditions {
+    try {
+        return {
+            rounds: wholeNumber("rounds", flags.rounds, 1),
+            retries: wholeNumber("retries", flags.retries, 0),
+            think_ms: wholeNumber("think-ms", flags["think-ms"], 0),
+            step_timeout_ms: wholeNumber(
+                "step-timeout-ms",
+                flags["step-timeout-ms"],
+                1,
+            ),
+            usage_sample_ms: 200,
+        };
+    } catch (error) {
+        if (error instanceof RangeError) fail(error.message);
+        throw error;
+    }
+}
+
+const conditions = conditionsFromFlags();
 
 const server = startFixtureServer();
 
