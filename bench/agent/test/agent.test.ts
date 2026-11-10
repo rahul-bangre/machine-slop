@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 import { toolOutput } from "../src/agent.ts";
-import { agentdProvider } from "../src/agentd_sandbox.ts";
+import { agentdProvider } from "../src/agentd-sandbox.ts";
 import { type AttemptRecord, runAttempt } from "../src/attempt.ts";
 import type { Model, ModelTurn } from "../src/model.ts";
 import type { SandboxProvider } from "../src/sandbox.ts";

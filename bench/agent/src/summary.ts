@@ -13,12 +13,17 @@ type Measured = AttemptRecord & {
 const metrics: {
     label: string;
     digits: number;
-    read(attempt: Measured): number;
+    read(attempt: Measured): number | null;
 }[] = [
     {
         label: "sandbox create ms",
         digits: 0,
         read: (attempt) => attempt.create_ms ?? 0,
+    },
+    {
+        label: "boot ms reported by sandbox",
+        digits: 0,
+        read: (attempt) => attempt.reported_boot_ms,
     },
     {
         label: "task file setup ms",
@@ -135,9 +140,12 @@ export function renderSummary(
                     metric.label,
                     ...sandbox_names.map((sandbox) =>
                         formatSpread(
-                            spread(finished(sandbox, task).map(metric.read)),
+                            spread(
+                                finished(sandbox, task).map(metric.read)
+                                    .filter((value) => value !== null),
+                            ),
                             metric.digits,
-                            "no finished run",
+                            "none",
                         )
                     ),
                 ]),

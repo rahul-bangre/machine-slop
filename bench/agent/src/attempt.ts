@@ -13,6 +13,7 @@ export type AttemptRecord = {
     status: "passed" | "failed";
     failure: { kind: FailureKind; message: string } | null;
     create_ms: number | null;
+    reported_boot_ms: number | null;
     setup_ms: number | null;
     agent: Omit<AgentRun, "transcript"> | null;
     check_ms: number | null;
@@ -36,7 +37,7 @@ class AttemptFailed extends Error {
     }
 }
 
-const checker_path = ".bench_check.py";
+const checker_path = ".bench-check.py";
 const check_timeout_ms = 60_000;
 const longest_checker_message = 2_000;
 
@@ -72,6 +73,7 @@ export async function runAttempt(
         status: "failed",
         failure: null,
         create_ms: null,
+        reported_boot_ms: null,
         setup_ms: null,
         agent: null,
         check_ms: null,
@@ -86,6 +88,7 @@ export async function runAttempt(
             sandboxStep("create", () => provider.create())
         );
         const opened = sandbox;
+        record.reported_boot_ms = opened.reported_boot_ms;
 
         [, record.setup_ms] = await timed(() =>
             sandboxStep("write task files", async () => {
