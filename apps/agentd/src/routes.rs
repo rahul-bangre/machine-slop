@@ -2,7 +2,7 @@ use std::{convert::Infallible, sync::Arc};
 
 use axum::{
     Json,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
@@ -39,6 +39,26 @@ pub async fn kill(
 ) -> Result<StatusCode, ApiError> {
     find(&processes, &id)?.kill();
     Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdinPosition {
+    offset: u64,
+    #[serde(default)]
+    close: bool,
+}
+
+pub async fn write_stdin(
+    State(processes): State<Arc<Processes>>,
+    Path(id): Path<String>,
+    Query(StdinPosition { offset, close }): Query<StdinPosition>,
+    data: Bytes,
+) -> Result<StatusCode, ApiError> {
+    find(&processes, &id)?
+        .write_stdin(offset, data, close)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Default, Deserialize)]
@@ -114,6 +134,14 @@ impl From<ProcessError> for ApiError {
             ProcessError::InvalidCursor => Self(
                 StatusCode::BAD_REQUEST,
                 "cursor is ahead of process output".into(),
+            ),
+            ProcessError::StdinClosed { offset } => Self(
+                StatusCode::CONFLICT,
+                format!("stdin is closed; {offset} bytes were written"),
+            ),
+            ProcessError::StdinOffsetAhead { offset } => Self(
+                StatusCode::CONFLICT,
+                format!("stdin offset is ahead; next offset is {offset}"),
             ),
             ProcessError::Gap { first_seq } => Self(
                 StatusCode::GONE,

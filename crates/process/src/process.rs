@@ -1,17 +1,19 @@
 use std::{
     collections::{HashMap, VecDeque},
     io,
-    process::Stdio,
+    os::unix::process::ExitStatusExt,
+    process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Bytes;
+use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
-    sync::watch,
+    sync::{mpsc, oneshot, watch},
     time::{Instant, sleep_until},
 };
 use uuid::Uuid;
@@ -22,6 +24,7 @@ const MAX_PROCESSES: usize = 128;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_EVENTS: usize = 256;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const STDIN_QUEUE: usize = 8;
 
 #[derive(Debug)]
 pub enum ProcessError {
@@ -30,6 +33,8 @@ pub enum ProcessError {
     Spawn(io::Error),
     InvalidCursor,
     Gap { first_seq: u64 },
+    StdinClosed { offset: u64 },
+    StdinOffsetAhead { offset: u64 },
 }
 
 #[derive(Default)]
@@ -70,17 +75,35 @@ impl Processes {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true);
         if let Some(cwd) = request.cwd {
             command.current_dir(cwd);
         }
         let child = command.spawn().map_err(ProcessError::Spawn)?;
-        let process = Arc::new(Process::new());
+        let group = child
+            .id()
+            .and_then(|id| Pid::from_raw(id as i32))
+            .expect("unreaped child has a pid");
+        let (stdin_requests, requests) = mpsc::channel(STDIN_QUEUE);
+        let process = Arc::new(Process::new(stdin_requests));
+        let initial_stdin = StdinWrite {
+            offset: 0,
+            data: Bytes::from(request.stdin.unwrap_or_default()),
+            close: !request.keep_stdin_open.unwrap_or(false),
+            reply: None,
+        };
         if let Some(id) = evict {
             registry.entries.remove(&id);
         }
         registry.entries.insert(process.id.clone(), process.clone());
-        tokio::spawn(supervise(process.clone(), child, request.stdin));
+        tokio::spawn(supervise(
+            process.clone(),
+            child,
+            group,
+            initial_stdin,
+            requests,
+        ));
         Ok(process)
     }
 
@@ -114,6 +137,7 @@ pub struct Process {
     log: Mutex<Log>,
     changed: watch::Sender<()>,
     kill: watch::Sender<bool>,
+    stdin: mpsc::Sender<StdinWrite>,
 }
 
 struct Log {
@@ -121,6 +145,44 @@ struct Log {
     events: VecDeque<(u64, Bytes)>,
     bytes: usize,
     next_seq: u64,
+    stdin_offset: u64,
+    stdin_open: bool,
+}
+
+struct StdinWrite {
+    offset: u64,
+    data: Bytes,
+    close: bool,
+    reply: Option<oneshot::Sender<Result<(), ProcessError>>>,
+}
+
+impl StdinWrite {
+    fn end(&self) -> u64 {
+        self.offset.saturating_add(self.data.len() as u64)
+    }
+
+    fn admit(self, open: bool, offset: u64) -> Option<Self> {
+        if !open {
+            let outcome = outcome_after_stdin_closed(self.end(), offset);
+            self.reply(outcome);
+            return None;
+        }
+        if self.offset > offset {
+            self.reply(Err(ProcessError::StdinOffsetAhead { offset }));
+            return None;
+        }
+        let already_written = (offset - self.offset).min(self.data.len() as u64) as usize;
+        Some(Self {
+            data: self.data.slice(already_written..),
+            ..self
+        })
+    }
+
+    fn reply(self, outcome: Result<(), ProcessError>) {
+        if let Some(reply) = self.reply {
+            let _ = reply.send(outcome);
+        }
+    }
 }
 
 pub struct EventBatch {
@@ -130,7 +192,7 @@ pub struct EventBatch {
 }
 
 impl Process {
-    fn new() -> Self {
+    fn new(stdin: mpsc::Sender<StdinWrite>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             created: Instant::now(),
@@ -139,9 +201,12 @@ impl Process {
                 events: VecDeque::new(),
                 bytes: 0,
                 next_seq: 0,
+                stdin_offset: 0,
+                stdin_open: true,
             }),
             changed: watch::channel(()).0,
             kill: watch::channel(false).0,
+            stdin,
         }
     }
 
@@ -152,6 +217,8 @@ impl Process {
             status: log.status.clone(),
             first_seq: log.first_seq(),
             next_seq: log.next_seq,
+            stdin_offset: log.stdin_offset,
+            stdin_open: log.stdin_open,
         }
     }
 
@@ -174,6 +241,27 @@ impl Process {
 
     pub fn kill(&self) {
         self.kill.send_replace(true);
+    }
+
+    pub async fn write_stdin(
+        &self,
+        offset: u64,
+        data: Bytes,
+        close: bool,
+    ) -> Result<(), ProcessError> {
+        let (reply, outcome) = oneshot::channel();
+        let request = StdinWrite {
+            offset,
+            data,
+            close,
+            reply: Some(reply),
+        };
+        let end = request.end();
+        let after_supervisor_exit = || outcome_after_stdin_closed(end, self.info().stdin_offset);
+        if self.stdin.send(request).await.is_err() {
+            return after_supervisor_exit();
+        }
+        outcome.await.unwrap_or_else(|_| after_supervisor_exit())
     }
 
     pub fn events(&self, cursor: u64) -> Result<EventBatch, ProcessError> {
@@ -223,6 +311,12 @@ impl Process {
         self.changed.send_replace(());
     }
 
+    fn record_stdin(&self, offset: u64, open: bool) {
+        let mut log = self.log.lock().expect("process log poisoned");
+        log.stdin_offset = offset;
+        log.stdin_open = open;
+    }
+
     fn finish(&self, result: ProcessResult) {
         let mut log = self.log.lock().expect("process log poisoned");
         log.status = ProcessStatus::Finished {
@@ -259,12 +353,31 @@ impl Log {
     }
 }
 
-async fn supervise(process: Arc<Process>, mut child: Child, input: Option<String>) {
+fn outcome_after_stdin_closed(end: u64, written: u64) -> Result<(), ProcessError> {
+    if end <= written {
+        Ok(())
+    } else {
+        Err(ProcessError::StdinClosed { offset: written })
+    }
+}
+
+fn end_process_group(group: Pid) {
+    let _ = kill_process_group(group, Signal::KILL);
+}
+
+async fn supervise(
+    process: Arc<Process>,
+    mut child: Child,
+    group: Pid,
+    initial_stdin: StdinWrite,
+    mut stdin_requests: mpsc::Receiver<StdinWrite>,
+) {
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let mut stdin = child.stdin.take();
-    let input = input.unwrap_or_default();
-    let mut input_offset = 0;
+    let mut stdin_offset = 0;
+    let mut stdin_complete = true;
+    let mut pending = initial_stdin.admit(true, 0);
     let mut kill = process.kill.subscribe();
     let mut out = [0; 4096];
     let mut err = [0; 4096];
@@ -275,12 +388,32 @@ async fn supervise(process: Arc<Process>, mut child: Child, input: Option<String
     let mut kill_requested = false;
     let mut drain_deadline = Instant::now();
     let result = loop {
-        if input_offset == input.len() || status.is_some() {
+        if status.is_some() {
             stdin.take();
+        }
+        let settled = pending
+            .take_if(|pending| pending.data.is_empty() || stdin.is_none())
+            .map(|settled| {
+                let outcome = if settled.data.is_empty() {
+                    if settled.close {
+                        stdin.take();
+                    }
+                    Ok(())
+                } else {
+                    stdin_complete = false;
+                    Err(ProcessError::StdinClosed {
+                        offset: stdin_offset,
+                    })
+                };
+                (settled, outcome)
+            });
+        process.record_stdin(stdin_offset, stdin.is_some());
+        if let Some((settled, outcome)) = settled {
+            settled.reply(outcome);
         }
         if let Some(exit) = status.take() {
             if !out_open && !err_open {
-                break exit_result(exit, output_complete, input_offset == input.len());
+                break exit_result(exit, output_complete, stdin_complete);
             }
             status = Some(exit);
         }
@@ -288,6 +421,7 @@ async fn supervise(process: Arc<Process>, mut child: Child, input: Option<String
             result = child.wait(), if status.is_none() => {
                 match result {
                     Ok(exit) => {
+                        end_process_group(group);
                         status = Some(exit);
                         drain_deadline = Instant::now() + DRAIN_TIMEOUT;
                     }
@@ -297,15 +431,26 @@ async fn supervise(process: Arc<Process>, mut child: Child, input: Option<String
             requested = kill.wait_for(|requested| *requested), if status.is_none() && !kill_requested => {
                 if requested.is_ok() {
                     kill_requested = true;
-                    if let Err(error) = child.start_kill() {
-                        break ProcessResult::Unknown { message: error.to_string() };
-                    }
+                    end_process_group(group);
                 }
             }
-            write = async { stdin.as_mut().expect("stdin is open").write(&input.as_bytes()[input_offset..]).await }, if stdin.is_some() => {
+            request = stdin_requests.recv(), if pending.is_none() => {
+                if let Some(request) = request {
+                    pending = request.admit(stdin.is_some(), stdin_offset);
+                }
+            }
+            write = async {
+                stdin.as_mut().expect("stdin is open").write(&pending.as_ref().expect("stdin write is pending").data).await
+            }, if stdin.is_some() && pending.is_some() => {
                 match write {
-                    Ok(0) | Err(_) => { stdin.take(); }
-                    Ok(count) => input_offset += count,
+                    Ok(count) if count > 0 => {
+                        let written = pending.as_mut().expect("stdin write is pending");
+                        written.data = written.data.slice(count..);
+                        stdin_offset += count as u64;
+                    }
+                    _ => {
+                        stdin.take();
+                    }
                 }
             }
             read = stdout.read(&mut out), if out_open => {
@@ -323,37 +468,18 @@ async fn supervise(process: Arc<Process>, mut child: Child, input: Option<String
                 }
             }
             () = sleep_until(drain_deadline), if status.is_some() => {
-                break exit_result(status.take().expect("child exited"), false, input_offset == input.len());
+                break exit_result(status.take().expect("child exited"), false, stdin_complete);
             }
         }
     };
+    process.record_stdin(stdin_offset, false);
     process.finish(result);
 }
 
-#[cfg(unix)]
-fn exit_result(
-    status: std::process::ExitStatus,
-    output_complete: bool,
-    stdin_complete: bool,
-) -> ProcessResult {
-    use std::os::unix::process::ExitStatusExt;
+fn exit_result(status: ExitStatus, output_complete: bool, stdin_complete: bool) -> ProcessResult {
     ProcessResult::Exited {
         code: status.code(),
         signal: status.signal(),
-        output_complete,
-        stdin_complete,
-    }
-}
-
-#[cfg(not(unix))]
-fn exit_result(
-    status: std::process::ExitStatus,
-    output_complete: bool,
-    stdin_complete: bool,
-) -> ProcessResult {
-    ProcessResult::Exited {
-        code: status.code(),
-        signal: None,
         output_complete,
         stdin_complete,
     }

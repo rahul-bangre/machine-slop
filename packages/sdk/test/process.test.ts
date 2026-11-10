@@ -155,7 +155,58 @@ Deno.test("disconnecting output and wait does not cancel execution; cursors repl
         }
     }));
 
-Deno.test("immediate and repeated kill requests terminate the direct child", () =>
+Deno.test("interactive stdin streams in order and retried writes are not repeated", () =>
+    withMachine(async (machine) => {
+        const process = await machine.startProcess({
+            program: "/bin/cat",
+            keep_stdin_open: true,
+        });
+        const stream = process.events();
+        try {
+            let offset = await process.writeStdin(0, "hello ");
+            const echoed = await stream.next();
+            assert.ok(!echoed.done && echoed.value.type === "stdout");
+            assert.equal(atob(echoed.value.data), "hello ");
+            assert.equal(await process.writeStdin(0, "hello "), offset);
+            await assert.rejects(
+                process.writeStdin(offset + 1, "x"),
+                (error) => error instanceof HttpError && error.status === 409,
+            );
+            offset = await process.writeStdin(offset, new Uint8Array([0, 255]));
+            assert.deepEqual(
+                {
+                    stdin_offset: (await process.info()).stdin_offset,
+                    stdin_open: (await process.info()).stdin_open,
+                },
+                { stdin_offset: 8, stdin_open: true },
+            );
+            await process.closeStdin(offset);
+            const rest = [echoed.value, ...await Array.fromAsync(stream)];
+            assert.deepEqual(
+                decode(rest, "stdout"),
+                new Uint8Array([
+                    ...new TextEncoder().encode("hello "),
+                    0,
+                    255,
+                ]),
+            );
+            assert.deepEqual(await process.wait(), {
+                kind: "exited",
+                code: 0,
+                signal: null,
+                output_complete: true,
+                stdin_complete: true,
+            });
+            await assert.rejects(
+                process.writeStdin(offset, "late"),
+                (error) => error instanceof HttpError && error.status === 409,
+            );
+        } finally {
+            await stream.return(undefined);
+        }
+    }));
+
+Deno.test("immediate and repeated kill requests terminate the process group", () =>
     withMachine(async (machine) => {
         const process = await machine.startProcess({
             program: "/bin/sleep",
