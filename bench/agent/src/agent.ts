@@ -1,7 +1,11 @@
 import type { Model, ModelTurn, ToolResult } from "./model.ts";
 import { type CommandResult, type Sandbox, SandboxError } from "./sandbox.ts";
 
-export type Limits = { max_turns: number; command_timeout_ms: number };
+export type Limits = {
+    max_turns: number;
+    command_timeout_ms: number;
+    max_tool_output_chars?: number;
+};
 
 export type CommandRecord = {
     ms: number;
@@ -32,7 +36,10 @@ export class ModelError extends Error {
 
 const largest_tool_output_chars = 20_000;
 
-export function toolOutput(result: CommandResult): string {
+export function toolOutput(
+    result: CommandResult,
+    output_limit = largest_tool_output_chars,
+): string {
     const status = result.timed_out
         ? "The command timed out and was killed."
         : `exit code ${result.exit_code}`;
@@ -40,11 +47,11 @@ export function toolOutput(result: CommandResult): string {
         result.stdout,
         result.stderr && `stderr:\n${result.stderr}`,
     ].filter(Boolean).join("\n");
-    if (output.length <= largest_tool_output_chars) {
+    if (output.length <= output_limit) {
         return [output, status].filter(Boolean).join("\n");
     }
-    const half = largest_tool_output_chars / 2;
-    const omitted = output.length - largest_tool_output_chars;
+    const half = Math.floor(output_limit / 2);
+    const omitted = output.length - half * 2;
     return [
         output.slice(0, half),
         `[${omitted} characters of output omitted]`,
@@ -55,7 +62,7 @@ export function toolOutput(result: CommandResult): string {
 
 export async function runAgent(
     model: Model,
-    sandbox: Sandbox,
+    sandbox: Pick<Sandbox, "run">,
     prompt: string,
     limits: Limits,
 ): Promise<AgentRun> {
@@ -127,7 +134,7 @@ export async function runAgent(
             }
             const ms = performance.now() - started_at;
             run.sandbox_ms += ms;
-            const output = toolOutput(result);
+            const output = toolOutput(result, limits.max_tool_output_chars);
             run.commands.push({
                 ms,
                 exit_code: result.exit_code,

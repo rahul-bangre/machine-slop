@@ -39,14 +39,18 @@ function isOutageStatus(status: number | null): boolean {
     return status === 429 || (status !== null && status >= 500);
 }
 
-export function claudeCliModel(model_id: string): Model {
+export function claudeCliModel(
+    model_id: string,
+    system_prompt = json_system_prompt,
+    signal?: AbortSignal,
+): Model {
     const directories: string[] = [];
     return {
         describe: () => ({
             provider: "claude cli (subscription login)",
             model: model_id,
             effort,
-            system_prompt: json_system_prompt,
+            system_prompt,
             tools: "none; commands are returned as schema-validated JSON",
             session: "one headless CLI call per turn, resumed by session id",
             caveat:
@@ -80,7 +84,7 @@ export function claudeCliModel(model_id: string): Model {
                         "--setting-sources",
                         "",
                         "--system-prompt",
-                        json_system_prompt,
+                        system_prompt,
                         "--json-schema",
                         reply_schema,
                         ...(exchanges.length === 0
@@ -88,6 +92,7 @@ export function claudeCliModel(model_id: string): Model {
                             : ["--resume", session_id]),
                     ],
                     cwd: directories[0]!,
+                    ...(signal ? { signal } : {}),
                     stdin: "piped",
                     stdout: "piped",
                     stderr: "piped",

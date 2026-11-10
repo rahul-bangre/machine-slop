@@ -3,7 +3,8 @@
     "./packages/sdk",
     "./bench/browser",
     "./bench/agent",
-    "./bench/env"
+    "./bench/env",
+    "./bench/browser-agent"
   ],
   "exclude": [
     "target",
@@ -21,7 +22,7 @@
     "noFallthroughCasesInSwitch": true
   },
   "tasks": {
-    "check": "deno check --frozen-lockfile packages/sdk/src/mod.ts packages/sdk/test/*.test.ts bench/browser/src/main.ts bench/browser/test/*.test.ts bench/agent/src/main.ts bench/agent/test/*.test.ts bench/env/src/main.ts bench/env/test/*.test.ts",
+    "check": "deno check --frozen-lockfile packages/sdk/src/mod.ts packages/sdk/test/*.test.ts bench/browser/src/main.ts bench/browser/test/*.test.ts bench/agent/src/main.ts bench/agent/test/*.test.ts bench/env/src/main.ts bench/env/test/*.test.ts bench/browser-agent/src/main.ts bench/browser-agent/test/*.test.ts",
     "lint": "deno lint",
     "format": "deno fmt",
     "format:check": "deno fmt --check",
@@ -29,7 +30,9 @@
     "bench:chromium": "deno run --frozen-lockfile --allow-net=storage.googleapis.com --allow-read --allow-write --allow-run=unzip bench/browser/src/chromium.ts",
     "bench": "deno run --frozen-lockfile --allow-run --allow-net --allow-read --allow-write --allow-env --allow-sys bench/browser/src/main.ts",
     "bench:agent": "deno run --frozen-lockfile --allow-run --allow-net --allow-read --allow-write --allow-env --allow-sys bench/agent/src/main.ts",
-    "env": "deno run --frozen-lockfile --allow-run --allow-net --allow-read --allow-write --allow-env --allow-sys bench/env/src/main.ts"
+    "env": "deno run --frozen-lockfile --allow-run --allow-net --allow-read --allow-write --allow-env --allow-sys bench/env/src/main.ts",
+    "bench:browser-agent": "deno run --frozen-lockfile -A bench/browser-agent/src/main.ts",
+    "test:browser-agent": "deno test --frozen-lockfile -A bench/browser-agent/test/"
   },
   "fmt": {
     "exclude": [
