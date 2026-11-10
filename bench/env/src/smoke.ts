@@ -14,8 +14,13 @@ const observe_timeout_ms = 180_000;
 
 export type GuestFiles = { observer: string; fixture: string };
 
-// `failed` holds every sandbox whose destruction could not be confirmed.
-export type Release = { destroyed: string[]; failed: string[] };
+// `failed` holds every sandbox whose destruction could not be confirmed, and
+// `listing_error` says why sandboxes from a lost create may have been missed.
+export type Release = {
+    destroyed: string[];
+    failed: string[];
+    listing_error: string | null;
+};
 
 export type SmokeReport = {
     provider: string;
@@ -25,7 +30,7 @@ export type SmokeReport = {
     failure: string | null;
     guest: (GuestFacts & { id: string }) | null;
     checks: Check[];
-    release: Release | { error: string };
+    release: Release;
     observation: Observation | null;
 };
 
@@ -85,7 +90,13 @@ async function release(
     owner: Owner,
     started: string | null,
 ): Promise<Release> {
-    const ids = new Set(await provider.owned(owner));
+    const ids = new Set<string>();
+    let listing_error: string | null = null;
+    try {
+        for (const id of await provider.owned(owner)) ids.add(id);
+    } catch (error) {
+        listing_error = error instanceof Error ? error.message : String(error);
+    }
     if (started) ids.add(started);
     const destroyed: string[] = [];
     const failed: string[] = [];
@@ -98,7 +109,7 @@ async function release(
             failed.push(id);
         }
     }
-    return { destroyed, failed };
+    return { destroyed, failed, listing_error };
 }
 
 export async function smoke(
@@ -127,24 +138,24 @@ export async function smoke(
     } catch (error) {
         failure = error instanceof Error ? error.message : String(error);
     }
-    const released = await release(provider, owner, started_id).catch((
-        error,
-    ) => ({
-        error: error instanceof Error ? error.message : String(error),
-    }));
+    const released = await release(provider, owner, started_id);
 
     const checks = guest && observation
         ? evaluate(environment, guest, observation)
         : [];
     checks.push({
         name: "every sandbox this run created was destroyed",
-        ok: "failed" in released && released.failed.length === 0,
+        ok: released.failed.length === 0 && released.listing_error === null,
         expected: "every one confirmed gone",
-        observed: "failed" in released
-            ? (released.failed.length
-                ? `not confirmed: ${released.failed.join(", ")}`
-                : `${released.destroyed.length} confirmed gone`)
-            : released.error,
+        observed: [
+            `${released.destroyed.length} confirmed gone`,
+            ...released.failed.length
+                ? [`not confirmed: ${released.failed.join(", ")}`]
+                : [],
+            ...released.listing_error
+                ? [`listing failed: ${released.listing_error}`]
+                : [],
+        ].join("; "),
     });
     return {
         provider: provider.name,

@@ -25,6 +25,7 @@ const entrypoint = ["sleep", "infinity"];
 // and, being ephemeral, is deleted when it stops.
 const auto_stop_minutes = 15;
 const delete_timeout_s = 120;
+const activate_timeout_ms = 120_000;
 const gone = new Set<string>([SandboxState.DESTROYED]);
 const failed = new Set<string>([
     SnapshotState.ERROR,
@@ -63,6 +64,22 @@ export function daytonaProvider(): Provider {
         }
     }
 
+    // Activation may finish after the request returns; record the snapshot
+    // only once it can be used.
+    async function activeSnapshot(name: string): Promise<Snapshot> {
+        const deadline = Date.now() + activate_timeout_ms;
+        while (true) {
+            const snapshot = await daytona.snapshot.get(name);
+            if (snapshot.state === SnapshotState.ACTIVE) return snapshot;
+            if (Date.now() >= deadline) {
+                throw new Error(
+                    `snapshot ${name} is still ${snapshot.state} after activation`,
+                );
+            }
+            await new Promise((resolve) => setTimeout(resolve, 2_000));
+        }
+    }
+
     return {
         name: "daytona",
         sdk: "@daytona/sdk@0.231.0",
@@ -79,7 +96,8 @@ export function daytonaProvider(): Provider {
             const found = await existing(name);
             if (found?.state === SnapshotState.ACTIVE) return builtImage(found);
             if (found?.state === SnapshotState.INACTIVE) {
-                return builtImage(await daytona.snapshot.activate(found));
+                await daytona.snapshot.activate(found);
+                return builtImage(await activeSnapshot(name));
             }
             if (found && failed.has(found.state)) {
                 console.error(`deleting failed snapshot ${name}`);

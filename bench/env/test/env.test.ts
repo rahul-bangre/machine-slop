@@ -228,6 +228,7 @@ type FakeCloud = {
         // The listing is a stale view: it still shows destroyed sandboxes and
         // does not show new ones yet.
         listing_stale: boolean;
+        listing_fails: boolean;
         observer_output: string;
     };
 };
@@ -242,6 +243,7 @@ function fakeProvider(): Provider & { cloud: FakeCloud } {
             image_moved: false,
             destroy_fails: false,
             listing_stale: false,
+            listing_fails: false,
             observer_output: JSON.stringify(container),
         },
     };
@@ -277,6 +279,9 @@ function fakeProvider(): Provider & { cloud: FakeCloud } {
             });
         },
         owned(owner) {
+            if (cloud.faults.listing_fails) {
+                return Promise.reject(new Error("bad gateway"));
+            }
             if (cloud.faults.listing_stale) {
                 return Promise.resolve([...cloud.destroyed]);
             }
@@ -290,8 +295,7 @@ function fakeProvider(): Provider & { cloud: FakeCloud } {
             if (cloud.faults.destroy_fails) {
                 return Promise.reject(new Error("service unavailable"));
             }
-            cloud.sandboxes.delete(id);
-            cloud.destroyed.push(id);
+            if (cloud.sandboxes.delete(id)) cloud.destroyed.push(id);
             return Promise.resolve();
         },
     };
@@ -316,6 +320,7 @@ Deno.test("a smoke run observes the guest, passes, and destroys only its own san
     assert.deepEqual(report.release, {
         destroyed: ["sandbox-1"],
         failed: [],
+        listing_error: null,
     });
     assert.deepEqual([...provider.cloud.sandboxes.keys()], ["someone-else"]);
 });
@@ -338,6 +343,7 @@ Deno.test("a sandbox whose create response was lost is still destroyed, and the 
     assert.deepEqual(report.release, {
         destroyed: ["sandbox-1"],
         failed: [],
+        listing_error: null,
     });
 });
 
@@ -354,7 +360,11 @@ Deno.test("a run that cannot destroy its sandbox fails even when every check pas
     );
 
     assert.equal(report.passed, false);
-    assert.deepEqual(report.release, { destroyed: [], failed: ["sandbox-1"] });
+    assert.deepEqual(report.release, {
+        destroyed: [],
+        failed: ["sandbox-1"],
+        listing_error: null,
+    });
     assert.deepEqual(
         report.checks.filter((check) => !check.ok).map((check) => check.name),
         ["every sandbox this run created was destroyed"],
@@ -455,15 +465,37 @@ Deno.test("images are named by their input digest, once", () => {
 Deno.test("the sandbox a run started is destroyed even when the listing is stale", async () => {
     const provider = fakeProvider();
     provider.cloud.faults.listing_stale = true;
+    provider.cloud.destroyed.push("sandbox-0");
 
-    const first = await smoke(
+    const report = await smoke(
         provider,
         environment,
         await recordFor(provider),
         files,
         "run-7",
     );
-    assert.ok(first.passed, JSON.stringify(first.checks, null, 2));
-    assert.deepEqual(provider.cloud.destroyed, ["sandbox-1"]);
+    assert.ok(report.passed, JSON.stringify(report.checks, null, 2));
+    assert.deepEqual(provider.cloud.destroyed, ["sandbox-0", "sandbox-1"]);
+    assert.equal(provider.cloud.sandboxes.size, 0);
+});
+
+Deno.test("a failed listing still destroys the sandbox the run started, and fails the run", async () => {
+    const provider = fakeProvider();
+    provider.cloud.faults.listing_fails = true;
+
+    const report = await smoke(
+        provider,
+        environment,
+        await recordFor(provider),
+        files,
+        "run-8",
+    );
+
+    assert.equal(report.passed, false);
+    assert.deepEqual(report.release, {
+        destroyed: ["sandbox-1"],
+        failed: [],
+        listing_error: "bad gateway",
+    });
     assert.equal(provider.cloud.sandboxes.size, 0);
 });

@@ -87,14 +87,14 @@ as root on Daytona.
 
 The smoke test destroys every sandbox carrying its run label, so a sandbox whose
 create response was lost is destroyed too, and the sandbox it started even if
-the label listing does not show it yet. Listings lag: Daytona's has been seen
-reporting a sandbox as running after it was deleted. So the test does not list
-again to confirm cleanup; it looks up each destroyed sandbox by ID until the
-provider reports it gone. A create the provider has not listed when the run
-ends, and whose response was lost, is left to the provider: E2B kills it after
-15 minutes, and Daytona stops it after 15 idle minutes and deletes it because it
-is ephemeral. Templates and snapshots are kept; they are what the records point
-at.
+the label listing does not show it yet or the listing fails (which fails the
+run). Listings lag: Daytona's has been seen reporting a sandbox as running after
+it was deleted. So the test does not list again to confirm cleanup; it looks up
+each destroyed sandbox by ID until the provider reports it gone. A create the
+provider has not listed when the run ends, and whose response was lost, is left
+to the provider: E2B kills it after 15 minutes, and Daytona stops it after 15
+idle minutes and deletes it because it is ephemeral. Templates and snapshots are
+kept; they are what the records point at.
 
 On the recorded images, an E2B sandbox is a microVM whose kernel sees 2 CPUs and
 3803 MiB. A Daytona sandbox is a container that sees all of the host's CPUs,
