@@ -12,9 +12,9 @@ import {
 import {
     type BuiltImage,
     type Guest,
+    type ImageBuilder,
     ImageMismatch,
     type Owner,
-    type Provider,
     requireEnv,
     untilGone,
 } from "./provider.ts";
@@ -47,7 +47,7 @@ function builtImage(snapshot: Snapshot): BuiltImage {
     };
 }
 
-export function daytonaProvider(): Provider {
+export function daytonaProvider(): ImageBuilder {
     requireEnv("DAYTONA_API_KEY", "daytona");
     const daytona = new Daytona({ otelEnabled: false });
 
@@ -118,68 +118,71 @@ export function daytonaProvider(): Provider {
                 await Deno.remove(context, { recursive: true });
             }
         },
-        async start(image: BuiltImage, owner: Owner): Promise<Guest> {
-            const sandbox = await daytona.create({
-                snapshot: image.ref,
-                labels: owner,
-                ephemeral: true,
-                autoStopInterval: abandoned_sandbox_stop_minutes,
-                networkBlockAll: true,
-            });
-            const snapshot = sandbox.snapshot
-                ? await existing(sandbox.snapshot)
-                : null;
-            if (snapshot?.id !== image.id) {
-                throw new ImageMismatch(
-                    "daytona",
-                    image.id,
-                    snapshot?.id ?? "no snapshot",
-                );
-            }
-            return {
-                id: sandbox.id,
-                reported: {
-                    vcpus: sandbox.cpu,
-                    memory_mib: sandbox.memory * 1024,
-                },
-                async write(path, content) {
-                    await sandbox.fs.uploadFile(Buffer.from(content), path);
-                },
-                async exec(command, timeout_ms) {
-                    const result = await sandbox.process.executeCommand(
-                        command,
-                        undefined,
-                        undefined,
-                        Math.ceil(timeout_ms / 1000),
-                    );
-                    return {
-                        exit_code: result.exitCode,
-                        output: result.result,
-                    };
-                },
-            };
-        },
-        async owned(owner) {
-            const ids: string[] = [];
-            for await (const sandbox of daytona.list({ labels: owner })) {
-                if (!gone.has(sandbox.state ?? "")) ids.push(sandbox.id);
-            }
-            return ids;
-        },
-        async destroy(id) {
-            const lookup = () =>
-                daytona.get(id).catch((error) => {
-                    if (error instanceof DaytonaNotFoundError) return null;
-                    throw error;
+        sandboxes: (image) => ({
+            name: "daytona",
+            async start(owner: Owner): Promise<Guest> {
+                const sandbox = await daytona.create({
+                    snapshot: image.ref,
+                    labels: owner,
+                    ephemeral: true,
+                    autoStopInterval: abandoned_sandbox_stop_minutes,
+                    networkBlockAll: true,
                 });
-            const sandbox = await lookup();
-            if (sandbox && !gone.has(sandbox.state ?? "")) {
-                await sandbox.delete(delete_timeout_s, true);
-            }
-            await untilGone(id, async () => {
-                const found = await lookup();
-                return !found || gone.has(found.state ?? "");
-            });
-        },
+                const snapshot = sandbox.snapshot
+                    ? await existing(sandbox.snapshot)
+                    : null;
+                if (snapshot?.id !== image.id) {
+                    throw new ImageMismatch(
+                        "daytona",
+                        image.id,
+                        snapshot?.id ?? "no snapshot",
+                    );
+                }
+                return {
+                    id: sandbox.id,
+                    reported: {
+                        vcpus: sandbox.cpu,
+                        memory_mib: sandbox.memory * 1024,
+                    },
+                    async write(path, content) {
+                        await sandbox.fs.uploadFile(Buffer.from(content), path);
+                    },
+                    async exec(command, timeout_ms) {
+                        const result = await sandbox.process.executeCommand(
+                            command,
+                            undefined,
+                            undefined,
+                            Math.ceil(timeout_ms / 1000),
+                        );
+                        return {
+                            exit_code: result.exitCode,
+                            output: result.result,
+                        };
+                    },
+                };
+            },
+            async owned(owner) {
+                const ids: string[] = [];
+                for await (const sandbox of daytona.list({ labels: owner })) {
+                    if (!gone.has(sandbox.state ?? "")) ids.push(sandbox.id);
+                }
+                return ids;
+            },
+            async destroy(id) {
+                const lookup = () =>
+                    daytona.get(id).catch((error) => {
+                        if (error instanceof DaytonaNotFoundError) return null;
+                        throw error;
+                    });
+                const sandbox = await lookup();
+                if (sandbox && !gone.has(sandbox.state ?? "")) {
+                    await sandbox.delete(delete_timeout_s, true);
+                }
+                await untilGone(id, async () => {
+                    const found = await lookup();
+                    return !found || gone.has(found.state ?? "");
+                });
+            },
+        }),
     };
 }

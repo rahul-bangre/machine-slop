@@ -52,8 +52,10 @@ Every sandbox other than local `agentd` needs Deno 2.9.7 and Chromium
   with 2 CPUs and 4 GiB; use `--browser-executable=/usr/local/bin/chromium`.
   They need `E2B_API_KEY` or `DAYTONA_API_KEY`, and have network access for
   setup while tasks stay on guest loopback.
-- `machined` needs the host to itself and destroys every machine it finds. Its
-  machines get no network, and the stock image has no browser runtime yet.
+- `machined` uses its stock image with 2 CPUs and 4 GiB; use
+  `--browser-executable=/usr/local/bin/chromium`. Its machines may reach only
+  `registry.npmjs.org`, for setup. It needs the host to itself and destroys
+  every machine it finds. The image has the pinned Chromium only on x86_64.
 - Local `agentd` runs without resource limits.
 
 ## Results

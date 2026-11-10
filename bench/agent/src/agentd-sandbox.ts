@@ -1,4 +1,9 @@
-import { Host, Machine, type Process } from "@machine-slop/sdk";
+import {
+    type CreateMachine,
+    Host,
+    Machine,
+    type Process,
+} from "@machine-slop/sdk";
 
 import {
     type CommandResult,
@@ -49,7 +54,7 @@ async function collect(process: Process): Promise<CommandResult> {
 
 type ShellOptions = { cwd?: string };
 
-async function shellWithin(
+export async function shellWithin(
     timeout_ms: number,
     machine: Machine,
     script: string,
@@ -277,7 +282,10 @@ export function agentdProvider(
     };
 }
 
-export function machinedProvider(url: string): SandboxProvider {
+export function machinedProvider(
+    url: string,
+    machine: CreateMachine = { allowed_hosts: [] },
+): SandboxProvider {
     const host = new Host(url);
     const open = new OpenSandboxes();
 
@@ -297,15 +305,17 @@ export function machinedProvider(url: string): SandboxProvider {
     async function lease(): Promise<Lease> {
         await destroyEveryMachine();
         try {
-            const { machine, info } = await host.createMachine(
-                { allowed_hosts: [] },
+            const created = await host.createMachine(
+                machine,
                 AbortSignal.timeout(machine_boot_timeout_ms),
             );
             return {
-                machine,
-                reported_boot_ms: info.boot_ms,
+                machine: created.machine,
+                reported_boot_ms: created.info.boot_ms,
                 release: () =>
-                    machine.destroy(AbortSignal.timeout(request_timeout_ms)),
+                    created.machine.destroy(
+                        AbortSignal.timeout(request_timeout_ms),
+                    ),
             };
         } catch (error) {
             await destroyEveryMachine().catch(() => {});
@@ -317,7 +327,9 @@ export function machinedProvider(url: string): SandboxProvider {
         name: "machined",
         describe: () => ({
             url,
-            isolation: "one Firecracker microVM per attempt, no network",
+            machine,
+            isolation:
+                "one Firecracker microVM per attempt; network access follows machine.allowed_hosts",
             create_measures:
                 "cold boot of a new microVM until agentd is healthy, and a new work directory",
             host_ownership:

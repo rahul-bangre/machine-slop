@@ -26,14 +26,19 @@ export interface Guest {
 
 export type Owner = Record<string, string>;
 
-export interface Provider {
+export interface Sandboxes {
+    readonly name: string;
+    start(owner: Owner): Promise<Guest>;
+    owned(owner: Owner): Promise<string[]>;
+    destroy(id: string): Promise<void>;
+}
+
+export interface ImageBuilder {
     readonly name: string;
     readonly sdk: string;
     readonly build_settings: Record<string, unknown>;
     build(environment: Environment, input_sha256: string): Promise<BuiltImage>;
-    start(image: BuiltImage, owner: Owner): Promise<Guest>;
-    owned(owner: Owner): Promise<string[]>;
-    destroy(id: string): Promise<void>;
+    sandboxes(image: BuiltImage): Sandboxes;
 }
 
 const gone_timeout_ms = 60_000;
@@ -70,7 +75,7 @@ export class ImageMismatch extends Error {
 }
 
 export function inputSha256(
-    provider: Provider,
+    provider: ImageBuilder,
     environment: Environment,
 ): Promise<string> {
     return sha256(JSON.stringify({
