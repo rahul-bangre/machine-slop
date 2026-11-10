@@ -1,0 +1,10 @@
+{
+  "browsers": {
+    "stock": { "executable": "pinned", "product": "pinned", "args": [] }
+  },
+  "arms": [
+    { "name": "stock-ax", "browser": "stock", "observer": "ax-tree" },
+    { "name": "stock-html", "browser": "stock", "observer": "html" },
+    { "name": "stock-screenshot", "browser": "stock", "observer": "screenshot" }
+  ]
+}

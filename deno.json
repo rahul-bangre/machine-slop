@@ -1,10 +1,13 @@
 {
   "workspace": [
-    "./packages/sdk"
+    "./packages/sdk",
+    "./packages/browser-bench"
   ],
   "exclude": [
     "target",
-    "node_modules"
+    "node_modules",
+    "packages/browser-bench/.chromium",
+    "bench-results"
   ],
   "compilerOptions": {
     "strict": true,
@@ -16,11 +19,13 @@
     "noFallthroughCasesInSwitch": true
   },
   "tasks": {
-    "check": "deno check --frozen-lockfile packages/sdk/src/mod.ts packages/sdk/test/*.test.ts",
+    "check": "deno check --frozen-lockfile packages/sdk/src/mod.ts packages/sdk/test/*.test.ts packages/browser-bench/src/main.ts packages/browser-bench/test/*.test.ts",
     "lint": "deno lint",
     "format": "deno fmt",
     "format:check": "deno fmt --check",
-    "test": "deno test --frozen-lockfile --allow-run=./target/debug/agentd --allow-net=127.0.0.1 --allow-read --allow-write packages/sdk/test/"
+    "test": "deno test --frozen-lockfile --allow-run=./target/debug/agentd --allow-net=127.0.0.1 --allow-read --allow-write packages/sdk/test/ && deno test --frozen-lockfile packages/browser-bench/test/",
+    "bench:chromium": "deno run --frozen-lockfile --allow-net=storage.googleapis.com --allow-read --allow-write --allow-run=unzip packages/browser-bench/src/chromium.ts",
+    "bench": "deno run --frozen-lockfile --allow-run --allow-net --allow-read --allow-write --allow-env --allow-sys packages/browser-bench/src/main.ts"
   },
   "fmt": {
     "exclude": [

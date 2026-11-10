@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Fieldstone Goods</title>
+    <style>
+    :root {
+      font-family: system-ui, sans-serif;
+      color: #1c1c1c;
+    }
+    body {
+      margin: 0;
+      background: #f6f4ef;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      padding: 12px 24px;
+      background: #fff;
+      border-bottom: 1px solid #ddd;
+    }
+    header h1 {
+      font-size: 20px;
+      margin: 0;
+      flex: 1;
+    }
+    #search {
+      padding: 8px 12px;
+      width: 280px;
+      font-size: 15px;
+    }
+    main {
+      padding: 24px;
+    }
+    #products {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 16px;
+    }
+    .product {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 12px;
+      transition: transform 150ms ease, box-shadow 150ms ease;
+      animation: arrive 300ms ease both;
+    }
+    .product:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px #0002;
+    }
+    .product .swatch {
+      height: 96px;
+      border-radius: 6px;
+      margin-bottom: 8px;
+    }
+    .product h2 {
+      font-size: 16px;
+      margin: 0 0 4px;
+    }
+    button {
+      padding: 8px 12px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    dialog {
+      width: 420px;
+      border: 1px solid #bbb;
+      border-radius: 8px;
+    }
+    label {
+      display: block;
+      margin: 8px 0;
+    }
+    input[type="text"],
+    input[type="email"] {
+      width: 100%;
+      padding: 6px;
+      box-sizing: border-box;
+    }
+    @keyframes arrive {
+      from {
+        opacity: 0;
+        transform: scale(0.96);
+      }
+    }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Fieldstone Goods</h1>
+      <input id="search" type="search" placeholder="Search products"
+        aria-label="Search products">
+      <button id="cart-button"
+        type="button">Cart (<span id="cart-count">0</span>)</button>
+    </header>
+    <main>
+      <p id="status" role="status">Loading products…</p>
+      <section id="products" aria-label="Products"></section>
+    </main>
+    <dialog id="cart" aria-labelledby="cart-title">
+      <h2 id="cart-title">Your cart</h2>
+      <ul id="cart-items"></ul>
+      <p>Total: <strong id="cart-total">$0.00</strong></p>
+      <button id="checkout" type="button">Checkout</button>
+      <form id="checkout-form" hidden>
+        <label>Full name <input id="name" type="text" required></label>
+        <label>Email <input id="email" type="email" required></label>
+        <label><input id="terms" type="checkbox"> I accept the terms</label>
+        <button id="place-order" type="submit">Place order</button>
+      </form>
+      <p id="confirmation" role="status"></p>
+    </dialog>
+    <script>
+    const cart = new Map();
+    const price = (cents) => `$${(cents / 100).toFixed(2)}`;
+    const grid = document.querySelector("#products");
+    const status = document.querySelector("#status");
+    let catalog = [];
+
+    function renderCart() {
+      const lines = [...cart.entries()].map(([id, quantity]) => {
+        const product = catalog.find((entry) => entry.id === id);
+        return { product, quantity };
+      });
+      document.querySelector("#cart-count").textContent = lines.reduce(
+        (count, line) => count + line.quantity,
+        0,
+      );
+      document.querySelector("#cart-items").replaceChildren(...lines.map((line) => {
+        const item = document.createElement("li");
+        item.textContent = `${line.product.name} × ${line.quantity}`;
+        return item;
+      }));
+      document.querySelector("#cart-total").textContent = price(
+        lines.reduce(
+          (sum, line) => sum + line.product.priceCents * line.quantity,
+          0,
+        ),
+      );
+    }
+
+    function renderCatalog() {
+      grid.replaceChildren(...catalog.map((product, index) => {
+        const card = document.createElement("article");
+        card.className = "product";
+        card.dataset.id = product.id;
+        card.innerHTML = `
+          <div class="swatch" style="background: hsl(${
+          index * 29 % 360
+        } 45% 70%)"></div>
+          <h2></h2>
+          <p class="price"></p>
+          <button class="add" type="button">Add to cart</button>`;
+        card.querySelector("h2").textContent = product.name;
+        card.querySelector(".price").textContent = price(product.priceCents);
+        card.querySelector(".add").addEventListener("click", () => {
+          cart.set(product.id, (cart.get(product.id) ?? 0) + 1);
+          renderCart();
+          status.textContent = `Added ${product.name} to cart`;
+        });
+        return card;
+      }));
+      status.textContent = `${catalog.length} products`;
+    }
+
+    let debounce;
+    document.querySelector("#search").addEventListener("input", (event) => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        const query = event.target.value.trim().toLowerCase();
+        let shown = 0;
+        for (const card of grid.children) {
+          const matches = card.querySelector("h2").textContent.toLowerCase()
+            .includes(query);
+          card.hidden = !matches;
+          if (matches) shown += 1;
+        }
+        status.textContent = `${shown} products`;
+      }, 120);
+    });
+
+    document.querySelector("#cart-button").addEventListener("click", () => {
+      document.querySelector("#cart").showModal();
+    });
+    document.querySelector("#checkout").addEventListener("click", () => {
+      document.querySelector("#checkout-form").hidden = false;
+    });
+    document.querySelector("#checkout-form").addEventListener(
+      "submit",
+      async (event) => {
+        event.preventDefault();
+        const response = await fetch("/api/orders", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            items: [...cart.entries()].map(([id, quantity]) => ({ id, quantity })),
+            name: document.querySelector("#name").value,
+            email: document.querySelector("#email").value,
+            acceptedTerms: document.querySelector("#terms").checked,
+          }),
+        });
+        const { orderId } = await response.json();
+        document.querySelector("#confirmation").textContent =
+          `Order ${orderId} confirmed`;
+      },
+    );
+
+    fetch("/api/products").then((response) => response.json()).then((loaded) => {
+      catalog = loaded;
+      renderCatalog();
+    });
+    </script>
+  </body>
+</html>

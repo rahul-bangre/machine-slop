@@ -1,0 +1,8 @@
+{
+  "name": "@machine-slop/browser-bench",
+  "version": "0.1.0",
+  "exports": "./src/main.ts",
+  "imports": {
+    "gpt-tokenizer/": "npm:/gpt-tokenizer@4.1.0/"
+  }
+}
