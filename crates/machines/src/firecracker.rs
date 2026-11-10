@@ -174,14 +174,16 @@ impl Vm {
         let dns_socket = root.join(host_socket_name(DNS_PORT));
         let dns_listener = UnixListener::bind(&dns_socket)?;
         std::fs::set_permissions(&dns_socket, Permissions::from_mode(0o777))?;
-        let reserved_bytes = (u64::from(memory_mib) + u64::from(MACHINE_OVERHEAD_MIB)) << 20;
+        let reserved_mib = u64::from(memory_mib) + u64::from(MACHINE_OVERHEAD_MIB);
+        let memory_file_being_saved_mib = u64::from(memory_mib);
+        let memory_max_bytes = (reserved_mib + memory_file_being_saved_mib) << 20;
         let mut child = Command::new(&jail.jailer)
             .args(["--id", &uid, "--exec-file"])
             .arg(dir.join(FIRECRACKER))
             .args(["--uid", &uid, "--gid", &uid, "--chroot-base-dir"])
             .arg(&jail.jails_dir)
             .args(["--cgroup-version", "2", "--parent-cgroup", &jail.cgroup])
-            .args(["--cgroup", &format!("memory.max={reserved_bytes}")])
+            .args(["--cgroup", &format!("memory.max={memory_max_bytes}")])
             .args(["--cgroup", "memory.swap.max=0"])
             .args([
                 "--cgroup",

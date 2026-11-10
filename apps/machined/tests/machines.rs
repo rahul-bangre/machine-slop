@@ -1022,6 +1022,42 @@ async fn a_fork_branches_a_running_machine_without_stopping_it() {
 
 #[tokio::test]
 #[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
+async fn a_machine_using_all_its_memory_survives_saving_it_repeatedly() {
+    let host = Host::start("full").await;
+    let machine = host
+        .create_with(Some(json!({ "memory_mib": SMALL_MACHINE_MIB })))
+        .await["id"]
+        .as_str()
+        .expect("machine id")
+        .to_owned();
+    assert_eq!(
+        host.exit_code(
+            &machine,
+            "mount -o remount,size=90% /dev/shm \
+            && head -c 192M /dev/urandom > /dev/shm/fill \
+            && sha256sum /dev/shm/fill > /root/fill.sha256"
+        )
+        .await,
+        json!(0)
+    );
+
+    let first = host.fork(&machine).await;
+    let second = host.fork(&machine).await;
+    host.pause(&machine).await;
+    host.resume(&machine).await;
+    let from_restored = host.fork(&machine).await;
+    for copy in [&machine, &first, &second, &from_restored] {
+        assert_eq!(
+            host.exit_code(copy, "sha256sum -c /root/fill.sha256").await,
+            json!(0),
+            "machine {copy} kept the memory it was saved with"
+        );
+    }
+    host.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm and SLOP_IMAGE_DIR; run with make vm-test"]
 async fn a_machine_unused_for_its_idle_timeout_is_destroyed() {
     let host = Host::start("idle").await;
     let requested = tokio::time::Instant::now();
@@ -1898,7 +1934,7 @@ async fn a_machine_runs_jailed_and_only_its_tenant_reaches_it() {
     let limit = |file: &str| std::fs::read_to_string(cgroup.join(file)).expect(file);
     assert_eq!(
         limit("memory.max").trim(),
-        ((512u64 + 64) << 20).to_string()
+        ((512u64 + 64 + 512) << 20).to_string()
     );
     assert_eq!(limit("cpu.max").trim(), "200000 100000");
 
