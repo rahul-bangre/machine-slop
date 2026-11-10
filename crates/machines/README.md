@@ -424,7 +424,7 @@ previews belong to different people.
 
 `machined` serves at most 1024 preview connections at once, counting open
 upgrades, and closes a connection that does not send a request head within 10
-seconds.
+seconds; a request body or an open tunnel has no time limit.
 
 A preview lasts `ttl_secs` (default 3600, at most 604800) for one machine and
 port. When it expires or is deleted, it stops accepting requests and its open

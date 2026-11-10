@@ -12,7 +12,7 @@ use crate::egress::{
 
 const HEADER_BYTES: usize = 12;
 const MAX_NAME_BYTES: usize = 255;
-const MAX_ANSWERS: usize = 16;
+const MAX_ANSWERS: usize = 8;
 const ANSWER_TTL_SECS: u32 = 30;
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;

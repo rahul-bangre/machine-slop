@@ -133,7 +133,7 @@ fn server_name(body: &[u8]) -> Option<Option<String>> {
                 return std::str::from_utf8(name)
                     .ok()
                     .filter(|name| name.is_ascii())
-                    .map(|name| Some(name.to_ascii_lowercase()));
+                    .map(|name| Some(name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()));
             }
         }
         return Some(None);
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn the_server_name_is_read_from_a_hello_split_across_records() {
-        let hello = records(&hello_body(Some("Example.COM")), 7);
+        let hello = records(&hello_body(Some("Example.COM.")), 7);
         assert_eq!(
             parse(&hello),
             Parsed::Complete {
