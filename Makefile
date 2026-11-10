@@ -1,4 +1,6 @@
-.PHONY: setup dev build check format
+VM_TARGETS := vm-start vm-stop vm-smoke vm-shell vm-delete
+
+.PHONY: setup dev build check format $(VM_TARGETS)
 
 setup:
 	deno install --frozen-lockfile
@@ -20,3 +22,7 @@ check:
 format:
 	cargo fmt --all
 	deno task format
+
+# Development VM; see vm/vm.sh.
+$(VM_TARGETS):
+	vm/vm.sh $(@:vm-%=%)
