@@ -1,0 +1,17 @@
+[package]
+name = "machined"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+slop-machines = { path = "../../crates/machines" }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde_json = "1"
+
+[lints]
+workspace = true

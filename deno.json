@@ -31,7 +31,8 @@
   },
   "fmt": {
     "exclude": [
-      "packages/sdk/src/process.gen.ts"
+      "packages/sdk/src/process.gen.ts",
+      "packages/sdk/src/machines.gen.ts"
     ]
   }
 }

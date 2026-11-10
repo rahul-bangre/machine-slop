@@ -1,4 +1,4 @@
-VM_TARGETS := vm-start vm-stop vm-smoke vm-shell vm-delete
+VM_TARGETS := vm-start vm-stop vm-smoke vm-test vm-shell vm-delete
 
 .PHONY: setup dev build check format generate test $(VM_TARGETS)
 
@@ -14,6 +14,7 @@ build:
 
 check:
 	cargo run --locked -p slop-process --bin export-types -- --check
+	cargo run --locked -p slop-machines --bin export-types -- --check
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	deno task format:check
@@ -29,6 +30,7 @@ $(VM_TARGETS):
 
 generate:
 	cargo run --locked -p slop-process --bin export-types
+	cargo run --locked -p slop-machines --bin export-types
 
 test:
 	cargo test --locked --workspace

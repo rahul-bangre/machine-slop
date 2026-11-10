@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" != overlay-ready ]; then
+  mount -t ext4 -o noatime /dev/vdb /mnt/scratch
+  mkdir -p /mnt/scratch/upper /mnt/scratch/work
+  mount -t overlay overlay \
+    -o lowerdir=/,upperdir=/mnt/scratch/upper,workdir=/mnt/scratch/work /mnt/root
+  mkdir -p /mnt/root/mnt/old-root
+  cd /mnt/root
+  pivot_root . mnt/old-root
+  exec chroot . /sbin/slop-init overlay-ready
+fi
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+mount -t tmpfs tmpfs /run
+umount -l /mnt/old-root
+rmdir /mnt/old-root
+
+hostname machine
+ip link set lo up
+
+export HOME=/root
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LANG=C.UTF-8
+mkdir -p /workspace
+cd /workspace
+exec /usr/bin/tini -- /usr/local/bin/agentd vsock:3000

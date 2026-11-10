@@ -10,7 +10,8 @@ export async function request(
     path: string,
     init?: RequestInit,
 ): Promise<Response> {
-    const response = await fetch(new URL(path, url), init);
+    const base_path = url.pathname.replace(/\/+$/, "");
+    const response = await fetch(new URL(`${base_path}${path}`, url), init);
     if (!response.ok) {
         throw new HttpError(response.status, await response.text());
     }
