@@ -1,13 +1,22 @@
 import { Buffer } from "node:buffer";
 
-import { Daytona, Image, SandboxState, SnapshotState } from "@daytona/sdk";
+import {
+    Daytona,
+    DaytonaNotFoundError,
+    Image,
+    SandboxState,
+    type Snapshot,
+    SnapshotState,
+} from "@daytona/sdk";
 
 import {
     type BuiltImage,
     type Guest,
+    ImageMismatch,
     type Owner,
     type Provider,
     requireEnv,
+    untilGone,
 } from "./provider.ts";
 
 const snapshot_prefix = "slop-browser";
@@ -15,11 +24,45 @@ const entrypoint = ["sleep", "infinity"];
 // A sandbox the smoke run loses track of stops after this many idle minutes
 // and, being ephemeral, is deleted when it stops.
 const auto_stop_minutes = 15;
-const gone = new Set<string>([SandboxState.DESTROYED, SandboxState.DESTROYING]);
+const delete_timeout_s = 120;
+const gone = new Set<string>([SandboxState.DESTROYED]);
+const failed = new Set<string>([
+    SnapshotState.ERROR,
+    SnapshotState.BUILD_FAILED,
+]);
+
+export function daytonaSnapshotName(input_sha256: string): string {
+    return `${snapshot_prefix}-${input_sha256.slice(0, 12)}`;
+}
+
+function builtImage(snapshot: Snapshot): BuiltImage {
+    return {
+        ref: snapshot.name,
+        id: snapshot.id,
+        // The registry image the snapshot was built into; `imageName` is empty
+        // for a snapshot built from a Dockerfile.
+        details: Object.fromEntries(
+            Object.entries({
+                image_ref: snapshot.ref,
+                build_ref: snapshot.buildInfo?.snapshotRef,
+            }).filter((entry): entry is [string, string] => !!entry[1]),
+        ),
+    };
+}
 
 export function daytonaProvider(): Provider {
     requireEnv("DAYTONA_API_KEY", "daytona");
     const daytona = new Daytona({ otelEnabled: false });
+
+    async function existing(name: string): Promise<Snapshot | null> {
+        try {
+            return await daytona.snapshot.get(name);
+        } catch (error) {
+            if (error instanceof DaytonaNotFoundError) return null;
+            throw error;
+        }
+    }
+
     return {
         name: "daytona",
         sdk: "@daytona/sdk@0.231.0",
@@ -29,9 +72,23 @@ export function daytonaProvider(): Provider {
             if (memory_mib % 1024 !== 0) {
                 throw new Error("Daytona allocates memory in whole GiB");
             }
-            // Snapshot names are unique, so a name that already exists is an
-            // error rather than something this build silently reuses.
-            const name = `${snapshot_prefix}-${input_sha256.slice(0, 12)}`;
+            // Snapshot names are unique per organization and this one is
+            // derived from the inputs, so a snapshot already under it was built
+            // from them: reuse it if it built, replace it if it failed.
+            const name = daytonaSnapshotName(input_sha256);
+            const found = await existing(name);
+            if (found?.state === SnapshotState.ACTIVE) return builtImage(found);
+            if (found?.state === SnapshotState.INACTIVE) {
+                return builtImage(await daytona.snapshot.activate(found));
+            }
+            if (found && failed.has(found.state)) {
+                console.error(`deleting failed snapshot ${name}`);
+                await daytona.snapshot.delete(found);
+            } else if (found) {
+                throw new Error(
+                    `snapshot ${name} is ${found.state}; wait for it and run the build again`,
+                );
+            }
             const context = await Deno.makeTempDir({ prefix: "env-build-" });
             try {
                 const dockerfile = `${context}/Dockerfile`;
@@ -47,11 +104,7 @@ export function daytonaProvider(): Provider {
                         `snapshot ${name} is ${snapshot.state}, not active`,
                     );
                 }
-                return {
-                    ref: snapshot.name,
-                    id: snapshot.id,
-                    details: { image_name: snapshot.imageName ?? "" },
-                };
+                return builtImage(snapshot);
             } finally {
                 await Deno.remove(context, { recursive: true });
             }
@@ -64,14 +117,20 @@ export function daytonaProvider(): Provider {
                 autoStopInterval: auto_stop_minutes,
                 networkBlockAll: true,
             });
-            // The sandbox names its snapshot; resolve that name to the ID the
-            // record holds, so a snapshot rebuilt under the same name is caught.
+            // The sandbox names its snapshot; a snapshot deleted and rebuilt
+            // under the same name has a different ID.
             const snapshot = sandbox.snapshot
-                ? await daytona.snapshot.get(sandbox.snapshot)
+                ? await existing(sandbox.snapshot)
                 : null;
+            if (snapshot?.id !== image.id) {
+                throw new ImageMismatch(
+                    "daytona",
+                    image.id,
+                    snapshot?.id ?? "no snapshot",
+                );
+            }
             return {
                 id: sandbox.id,
-                image_id: snapshot?.id ?? "",
                 reported: {
                     vcpus: sandbox.cpu,
                     memory_mib: sandbox.memory * 1024,
@@ -101,7 +160,19 @@ export function daytonaProvider(): Provider {
             return ids;
         },
         async destroy(id) {
-            await (await daytona.get(id)).delete();
+            const lookup = () =>
+                daytona.get(id).catch((error) => {
+                    if (error instanceof DaytonaNotFoundError) return null;
+                    throw error;
+                });
+            const sandbox = await lookup();
+            if (sandbox && !gone.has(sandbox.state ?? "")) {
+                await sandbox.delete(delete_timeout_s, true);
+            }
+            await untilGone(id, async () => {
+                const found = await lookup();
+                return !found || gone.has(found.state ?? "");
+            });
         },
     };
 }

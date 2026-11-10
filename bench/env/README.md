@@ -35,13 +35,28 @@ The guests are x86_64; no other architecture is pinned.
 - `image.ref`: what sandboxes are created from. For E2B, the template name and a
   tag naming this build; for Daytona, the snapshot name
 - `image.id`: the E2B template ID or the Daytona snapshot ID
-- `image.details`: the E2B build ID, or the Daytona image name
+- `image.details`: the E2B build ID and tag, or the registry image Daytona built
+  the snapshot into
 - `input_sha256`: a digest of the Dockerfile, the resources and the provider's
   build settings
 
 `env smoke` refuses a record whose `input_sha256` no longer matches what the
 current pins would build, so a changed pin cannot be smoke-tested against an old
 image. Rebuild and commit the new record.
+
+Image names carry the first 12 hex digits of `input_sha256`, so building again
+with unchanged inputs is safe. On E2B it makes a new build and moves the tag to
+it, and the new record names that build. On Daytona, snapshot names are unique:
+an active snapshot under the name is recorded as it is, an inactive one is
+activated, and a failed one is deleted and built again. A build whose record was
+never written, for example because the process died, is recovered by running the
+build again.
+
+A sandbox is only used if it runs exactly the recorded build. On E2B every build
+of a template shares the template ID and a sandbox does not report its build, so
+the tag must still point at the recorded build ID when the sandbox is created.
+On Daytona the sandbox's snapshot must have the recorded snapshot ID, which
+changes if the snapshot is deleted and rebuilt under the same name.
 
 ## What the smoke test checks
 
@@ -50,7 +65,6 @@ uploads `guest/observe.ts` and `guest/fixture.html`, and runs the observer with
 the image's own Deno. The observer only reports what it sees; the host judges
 it. A run passes when:
 
-- the sandbox reports the recorded template or snapshot ID
 - the provider reports 2 vCPUs and 4096 MiB
 - inside the guest, the tightest of `nproc` and every cgroup `cpu.max` up to the
   root is 2, and the tightest of `MemTotal` and every cgroup `memory.max` is
@@ -63,16 +77,28 @@ it. A run passes when:
 - no Chromium process is left once the browser exits (after a 5 second grace
   period; anything left is killed and reported), and the profile directory is
   gone
-- every sandbox labelled with the run ID was destroyed
+- every sandbox the run created was destroyed, confirmed by looking each one up
+  by ID
 
 Chromium runs with `--no-sandbox` on both providers: the sandbox is the
-isolation boundary, and the same flags keep the two runs comparable.
+isolation boundary, and the same flags keep the two runs comparable. The
+observer runs as `user` on E2B, whose Dockerfile conversion adds that user, and
+as root on Daytona.
 
 The smoke test destroys every sandbox carrying its run label, so a sandbox whose
-create response was lost is destroyed too. A create the provider has not yet
-listed when the run ends is left to the provider: E2B kills it after 15 minutes,
-and Daytona stops it after 15 idle minutes and deletes it because it is
-ephemeral. Templates and snapshots are kept; they are what the records point at.
+create response was lost is destroyed too, and the sandbox it started even if
+the label listing does not show it yet. Listings lag: Daytona's has been seen
+reporting a sandbox as running after it was deleted. So the test does not list
+again to confirm cleanup; it looks up each destroyed sandbox by ID until the
+provider reports it gone. A create the provider has not listed when the run
+ends, and whose response was lost, is left to the provider: E2B kills it after
+15 minutes, and Daytona stops it after 15 idle minutes and deletes it because it
+is ephemeral. Templates and snapshots are kept; they are what the records point
+at.
+
+On the recorded images, an E2B sandbox is a microVM whose kernel sees 2 CPUs and
+3803 MiB. A Daytona sandbox is a container that sees all of the host's CPUs,
+held to 2 CPUs and 4096 MiB by its cgroup.
 
 The report is written to `bench-results/env-<timestamp>/<provider>.json`.
 

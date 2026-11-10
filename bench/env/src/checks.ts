@@ -1,6 +1,5 @@
 import type { CgroupLimits, Observation } from "../guest/observe.ts";
 import type { Environment, Resources } from "./environment.ts";
-import type { ImageRecord } from "./provider.ts";
 
 export type Check = {
     name: string;
@@ -9,7 +8,7 @@ export type Check = {
     observed: string;
 };
 
-export type GuestFacts = { image_id: string; reported: Resources };
+export type GuestFacts = { reported: Resources };
 
 // A VM guest kernel sees only its vCPUs and memory; a container sees the host's
 // and is limited by its cgroups. The effective limit is the tightest of both.
@@ -20,7 +19,8 @@ export function effectiveCpus(nproc: number, cgroups: CgroupLimits[]): number {
     for (const { cpu_max } of cgroups) {
         const [quota, period] = (cpu_max ?? "max").split(" ");
         if (quota === "max" || !quota || !period) continue;
-        cpus = Math.min(cpus, Math.ceil(Number(quota) / Number(period)));
+        // Exact, not rounded: a 1.5 CPU quota is not 2 vCPUs.
+        cpus = Math.min(cpus, Number(quota) / Number(period));
     }
     return cpus;
 }
@@ -51,7 +51,6 @@ const resources = (value: Resources) =>
 
 export function evaluate(
     environment: Environment,
-    record: ImageRecord,
     guest: GuestFacts,
     observation: Observation,
 ): Check[] {
@@ -67,13 +66,10 @@ export function evaluate(
     // The user agent is reduced to the major version; `--version` pins the
     // full one.
     const agent = `HeadlessChrome/${chromium.version.split(".")[0]}.`;
+    const fixture_ran = run.exit_code === 0 && !run.timed_out &&
+        run.dom.includes("fixture script ran") && run.dom.includes(agent) &&
+        run.fixture_requests.includes("GET /");
     return [
-        check(
-            "sandbox runs the recorded image",
-            guest.image_id === record.image.id,
-            record.image.id,
-            guest.image_id,
-        ),
         check(
             "provider reports the pinned resources",
             guest.reported.vcpus === want.vcpus &&
@@ -107,16 +103,17 @@ export function evaluate(
         ),
         check(
             "headless Chromium ran the local fixture",
-            run.exit_code === 0 && !run.timed_out &&
-                run.dom.includes("fixture script ran") &&
-                run.dom.includes(agent) &&
-                run.fixture_requests.includes("GET /"),
+            fixture_ran,
             `exit 0, fixture script ran, ${agent}, GET / served`,
             run.timed_out
                 ? "timed out"
                 : `exit ${run.exit_code}, requests ${
                     run.fixture_requests.join(", ") || "none"
-                }, stderr: ${run.stderr_tail.trim().slice(-300)}`,
+                }${
+                    fixture_ran
+                        ? ""
+                        : `, stderr: ${run.stderr_tail.trim().slice(-300)}`
+                }`,
         ),
         check(
             "no Chromium process outlived the run",

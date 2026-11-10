@@ -7,9 +7,12 @@ import chromium from "../../browser/chromium.json" with { type: "json" };
 import type { Observation } from "../guest/observe.ts";
 import { CredentialInArtifact, serializeArtifact } from "../src/artifacts.ts";
 import { effectiveCpus, effectiveMemoryMib, evaluate } from "../src/checks.ts";
+import { daytonaSnapshotName } from "../src/daytona.ts";
+import { e2bRef } from "../src/e2b.ts";
 import { browserEnvironment } from "../src/environment.ts";
 import {
     type Guest,
+    ImageMismatch,
     type ImageRecord,
     inputSha256,
     type Owner,
@@ -65,15 +68,11 @@ async function recordFor(provider: Provider): Promise<ImageRecord> {
 }
 
 const facts = {
-    image_id: "image-1",
     reported: { vcpus: 2, memory_mib: 4096 },
 };
 
 function failed(observation: Observation, guest = facts): string[] {
-    const record = {
-        image: { id: "image-1" },
-    } as ImageRecord;
-    return evaluate(environment, record, guest, observation)
+    return evaluate(environment, guest, observation)
         .filter((check) => !check.ok)
         .map((check) => check.name);
 }
@@ -141,7 +140,7 @@ Deno.test("limits are the tightest of what the kernel and every cgroup allow", (
             { path: "/a", cpu_max: "400000 100000", memory_max: null },
             { path: "/", cpu_max: "150000 100000", memory_max: null },
         ]),
-        2,
+        1.5,
     );
     assert.equal(effectiveMemoryMib(16 * 1024 * 1024, container.cgroups), 4096);
     assert.equal(effectiveMemoryMib(3911568, container.cgroups), 3819);
@@ -174,9 +173,18 @@ Deno.test("each way a sandbox can differ from the environment fails its own chec
         }),
         ["provider reports the pinned resources"],
     );
-    assert.deepEqual(failed(container, { ...facts, image_id: "image-2" }), [
-        "sandbox runs the recorded image",
-    ]);
+    assert.deepEqual(
+        failed({
+            ...container,
+            nproc: 8,
+            cgroups: [{
+                path: "/",
+                cpu_max: "150000 100000",
+                memory_max: null,
+            }],
+        }),
+        ["guest is limited to the pinned vCPUs"],
+    );
     assert.deepEqual(failed({ ...container, deno_version: "2.9.6" }), [
         "Deno is the pinned version",
     ]);
@@ -215,7 +223,11 @@ type FakeCloud = {
     destroyed: string[];
     faults: {
         create_response_lost: boolean;
+        image_moved: boolean;
         destroy_fails: boolean;
+        // The listing is a stale view: it still shows destroyed sandboxes and
+        // does not show new ones yet.
+        listing_stale: boolean;
         observer_output: string;
     };
 };
@@ -227,7 +239,9 @@ function fakeProvider(): Provider & { cloud: FakeCloud } {
         destroyed: [],
         faults: {
             create_response_lost: false,
+            image_moved: false,
             destroy_fails: false,
+            listing_stale: false,
             observer_output: JSON.stringify(container),
         },
     };
@@ -245,9 +259,13 @@ function fakeProvider(): Provider & { cloud: FakeCloud } {
             if (cloud.faults.create_response_lost) {
                 return Promise.reject(new Error("socket hang up"));
             }
+            if (cloud.faults.image_moved) {
+                return Promise.reject(
+                    new ImageMismatch("fake", image.id, "image-2"),
+                );
+            }
             return Promise.resolve({
                 id,
-                image_id: image.id,
                 reported: { vcpus: 2, memory_mib: 4096 },
                 write: () => Promise.resolve(),
                 exec: () =>
@@ -258,12 +276,16 @@ function fakeProvider(): Provider & { cloud: FakeCloud } {
                     }),
             });
         },
-        owned: (owner) =>
-            Promise.resolve(
+        owned(owner) {
+            if (cloud.faults.listing_stale) {
+                return Promise.resolve([...cloud.destroyed]);
+            }
+            return Promise.resolve(
                 [...cloud.sandboxes]
                     .filter(([, labels]) => matches(labels, owner))
                     .map(([id]) => id),
-            ),
+            );
+        },
         destroy(id) {
             if (cloud.faults.destroy_fails) {
                 return Promise.reject(new Error("service unavailable"));
@@ -293,7 +315,7 @@ Deno.test("a smoke run observes the guest, passes, and destroys only its own san
     assert.ok(report.passed, JSON.stringify(report.checks, null, 2));
     assert.deepEqual(report.release, {
         destroyed: ["sandbox-1"],
-        remaining: [],
+        failed: [],
     });
     assert.deepEqual([...provider.cloud.sandboxes.keys()], ["someone-else"]);
 });
@@ -315,7 +337,7 @@ Deno.test("a sandbox whose create response was lost is still destroyed, and the 
     assert.deepEqual(provider.cloud.destroyed, ["sandbox-1"]);
     assert.deepEqual(report.release, {
         destroyed: ["sandbox-1"],
-        remaining: [],
+        failed: [],
     });
 });
 
@@ -332,7 +354,7 @@ Deno.test("a run that cannot destroy its sandbox fails even when every check pas
     );
 
     assert.equal(report.passed, false);
-    assert.deepEqual(report.release, { error: "service unavailable" });
+    assert.deepEqual(report.release, { destroyed: [], failed: ["sandbox-1"] });
     assert.deepEqual(
         report.checks.filter((check) => !check.ok).map((check) => check.name),
         ["every sandbox this run created was destroyed"],
@@ -401,4 +423,47 @@ Deno.test("an artifact that would contain a credential is refused", () => {
     assert.doesNotThrow(() =>
         serializeArtifact("report.json", report, { DAYTONA_API_KEY: "" })
     );
+});
+
+Deno.test("a sandbox that would not run the recorded build fails the run and is destroyed", async () => {
+    const provider = fakeProvider();
+    provider.cloud.faults.image_moved = true;
+
+    const report = await smoke(
+        provider,
+        environment,
+        await recordFor(provider),
+        files,
+        "run-6",
+    );
+
+    assert.equal(report.passed, false);
+    assert.match(report.failure ?? "", /would not run the recorded image/);
+    assert.equal(report.observation, null);
+    assert.deepEqual(provider.cloud.destroyed, ["sandbox-1"]);
+});
+
+Deno.test("images are named by their input digest, once", () => {
+    const digest = "9853e4b677dd" + "0".repeat(52);
+    assert.deepEqual(e2bRef(digest), {
+        ref: "slop-browser:9853e4b677dd",
+        tag: "9853e4b677dd",
+    });
+    assert.equal(daytonaSnapshotName(digest), "slop-browser-9853e4b677dd");
+});
+
+Deno.test("the sandbox a run started is destroyed even when the listing is stale", async () => {
+    const provider = fakeProvider();
+    provider.cloud.faults.listing_stale = true;
+
+    const first = await smoke(
+        provider,
+        environment,
+        await recordFor(provider),
+        files,
+        "run-7",
+    );
+    assert.ok(first.passed, JSON.stringify(first.checks, null, 2));
+    assert.deepEqual(provider.cloud.destroyed, ["sandbox-1"]);
+    assert.equal(provider.cloud.sandboxes.size, 0);
 });

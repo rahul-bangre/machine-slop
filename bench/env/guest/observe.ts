@@ -183,12 +183,15 @@ export async function observe(
     const chromium_version = await command(chromium, ["--version"]);
     const profile = await Deno.makeTempDir({ prefix: "env-smoke-profile-" });
     let run: ChromiumRun;
+    let leftover_chromium_pids: number[];
     try {
         run = await openFixture(chromium, fixture, profile);
     } finally {
+        // Reap first, so no helper process writes into the profile after it
+        // is removed.
+        leftover_chromium_pids = await reapChromium(install_root);
         await Deno.remove(profile, { recursive: true }).catch(() => {});
     }
-    const leftover_chromium_pids = await reapChromium(install_root);
     const profile_removed = await Deno.stat(profile).then(
         () => false,
         (error) => error instanceof Deno.errors.NotFound,

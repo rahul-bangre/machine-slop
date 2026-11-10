@@ -1,16 +1,40 @@
-import { CommandExitError, Sandbox, Template } from "e2b";
+import { CommandExitError, Sandbox, SandboxNotFoundError, Template } from "e2b";
 
 import {
     type BuiltImage,
     type Guest,
+    ImageMismatch,
     type Owner,
     type Provider,
     requireEnv,
+    untilGone,
 } from "./provider.ts";
 
 const template_name = "slop-browser";
 // A sandbox the smoke run loses track of is killed by E2B after this long.
 const sandbox_lifetime_ms = 15 * 60_000;
+
+export function e2bRef(input_sha256: string): { ref: string; tag: string } {
+    const tag = input_sha256.slice(0, 12);
+    return { ref: `${template_name}:${tag}`, tag };
+}
+
+// Every build of a template shares its template ID, and a sandbox does not
+// report which build it runs. The tag is what selects the build, so it must
+// still name the recorded one when the sandbox is created.
+async function requireTaggedBuild(image: BuiltImage): Promise<void> {
+    const tag = image.details.tag;
+    const tags = await Template.getTags(image.id);
+    const current = tags.find((entry) => entry.tag === tag)?.buildId ??
+        "no build";
+    if (current !== image.details.build_id) {
+        throw new ImageMismatch(
+            "e2b",
+            `${image.ref} at build ${image.details.build_id}`,
+            current,
+        );
+    }
+}
 
 export function e2bProvider(): Provider {
     requireEnv("E2B_API_KEY", "e2b");
@@ -18,13 +42,13 @@ export function e2bProvider(): Provider {
         name: "e2b",
         sdk: "e2b@2.63.0",
         build_settings: { template_name },
+        // Rebuilding with the same inputs is safe: it makes a new build and
+        // moves the tag to it, and the record written afterwards names it.
         async build(environment, input_sha256) {
-            // The tag names this exact build, so later builds of the template
-            // cannot change what the record points at.
-            const tag = input_sha256.slice(0, 12);
+            const { ref, tag } = e2bRef(input_sha256);
             const built = await Template.build(
                 Template().fromDockerfile(environment.dockerfile),
-                `${template_name}:${tag}`,
+                ref,
                 {
                     cpuCount: environment.resources.vcpus,
                     memoryMB: environment.resources.memory_mib,
@@ -32,21 +56,24 @@ export function e2bProvider(): Provider {
                 },
             );
             return {
-                ref: `${built.name}:${tag}`,
+                ref,
                 id: built.templateId,
                 details: { build_id: built.buildId, tag },
             };
         },
         async start(image: BuiltImage, owner: Owner): Promise<Guest> {
+            await requireTaggedBuild(image);
             const sandbox = await Sandbox.create(image.ref, {
                 metadata: owner,
                 timeoutMs: sandbox_lifetime_ms,
                 allowInternetAccess: false,
             });
             const info = await sandbox.getInfo();
+            if (info.templateId !== image.id) {
+                throw new ImageMismatch("e2b", image.id, info.templateId);
+            }
             return {
                 id: sandbox.sandboxId,
-                image_id: info.templateId,
                 reported: { vcpus: info.cpuCount, memory_mib: info.memoryMB },
                 async write(path, content) {
                     await sandbox.files.write(path, content);
@@ -82,6 +109,19 @@ export function e2bProvider(): Provider {
         },
         async destroy(id) {
             await Sandbox.kill(id);
+            await untilGone(
+                id,
+                () =>
+                    Sandbox.getInfo(id).then(
+                        () => false,
+                        (error) => {
+                            if (error instanceof SandboxNotFoundError) {
+                                return true;
+                            }
+                            throw error;
+                        },
+                    ),
+            );
         },
     };
 }

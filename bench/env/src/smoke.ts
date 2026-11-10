@@ -14,7 +14,8 @@ const observe_timeout_ms = 180_000;
 
 export type GuestFiles = { observer: string; fixture: string };
 
-export type Release = { destroyed: string[]; remaining: string[] };
+// `failed` holds every sandbox whose destruction could not be confirmed.
+export type Release = { destroyed: string[]; failed: string[] };
 
 export type SmokeReport = {
     provider: string;
@@ -53,6 +54,10 @@ async function observeIn(
 ): Promise<Observation> {
     const observer = `${guest_directory}/observe.ts`;
     const fixture = `${guest_directory}/fixture.html`;
+    const made = await guest.exec(`mkdir -p ${guest_directory}`, 30_000);
+    if (made.exit_code !== 0) {
+        throw new Error(`cannot create ${guest_directory}: ${made.output}`);
+    }
     await guest.write(observer, files.observer);
     await guest.write(fixture, files.fixture);
     const result = await guest.exec(
@@ -70,12 +75,30 @@ async function observeIn(
     return JSON.parse(last_line);
 }
 
-// Destroys every sandbox labelled with this run's owner, including one whose
-// create response was lost, then confirms none is left.
-async function release(provider: Provider, owner: Owner): Promise<Release> {
-    const destroyed = await provider.owned(owner);
-    for (const id of destroyed) await provider.destroy(id);
-    return { destroyed, remaining: await provider.owned(owner) };
+// Destroys every sandbox labelled with this run's owner, which includes one
+// whose create response was lost, and the sandbox it started, which a
+// provider's listing may not show yet. A listing can also still show a sandbox
+// after it is gone, so each destruction is confirmed by its own ID instead of
+// by listing again.
+async function release(
+    provider: Provider,
+    owner: Owner,
+    started: string | null,
+): Promise<Release> {
+    const ids = new Set(await provider.owned(owner));
+    if (started) ids.add(started);
+    const destroyed: string[] = [];
+    const failed: string[] = [];
+    for (const id of ids) {
+        try {
+            await provider.destroy(id);
+            destroyed.push(id);
+        } catch (error) {
+            console.error(`cannot destroy ${id}: ${error}`);
+            failed.push(id);
+        }
+    }
+    return { destroyed, failed };
 }
 
 export async function smoke(
@@ -90,32 +113,37 @@ export async function smoke(
     }
     const owner = { "env-smoke-run": run_id };
     let guest: SmokeReport["guest"] = null;
+    let started_id: string | null = null;
     let observation: Observation | null = null;
     let failure: string | null = null;
     try {
         const started = await provider.start(record.image, owner);
+        started_id = started.id;
         guest = {
             id: started.id,
-            image_id: started.image_id,
             reported: started.reported,
         };
         observation = await observeIn(started, environment, files);
     } catch (error) {
         failure = error instanceof Error ? error.message : String(error);
     }
-    const released = await release(provider, owner).catch((error) => ({
+    const released = await release(provider, owner, started_id).catch((
+        error,
+    ) => ({
         error: error instanceof Error ? error.message : String(error),
     }));
 
     const checks = guest && observation
-        ? evaluate(environment, record, guest, observation)
+        ? evaluate(environment, guest, observation)
         : [];
     checks.push({
         name: "every sandbox this run created was destroyed",
-        ok: "remaining" in released && released.remaining.length === 0,
-        expected: "none left",
-        observed: "remaining" in released
-            ? released.remaining.join(", ") || "none left"
+        ok: "failed" in released && released.failed.length === 0,
+        expected: "every one confirmed gone",
+        observed: "failed" in released
+            ? (released.failed.length
+                ? `not confirmed: ${released.failed.join(", ")}`
+                : `${released.destroyed.length} confirmed gone`)
             : released.error,
     });
     return {

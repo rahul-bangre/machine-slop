@@ -1,0 +1,18 @@
+{
+  "provider": "daytona",
+  "sdk": "@daytona/sdk@0.231.0",
+  "input_sha256": "fe5a70d46567db28fa5a4c1b9e3d4826e99261992e9c2ed7d55372501adcfd7d",
+  "resources": {
+    "vcpus": 2,
+    "memory_mib": 4096
+  },
+  "image": {
+    "ref": "slop-browser-fe5a70d46567",
+    "id": "4747d9f7-6cff-4b88-9f53-9c0fc424310d",
+    "details": {
+      "image_ref": "cr.app.daytona.io/sbox/daytona-680c25b782589a7d67e518dc70b67429d636560c6a88fbf70fcf66009a60ee4d:daytona",
+      "build_ref": "daytona-680c25b782589a7d67e518dc70b67429d636560c6a88fbf70fcf66009a60ee4d:daytona"
+    }
+  },
+  "built_at": "2026-11-10T06:46:20.425Z"
+}
