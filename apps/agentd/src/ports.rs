@@ -1,4 +1,7 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -15,6 +18,7 @@ use tokio::{
 use crate::error::ApiError;
 
 const PROTOCOL: &str = "tcp";
+const LINGER_AFTER_CLIENT_ENDS: Duration = Duration::from_secs(1);
 
 pub async fn tunnel(Path(port): Path<u16>, mut request: Request) -> Result<Response, ApiError> {
     if !requests_tcp_upgrade(request.headers()) {
@@ -60,7 +64,14 @@ async fn relay_until_either_side_ends(
     let (mut from_client, mut to_client) = tokio::io::split(client);
     let (mut from_target, mut to_target) = target.split();
     tokio::select! {
-        _ = tokio::io::copy(&mut from_client, &mut to_target) => {}
+        _ = tokio::io::copy(&mut from_client, &mut to_target) => {
+            let _ = to_target.shutdown().await;
+            let _ = tokio::time::timeout(
+                LINGER_AFTER_CLIENT_ENDS,
+                tokio::io::copy(&mut from_target, &mut tokio::io::sink()),
+            )
+            .await;
+        }
         _ = async {
             let _ = tokio::io::copy(&mut from_target, &mut to_client).await;
             let _ = to_client.shutdown().await;

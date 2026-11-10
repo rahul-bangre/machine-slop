@@ -80,10 +80,12 @@ the port on the machine's loopback, `127.0.0.1` then `::1`, and answers 101 only
 once that connection is open. The HTTP connection then carries raw bytes both
 ways. When either side ends its stream, the tunnel ends: bytes the port sent
 before closing reach the client first, and a client that closes, or only
-half-closes, its sending side closes the port's connection. Firecracker's vsock
-cannot carry a half-close, so no hop relies on one. A port with no listener
-returns 502, and a request without the upgrade headers 426. `machined` passes
-the upgrade through, so this works for hosted machines too.
+half-closes, its sending side closes the port's connection after its bytes are
+delivered; anything the port sends while that close settles, at most one second,
+is discarded. Firecracker's vsock cannot carry a half-close, so no hop relies on
+one. A port with no listener returns 502, and a request without the upgrade
+headers 426. `machined` passes the upgrade through, so this works for hosted
+machines too.
 
 `machine.connect(port)` returns the tunnel as a readable and writable stream
 pair. `machine.forward(port, localPort?)` listens on `127.0.0.1` and opens a

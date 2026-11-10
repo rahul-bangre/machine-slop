@@ -118,3 +118,48 @@ Deno.test("a port with no listener is a gateway error, and plain requests need a
         assert.equal(response.status, 426);
         await response.body?.cancel();
     }));
+
+Deno.test("a client's bytes reach a port that is writing when the client ends", () =>
+    withMachine(async (machine) => {
+        const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+        const upload = new Uint8Array(4 * 1024 * 1024).fill(7);
+        try {
+            for (let attempt = 0; attempt < 10; attempt++) {
+                const received = (async () => {
+                    const conn = await listener.accept();
+                    const chatter = (async () => {
+                        const chunk = new Uint8Array(4096);
+                        try {
+                            while (true) await conn.write(chunk);
+                        } catch {
+                            return;
+                        }
+                    })();
+                    const buffer = new Uint8Array(64 * 1024);
+                    let total = 0;
+                    let count;
+                    while ((count = await conn.read(buffer)) !== null) {
+                        total += count;
+                    }
+                    conn.close();
+                    await chatter;
+                    return total;
+                })();
+                const tunnel = await machine.connect(listener.addr.port);
+                const draining = tunnel.readable.pipeTo(new WritableStream())
+                    .catch(() => {});
+                const writer = tunnel.writable.getWriter();
+                await writer.write(upload);
+                await writer.close();
+                assert.equal(
+                    await received,
+                    upload.byteLength,
+                    `attempt ${attempt}`,
+                );
+                await draining;
+                tunnel.close();
+            }
+        } finally {
+            listener.close();
+        }
+    }));
