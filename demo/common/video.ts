@@ -56,8 +56,11 @@ export function inlineRun(
     events: Record<string, unknown>[],
 ): string {
     const data = JSON.stringify({ events }).replaceAll("<", "\\u003c");
+    if (!/<script>\s*const RUN/.test(dashboard)) {
+        throw new Error("Dashboard is missing its run data entry point");
+    }
     return dashboard.replace(
-        "<script>\nconst RUN",
+        /<script>\s*const RUN/,
         () => `<script>window.RUN = ${data};</script>\n<script>\nconst RUN`,
     );
 }
@@ -161,7 +164,11 @@ export async function recordRun(options: {
     try {
         const page = await browser.page({ width: 1920, height: 1080 });
         await page.goto(`file://${options.run_dir}/video.html`, 1500);
-        console.log("images preloaded:", await page.evaluate("window.ready"));
+        const ready = await page.evaluate("window.ready");
+        if (ready === undefined) {
+            throw new Error("Dashboard did not initialize");
+        }
+        console.log("images preloaded:", ready);
         const stills = Deno.env.get("STILLS");
         if (stills) {
             await writeStills(

@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Machine Slop — Fork the future</title>
+    <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      background: #080c0d;
+      overflow: hidden;
+    }
+    canvas {
+      width: 1920px;
+      height: 1080px;
+      display: block;
+    }
+    </style>
+  </head>
+  <body>
+    <canvas id="film" width="1920" height="1080"></canvas>
+    <script>
+    const RUN = window.RUN;
+    const bundle = RUN.events[0];
+    const race = bundle.race, research = bundle.research;
+    const canvas = document.getElementById("film"), g = canvas.getContext("2d");
+    const C = {
+      paper: "#eeeee5",
+      ink: "#10191a",
+      dim: "#81908c",
+      lime: "#d5ff5f",
+      blue: "#8dbdff",
+      line: "#2b3736",
+      muted: "#a3aea6",
+    };
+    const colors = [
+      C.lime,
+      C.blue,
+      "#ffb4a1",
+      "#c8b0ff",
+      "#7ee0ba",
+      "#ffd083",
+      "#ff9bc4",
+      "#a5dcec",
+      "#d1d7ae",
+      "#b6b6ff",
+    ];
+    const checkpoint = race.find((e) => e.type === "checkpoint");
+    const maze = race.find((e) => e.maze).maze;
+    const forked = race.find((e) => e.type === "forked");
+    const pause = race.find((e) => e.type === "pause_start");
+    const winner = race.find((e) => e.type === "winner");
+    const branch = race.find((e) => e.type === "branch");
+    const originProcess = race.find((e) => e.type === "process");
+    const images = new Map();
+    window.ready = Promise.all(
+      Object.entries(bundle.images).map(([file, src]) =>
+        new Promise((resolve) => {
+          const im = new Image();
+          im.onload = () => {
+            images.set(file, im);
+            resolve(true);
+          };
+          im.onerror = () => resolve(false);
+          im.src = src;
+        })
+      ),
+    );
+    const clamp = (v) => Math.max(0, Math.min(1, v));
+    const ease = (v) => 1 - Math.pow(1 - clamp(v), 3);
+    const lerp = (a, b, t) => a + (b - a) * t;
+    function rect(x, y, w, h, color, r = 0) {
+      g.fillStyle = color;
+      g.beginPath();
+      g.roundRect(x, y, w, h, r);
+      g.fill();
+    }
+    function line(x, y, a, b, color, width = 1) {
+      g.strokeStyle = color;
+      g.lineWidth = width;
+      g.beginPath();
+      g.moveTo(x, y);
+      g.lineTo(a, b);
+      g.stroke();
+    }
+    function text(
+      s,
+      x,
+      y,
+      size = 28,
+      color = C.paper,
+      weight = 400,
+      align = "left",
+      mono = false,
+    ) {
+      g.font = `${weight} ${size}px ${
+        mono ? '"DejaVu Sans Mono"' : '"Liberation Sans"'
+      }`;
+      g.fillStyle = color;
+      g.textAlign = align;
+      g.textBaseline = "alphabetic";
+      g.fillText(s, x, y);
+    }
+    function circle(x, y, r, color) {
+      g.fillStyle = color;
+      g.beginPath();
+      g.arc(x, y, r, 0, Math.PI * 2);
+      g.fill();
+    }
+    function pill(s, x, y, color = C.lime) {
+      g.font = '500 19px "DejaVu Sans Mono"';
+      const w = g.measureText(s).width + 36;
+      rect(x, y - 27, w, 40, color, 20);
+      text(s, x + 18, y, 19, color === C.ink ? C.paper : C.ink, 500, "left", true);
+    }
+    function background(light = false) {
+      rect(0, 0, 1920, 1080, light ? C.paper : "#080e0f");
+      for (let x = 48; x < 1920; x += 48) {
+        for (let y = 48; y < 1080; y += 48) {
+          circle(x, y, 0.8, light ? "#cbd0c4" : "#23302d");
+        }
+      }
+    }
+    function chrome(
+      section,
+      light = false,
+      proof = "RECORDED RUN / LOCAL 2-vCPU HOST",
+    ) {
+      const fg = light ? C.ink : C.paper;
+      text("machine/slop", 64, 62, 25, fg, 700);
+      text(section, 1856, 62, 20, light ? "#5f6c61" : C.muted, 400, "right", true);
+      line(64, 85, 1856, 85, light ? "#c8cec1" : C.line);
+      text(proof, 64, 1033, 17, light ? "#65705e" : C.muted, 400, "left", true);
+      text(
+        "FORK THE FUTURE",
+        1856,
+        1033,
+        17,
+        light ? "#65705e" : C.muted,
+        400,
+        "right",
+        true,
+      );
+    }
+    function heading(kicker, first, second, t, light = false) {
+      const fg = light ? C.ink : C.paper;
+      const y = lerp(22, 0, ease(t / 650));
+      text(kicker, 76, 160 + y, 22, light ? "#5f7056" : C.lime, 500, "left", true);
+      text(first, 70, 277 + y, 110, fg, 700);
+      if (second) text(second, 70, 390 + y, 110, fg, 700);
+    }
+    function state(lane, t) {
+      const base = lane === "origin" ? [] : checkpoint.path.map((p) => p.slice());
+      let path = base.length ? base : [[0, 0]],
+        step = lane === "origin" ? 0 : checkpoint.s;
+      let found = false;
+      for (const e of race) {
+        if (e.type !== "out" || e.lane !== lane || e.t > t) continue;
+        if (e.go) path.push(e.go);
+        if (e.back) {
+          const i = path.findLastIndex((p) =>
+            p[0] === e.back[0] && p[1] === e.back[1]
+          );
+          if (i >= 0) path = path.slice(0, i + 1);
+        }
+        if (e.s !== undefined) step = e.s;
+        if (e.found) found = true;
+      }
+      return { path, step, found };
+    }
+    function mazeCard(lane, x, y, w, h, t, color, freeze = false, alpha = 1) {
+      g.save();
+      g.globalAlpha = alpha;
+      rect(x, y, w, h, "#15201f", 12);
+      rect(x + 1, y + 1, w - 2, 38, "#1b2926", 11);
+      const idx = lane === "origin" ? "SOURCE" : lane.replace("copy-", "VM ");
+      text(idx, x + 16, y + 26, 14, color, 600, "left", true);
+      const s = freeze
+        ? { path: checkpoint.path, step: checkpoint.s, found: false }
+        : state(lane, t);
+      text(`STEP ${s.step}`, x + w - 15, y + 26, 12, "#a5b2a6", 400, "right", true);
+      const ox = x + 14, oy = y + 53, cw = (w - 28) / 32, ch = (h - 76) / 18;
+      g.strokeStyle = "#34423d";
+      g.lineWidth = Math.max(1, cw * .32);
+      g.beginPath();
+      for (const wall of maze) {
+        g.moveTo(ox + (wall[0] + .5) * cw, oy + (wall[1] + .5) * ch);
+        g.lineTo(ox + (wall[2] + .5) * cw, oy + (wall[3] + .5) * ch);
+      }
+      g.stroke();
+      g.strokeStyle = color;
+      g.lineWidth = Math.max(2, cw * .26);
+      g.lineJoin = "round";
+      g.lineCap = "round";
+      g.beginPath();
+      s.path.forEach((p, i) => {
+        const xx = ox + (p[0] + .5) * cw, yy = oy + (p[1] + .5) * ch;
+        i ? g.lineTo(xx, yy) : g.moveTo(xx, yy);
+      });
+      g.stroke();
+      const end = s.path[s.path.length - 1];
+      circle(
+        ox + (end[0] + .5) * cw,
+        oy + (end[1] + .5) * ch,
+        Math.max(3, cw * .25),
+        color,
+      );
+      rect(ox + 31 * cw, oy + 17 * ch, cw, ch, C.paper, 2);
+      if (s.found) pill("FOUND", x + w - 103, y + h - 14, color);
+      g.restore();
+    }
+    function grid(vt, real, freeze = false) {
+      for (let i = 0; i < 10; i++) {
+        const u = ease((vt - i * 65) / 1400);
+        const tx = 70 + (i % 5) * 358, ty = 355 + Math.floor(i / 5) * 290;
+        mazeCard(
+          `copy-${i + 1}`,
+          lerp(486, tx, u),
+          lerp(284, ty, u),
+          lerp(948, 344, u),
+          lerp(570, 267, u),
+          real,
+          colors[i],
+          freeze,
+          lerp(i === 0 ? 1 : 0, 1, u),
+        );
+      }
+    }
+    function browserFrame(lane, real, x, y, w, h, label, color = C.lime, fallback) {
+      const events = research.filter((e) =>
+        e.type === "frame" && e.lane === lane && e.t <= real
+      );
+      const frame = events[events.length - 1] || fallback;
+      rect(x, y, w, h, "#fcfcf8", 13);
+      rect(x, y, w, 48, "#21302b", 12);
+      circle(x + 20, y + 24, 5, "#fa9c8c");
+      circle(x + 37, y + 24, 5, "#efce7a");
+      circle(x + 54, y + 24, 5, "#b8d48e");
+      text(label, x + 78, y + 31, 17, color, 500, "left", true);
+      if (frame) {
+        const im = images.get(frame.file);
+        if (im) {
+          g.save();
+          g.beginPath();
+          g.rect(x + 1, y + 48, w - 2, h - 49);
+          g.clip();
+          const scale = w / im.width;
+          g.drawImage(im, x, y + 48, w, im.height * scale);
+          g.restore();
+        }
+        const url = String(frame.url).replace("https://", "");
+        rect(x + 12, y + h - 41, w - 24, 30, "#ecf0e8", 4);
+        text(
+          url.length > Math.floor(w / 10)
+            ? url.slice(0, Math.floor(w / 10) - 2) + "…"
+            : url,
+          x + 22,
+          y + h - 20,
+          14,
+          "#314637",
+          400,
+          "left",
+          true,
+        );
+      }
+    }
+    function forkGraph(t, y = 465) {
+      const amount = ease(t / 1200);
+      circle(160, y, 13, C.lime);
+      line(174, y, 620, y, C.lime, 5);
+      for (let i = 0; i < 3; i++) {
+        const end = 390 + i * 150;
+        g.strokeStyle = colors[i];
+        g.lineWidth = 5;
+        g.beginPath();
+        g.moveTo(620, y);
+        g.bezierCurveTo(
+          800,
+          y,
+          800,
+          lerp(y, end, amount),
+          1010,
+          lerp(y, end, amount),
+        );
+        g.lineTo(1770, lerp(y, end, amount));
+        g.stroke();
+        circle(1770, lerp(y, end, amount), 12, colors[i]);
+      }
+      pill("MEMORY + DISK", 230, y - 35);
+      pill("CONVERSATION", 230, y + 65, C.blue);
+    }
+    function end(t) {
+      background(true);
+      const p = ease(t / 1600);
+      for (let i = 0; i < 8; i++) {
+        g.save();
+        g.translate(960, 560);
+        g.rotate((i - 3.5) * .08 * p);
+        rect(
+          -160 + (i - 3.5) * p * 56,
+          -100,
+          320,
+          210,
+          i === 7 ? C.ink : "#cbd7b0",
+          12,
+        );
+        g.restore();
+      }
+      text("machine/slop", 960, 287, 136, C.ink, 700, "center");
+      text("Fork the computer.", 960, 764, 66, C.ink, 700, "center");
+      text("Explore more futures.", 960, 842, 66, C.ink, 700, "center");
+      text(
+        "github.com/rahul-bangre/machine-slop",
+        960,
+        973,
+        28,
+        "#4c5e45",
+        400,
+        "center",
+        true,
+      );
+    }
+    window.renderAt = (_t, v) => {
+      const s = v / 1000;
+      g.clearRect(0, 0, 1920, 1080);
+      if (s < 6) {
+        background(true);
+        chrome("01 / ONE RUNNING COMPUTER", true);
+        heading(
+          "A PROCESS IS ALREADY RUNNING.",
+          "What if you could",
+          "fork this moment?",
+          v,
+          true,
+        );
+        const real = lerp(1600, pause.t, clamp((s - .8) / 5.2));
+        mazeCard("origin", 950, 425, 830, 500, real, C.lime);
+        text("Python is exploring a maze.", 78, 552, 34, C.ink, 500);
+        text("Its stack. Its memory. Its next move.", 78, 605, 27, "#5f7056");
+        pill("LIVE PROCESS", 80, 719);
+        text(
+          originProcess.id.slice(0, 18),
+          80,
+          790,
+          20,
+          "#5f7056",
+          400,
+          "left",
+          true,
+        );
+      } else if (s < 8) {
+        background();
+        chrome("02 / CHECKPOINT");
+        heading("KEEP EVERYTHING.", "Save this instant.", null, v - 6000);
+        mazeCard("origin", 486, 340, 948, 570, pause.t, C.lime, true);
+        pill(`PID ${checkpoint.pid}  /  STEP ${checkpoint.s}`, 76, 968);
+        text("Running memory + filesystem", 1850, 964, 27, C.muted, 400, "right");
+      } else if (s < 11.5) {
+        background();
+        chrome("03 / FORK");
+        text("ONE COMPUTER.", 70, 194, 84, C.paper, 700);
+        text("TEN POSSIBLE FUTURES.", 70, 287, 84, C.lime, 700);
+        grid(v - 8000, branch.t, true);
+        pill("SAME CHECKPOINT VERIFIED IN ALL 10", 72, 974);
+        text(
+          `${(forked.t - pause.t)} ms total · pause + snapshot + start`,
+          1850,
+          972,
+          23,
+          C.muted,
+          400,
+          "right",
+          true,
+        );
+      } else if (s < 23.5) {
+        background();
+        chrome("04 / INDEPENDENT MACHINES");
+        text("Same past.", 70, 208, 94, C.paper, 700);
+        text("Different decisions.", 70, 303, 94, C.lime, 700);
+        const real = lerp(branch.t, winner.t + 250, clamp((s - 11.5) / 11));
+        grid(20000, real);
+        const speed = (winner.t + 250 - branch.t) / 11000;
+        text(
+          `${speed.toFixed(2)}× playback · real process output`,
+          74,
+          975,
+          22,
+          C.muted,
+          400,
+          "left",
+          true,
+        );
+        text(
+          "10 × 128 MiB Firecracker VMs",
+          1850,
+          975,
+          22,
+          C.muted,
+          400,
+          "right",
+          true,
+        );
+      } else if (s < 28) {
+        background();
+        chrome("05 / A PATH FOUND");
+        const id = Number(winner.lane.replace("copy-", ""));
+        text("10", 70, 680, 530, C.lime, 700);
+        text("independent futures.", 750, 280, 71, C.paper, 700);
+        text("One shared beginning.", 750, 373, 59, C.paper, 500);
+        mazeCard(winner.lane, 750, 452, 1080, 443, winner.t, colors[id - 1]);
+        text(
+          `First result: VM ${id} · ${
+            ((winner.t - branch.t) / 1000).toFixed(2)
+          } s after branching`,
+          750,
+          968,
+          25,
+          C.muted,
+          400,
+          "left",
+          true,
+        );
+      } else if (s < 32) {
+        background(true);
+        chrome("06 / NOW ADD AN AGENT", true);
+        text("Now fork", 78, 390, 176, C.ink, 700);
+        text("the agent, too.", 78, 568, 176, C.ink, 700);
+        text("The conversation goes with the computer.", 84, 800, 43, "#5f7056");
+        pill("A REAL RESEARCH TASK", 86, 947, C.ink);
+      } else if (s < 38) {
+        background();
+        chrome(
+          "07 / RESEARCH ONCE",
+          false,
+          "RECORDED AGENT RUN / EDITED FOR LENGTH",
+        );
+        text("Read once.", 76, 219, 100, C.paper, 700);
+        text("Carry the context forward.", 76, 306, 64, C.lime, 500);
+        const real = lerp(14512, 62719, (s - 32) / 6);
+        browserFrame(
+          "main",
+          real,
+          710,
+          358,
+          1120,
+          610,
+          "ORIGINAL / CLAUDE OPUS 5.5",
+        );
+        text("Compare machine-slop", 78, 476, 42, C.paper, 500);
+        text("with E2B.", 78, 528, 42, C.paper, 500);
+        text("Research the three gaps.", 78, 641, 32, C.muted);
+        text("File one GitHub issue.", 78, 688, 32, C.muted);
+        text(
+          "Replay of recorded browser frames",
+          78,
+          938,
+          20,
+          C.muted,
+          400,
+          "left",
+          true,
+        );
+      } else if (s < 42) {
+        background();
+        chrome(
+          "08 / FORK MACHINE + CONVERSATION",
+          false,
+          "RECORDED AGENT RUN / EDITED FOR LENGTH",
+        );
+        text("Every copy remembers.", 74, 232, 104, C.paper, 700);
+        forkGraph(v - 38000, 560);
+        text("Same browser. Same files. Same history.", 78, 890, 42, C.muted);
+        text("Three independent continuations.", 78, 953, 42, C.lime);
+      } else if (s < 50) {
+        background();
+        chrome(
+          "09 / THREE INVESTIGATIONS",
+          false,
+          "RECORDED AGENT RUN / EDITED FOR LENGTH",
+        );
+        text("Explore in parallel.", 74, 215, 105, C.paper, 700);
+        const real = lerp(85490, 129455, clamp((s - 42) / 7));
+        const labels = [
+          "Custom templates",
+          "Persistent volumes",
+          "Code interpreter",
+        ];
+        for (let i = 0; i < 3; i++) {
+          const x = 70 + i * 603;
+          text(`0${i + 1}`, x, 312, 23, colors[i], 500, "left", true);
+          text(labels[i], x, 359, 37, C.paper, 600);
+          browserFrame(
+            String(i + 1),
+            real,
+            x,
+            395,
+            575,
+            504,
+            `AGENT ${i + 1}`,
+            colors[i],
+            research.find((e) => e.type === "frame" && e.lane === String(i + 1)),
+          );
+          const section = research.find((e) =>
+            e.type === "section" && e.lane === String(i + 1) && e.t <= real
+          );
+          pill(
+            section ? "SECTION COMPLETE" : "READING + WRITING",
+            x,
+            960,
+            colors[i],
+          );
+        }
+        rect(1120, 1007, 760, 45, "#080e0f");
+        text(
+          "Recorded 44 s of parallel research → 8 s edit",
+          1850,
+          1033,
+          17,
+          C.muted,
+          400,
+          "right",
+          true,
+        );
+      } else if (s < 55) {
+        background(true);
+        chrome(
+          "10 / BRING THE RESULTS BACK",
+          true,
+          "RECORDED AGENT RUN / EDITED FOR LENGTH",
+        );
+        text("Three branches.", 75, 242, 116, C.ink, 700);
+        text("One finished task.", 75, 370, 116, C.ink, 700);
+        const p = ease((s - 50) / 3);
+        for (let i = 0; i < 3; i++) {
+          const y = 570 + i * 130;
+          line(120, y, lerp(1100, 1550, p), lerp(y, 700, p), "#6b8052", 5);
+          circle(120, y, 12, C.ink);
+          text(
+            ["Templates", "Volumes", "Interpreter"][i],
+            155,
+            y - 24,
+            28,
+            C.ink,
+            500,
+          );
+        }
+        circle(1580, 700, 36, C.ink);
+        text("RESUME ORIGINAL", 1460, 855, 22, C.ink, 600, "left", true);
+        pill("Browser + agent context preserved", 82, 969);
+      } else if (s < 60) {
+        background();
+        chrome(
+          "11 / THE REAL RESULT",
+          false,
+          "RECORDED AGENT RUN / EDITED FOR LENGTH",
+        );
+        text("Shipped.", 70, 273, 142, C.lime, 700);
+        text("GitHub issue #29", 76, 374, 45, C.paper, 500);
+        text("Three researched sections.", 78, 523, 30, C.muted);
+        text("One original agent.", 78, 573, 30, C.muted);
+        text("Token injected by the host.", 78, 683, 28, C.paper);
+        text("Never inside the machine.", 78, 730, 28, C.paper);
+        browserFrame(
+          "main",
+          172000,
+          705,
+          194,
+          1125,
+          783,
+          "github.com / issues / 29",
+        );
+        text(
+          "Posted by the earlier recorded run",
+          78,
+          953,
+          19,
+          C.muted,
+          400,
+          "left",
+          true,
+        );
+      } else end(v - 60000);
+    };
+    window.ready.then(() => window.renderAt(0, 0));
+    </script>
+  </body>
+</html>
