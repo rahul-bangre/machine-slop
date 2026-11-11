@@ -2,6 +2,12 @@ import { Host, type HostedMachine } from "../../../packages/sdk/src/mod.ts";
 import { AgentSession } from "../../common/claude.ts";
 import { Browser, delay, type Page } from "../../common/browser.ts";
 import { shell, tail } from "../../common/shell.ts";
+import {
+    connectChromium,
+    type PageText,
+    readPage,
+    startChromium,
+} from "../../common/machine-browser.ts";
 
 const home = Deno.env.get("HOME")!;
 const machined_url = Deno.env.get("MACHINED_URL") ?? "http://127.0.0.1:4100";
@@ -86,30 +92,10 @@ async function frame(page: Page, label: string): Promise<void> {
     emit("frame", { file, url, label });
 }
 
-type PageText = {
-    title: string;
-    url: string;
-    text: string;
-    links: string[];
-    height: number;
-};
-
 async function openPage(page: Page, url: string): Promise<PageText> {
     await page.goto(url, 1500);
     await frame(page, "loaded");
-    const read = await page.evaluate<PageText>(`(() => {
-        const root = document.querySelector("article, .markdown-body, main") ?? document.body;
-        const links = [...new Set([...root.querySelectorAll("a[href]")]
-            .map((a) => (a.innerText.trim().replace(/\\s+/g, " ").slice(0, 80) || "link") + " -> " + a.href)
-            .filter((line) => line.includes("http")))].slice(0, 60);
-        return {
-            title: document.title,
-            url: location.href,
-            text: root.innerText.replace(/\\n{3,}/g, "\\n\\n").slice(0, 14000),
-            links,
-            height: document.documentElement.scrollHeight,
-        };
-    })()`);
+    const read = await readPage(page);
     for (const y of [700, 1400]) {
         if (read.height < y + 500) break;
         await page.evaluate(
@@ -122,36 +108,8 @@ async function openPage(page: Page, url: string): Promise<PageText> {
 }
 
 async function startBrowser(machine: HostedMachine): Promise<Browser> {
-    await machine.startProcess({
-        program: "/usr/local/bin/chromium",
-        args: [
-            "--headless=new",
-            "--no-sandbox",
-            "--hide-scrollbars",
-            "--remote-debugging-port=9222",
-            "--remote-allow-origins=*",
-            "--user-data-dir=/tmp/chrome",
-            "about:blank",
-        ],
-        cwd: "/workspace",
-    });
-    const forward = machine.forward(9222);
-    const base = forward.url.replace(/\/$/, "");
-    for (let attempt = 0; attempt < 60; attempt++) {
-        const version = await fetch(`${base}/json/version`).then((r) =>
-            r.ok ? r.json() : null
-        ).catch(() => null);
-        if (version?.webSocketDebuggerUrl) {
-            const websocket = String(version.webSocketDebuggerUrl).replace(
-                /^ws:\/\/[^/]+/,
-                base.replace(/^http/, "ws"),
-            );
-            return await Browser.connect(websocket, () => forward.close());
-        }
-        await delay(250);
-    }
-    await forward.close();
-    throw new Error("chromium in the machine did not start");
+    await startChromium(machine);
+    return await connectChromium(machine);
 }
 
 const token = new TextDecoder().decode(

@@ -63,6 +63,22 @@ export class Browser {
             "Target.createTarget",
             { url: "about:blank" },
         );
+        return await this.attach(targetId, viewport);
+    }
+
+    async openedPage(viewport: Viewport): Promise<Page> {
+        const { targetInfos } = await this.cdp.send<
+            { targetInfos: { targetId: string; type: string; url: string }[] }
+        >("Target.getTargets");
+        const opened = targetInfos.find((target) =>
+            target.type === "page" && target.url !== "about:blank"
+        );
+        return opened
+            ? await this.attach(opened.targetId, viewport)
+            : await this.page(viewport);
+    }
+
+    private async attach(targetId: string, viewport: Viewport): Promise<Page> {
         const { sessionId } = await this.cdp.send<{ sessionId: string }>(
             "Target.attachToTarget",
             { targetId, flatten: true },

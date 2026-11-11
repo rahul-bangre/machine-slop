@@ -2,14 +2,16 @@ export type AgentReply<T> = { output: T; output_tokens: number };
 
 type CliResult<T> = {
     is_error: boolean;
+    session_id?: string;
     result?: string;
     structured_output?: T;
     usage?: { output_tokens: number };
 };
 
 export class AgentSession<T> {
-    private readonly session_id = crypto.randomUUID();
+    private session_id: string = crypto.randomUUID();
     private turns = 0;
+    private fork_of: string | null = null;
 
     constructor(
         private readonly model: string,
@@ -18,6 +20,25 @@ export class AgentSession<T> {
         private readonly workdir: string,
         private readonly effort = "low",
     ) {}
+
+    fork(): AgentSession<T> {
+        const copy = new AgentSession<T>(
+            this.model,
+            this.system_prompt,
+            this.schema,
+            this.workdir,
+            this.effort,
+        );
+        copy.fork_of = this.session_id;
+        return copy;
+    }
+
+    private sessionArgs(): string[] {
+        if (this.fork_of) return ["--resume", this.fork_of, "--fork-session"];
+        return this.turns === 0
+            ? ["--session-id", this.session_id]
+            : ["--resume", this.session_id];
+    }
 
     async send(message: string): Promise<AgentReply<T>> {
         const child = new Deno.Command("claude", {
@@ -39,9 +60,7 @@ export class AgentSession<T> {
                 this.system_prompt,
                 "--json-schema",
                 JSON.stringify(this.schema),
-                ...(this.turns === 0
-                    ? ["--session-id", this.session_id]
-                    : ["--resume", this.session_id]),
+                ...this.sessionArgs(),
             ],
             cwd: this.workdir,
             stdin: "piped",
@@ -63,6 +82,10 @@ export class AgentSession<T> {
                     new TextDecoder().decode(stderr).slice(-400)
                 }`,
             );
+        }
+        if (this.fork_of && result.session_id) {
+            this.session_id = result.session_id;
+            this.fork_of = null;
         }
         if (result.is_error || !result.structured_output) {
             throw new Error(
