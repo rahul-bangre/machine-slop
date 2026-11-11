@@ -1,16 +1,22 @@
-import { Cdp, type CdpSession } from "../../../bench/browser/src/cdp.ts";
+import { Cdp, type CdpSession } from "../../bench/browser/src/cdp.ts";
 
 export type Viewport = { width: number; height: number };
 
 export class Browser {
     private constructor(
-        private readonly child: Deno.ChildProcess,
-        private readonly profile: string,
         readonly cdp: Cdp,
+        private readonly release: () => Promise<void>,
     ) {}
 
+    static async connect(
+        websocket_url: string,
+        release: () => Promise<void> = () => Promise.resolve(),
+    ): Promise<Browser> {
+        return new Browser(await Cdp.connect(websocket_url), release);
+    }
+
     static async launch(executable: string): Promise<Browser> {
-        const profile = await Deno.makeTempDir({ prefix: "fork-race-chrome-" });
+        const profile = await Deno.makeTempDir({ prefix: "demo-chrome-" });
         const child = new Deno.Command(executable, {
             args: [
                 "--headless=new",
@@ -37,7 +43,17 @@ export class Browser {
             if (match?.[1]) {
                 reader.releaseLock();
                 child.stderr.pipeTo(new WritableStream()).catch(() => {});
-                return new Browser(child, profile, await Cdp.connect(match[1]));
+                return new Browser(await Cdp.connect(match[1]), async () => {
+                    try {
+                        child.kill("SIGKILL");
+                    } catch {
+                        return;
+                    }
+                    await child.status;
+                    await Deno.remove(profile, { recursive: true }).catch(
+                        () => {},
+                    );
+                });
             }
         }
     }
@@ -64,13 +80,7 @@ export class Browser {
 
     async close(): Promise<void> {
         this.cdp.close();
-        try {
-            this.child.kill("SIGKILL");
-        } catch {
-            return;
-        }
-        await this.child.status;
-        await Deno.remove(this.profile, { recursive: true }).catch(() => {});
+        await this.release();
     }
 }
 

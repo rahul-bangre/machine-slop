@@ -1,43 +1,25 @@
-export type AgentReply = {
-    intent: string;
-    commands: string[];
-    summary: string | null;
-    output_tokens: number;
-};
+export type AgentReply<T> = { output: T; output_tokens: number };
 
-const reply_schema = JSON.stringify({
-    type: "object",
-    properties: {
-        intent: { type: "string" },
-        commands: { type: "array", items: { type: "string" } },
-        summary: { type: "string" },
-    },
-    required: ["intent", "commands"],
-    additionalProperties: false,
-});
-
-type CliResult = {
+type CliResult<T> = {
     is_error: boolean;
     result?: string;
-    structured_output?: {
-        intent: string;
-        commands: string[];
-        summary?: string;
-    };
+    structured_output?: T;
     usage?: { output_tokens: number };
 };
 
-export class AgentSession {
+export class AgentSession<T> {
     private readonly session_id = crypto.randomUUID();
     private turns = 0;
 
     constructor(
         private readonly model: string,
         private readonly system_prompt: string,
+        private readonly schema: Record<string, unknown>,
         private readonly workdir: string,
+        private readonly effort = "low",
     ) {}
 
-    async send(message: string): Promise<AgentReply> {
+    async send(message: string): Promise<AgentReply<T>> {
         const child = new Deno.Command("claude", {
             args: [
                 "--print",
@@ -46,7 +28,7 @@ export class AgentSession {
                 "--model",
                 this.model,
                 "--effort",
-                "low",
+                this.effort,
                 "--tools",
                 "",
                 "--strict-mcp-config",
@@ -56,7 +38,7 @@ export class AgentSession {
                 "--system-prompt",
                 this.system_prompt,
                 "--json-schema",
-                reply_schema,
+                JSON.stringify(this.schema),
                 ...(this.turns === 0
                     ? ["--session-id", this.session_id]
                     : ["--resume", this.session_id]),
@@ -72,7 +54,7 @@ export class AgentSession {
         const { stdout, stderr } = await child.output();
         this.turns++;
         const text = new TextDecoder().decode(stdout);
-        let result: CliResult;
+        let result: CliResult<T>;
         try {
             result = JSON.parse(text);
         } catch {
@@ -88,9 +70,7 @@ export class AgentSession {
             );
         }
         return {
-            intent: result.structured_output.intent,
-            commands: result.structured_output.commands,
-            summary: result.structured_output.summary ?? null,
+            output: result.structured_output,
             output_tokens: result.usage?.output_tokens ?? 0,
         };
     }

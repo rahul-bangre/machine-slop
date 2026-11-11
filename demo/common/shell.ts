@@ -1,4 +1,4 @@
-import type { Machine } from "../../../packages/sdk/src/mod.ts";
+import type { Machine } from "../../packages/sdk/src/mod.ts";
 
 export type ShellResult = {
     exit_code: number | null;

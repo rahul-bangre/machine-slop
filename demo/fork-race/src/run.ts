@@ -3,9 +3,9 @@ import {
     type HostedMachine,
     tar,
 } from "../../../packages/sdk/src/mod.ts";
-import { AgentSession } from "./claude.ts";
-import { Browser, delay, type Page } from "./browser.ts";
-import { shell, type ShellResult, tail } from "./shell.ts";
+import { AgentSession } from "../../common/claude.ts";
+import { Browser, delay, type Page } from "../../common/browser.ts";
+import { shell, type ShellResult, tail } from "../../common/shell.ts";
 
 const home = Deno.env.get("HOME")!;
 const machined_url = Deno.env.get("MACHINED_URL") ?? "http://127.0.0.1:4100";
@@ -64,6 +64,19 @@ const lanes: Lane[] = [
             "Work test-first: run the tests, fix one failing test at a time, and re-run them after each change.",
     },
 ];
+
+type CodingReply = { intent: string; commands: string[]; summary?: string };
+
+const reply_schema = {
+    type: "object",
+    properties: {
+        intent: { type: "string" },
+        commands: { type: "array", items: { type: "string" } },
+        summary: { type: "string" },
+    },
+    required: ["intent", "commands"],
+    additionalProperties: false,
+};
 
 const system_prompt = [
     "You are a coding agent working inside a Linux machine on a small Node.js 24 web app in /workspace/app, which is a git repository.",
@@ -448,7 +461,12 @@ try {
             name: lane.name,
             approach: lane.approach,
         });
-        const session = new AgentSession(lane.model, system_prompt, workdir);
+        const session = new AgentSession<CodingReply>(
+            lane.model,
+            system_prompt,
+            reply_schema,
+            workdir,
+        );
         let message = `${task}\n\nYour approach: ${lane.hint}`;
         for (let turn = 1; turn <= max_turns; turn++) {
             if (performance.now() - race_started > race_limit_ms) {
@@ -456,7 +474,10 @@ try {
                 return;
             }
             emit("status", { lane: lane.id, status: "thinking", turn });
-            const reply = await session.send(message).catch((error) => {
+            const reply = await session.send(message).then((answer) => ({
+                ...answer.output,
+                output_tokens: answer.output_tokens,
+            })).catch((error) => {
                 emit("note", { lane: lane.id, text: String(error) });
                 return null;
             });

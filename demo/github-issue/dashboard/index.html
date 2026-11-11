@@ -1,0 +1,779 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>An agent files a real GitHub issue</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=block"
+      rel="stylesheet">
+    <style>
+    :root {
+      --bg: #0b0d12;
+      --panel: #12151d;
+      --panel2: #181c26;
+      --line: #252a37;
+      --text: #eef0f5;
+      --dim: #8d95a8;
+      --faint: #596178;
+      --green: #3ddc97;
+      --red: #ff5d6c;
+      --blue: #5aa9ff;
+      --amber: #ffb547;
+      --violet: #a98bff;
+      --mono: "JetBrains Mono", ui-monospace, monospace;
+      --sans: "Inter", system-ui, sans-serif;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html,
+    body {
+      margin: 0;
+      width: 1920px;
+      height: 1080px;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background: radial-gradient(1100px 520px at 75% -15%, #1b2541 0%, transparent
+        60%);
+      pointer-events: none;
+    }
+    #stage {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      grid-template-rows: 150px minmax(0, 1fr) 92px;
+    }
+    header {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 30px;
+      align-items: center;
+      padding: 0 40px;
+      border-bottom: 1px solid var(--line);
+    }
+    .task .label {
+      font-family: var(--mono);
+      font-size: 14px;
+      letter-spacing: .14em;
+      color: var(--blue);
+      font-weight: 600;
+    }
+    .task .text {
+      font-size: 25px;
+      line-height: 1.38;
+      font-weight: 600;
+      margin-top: 8px;
+      max-width: 1500px;
+    }
+    .right {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 12px;
+    }
+    .brand {
+      font-weight: 800;
+      font-size: 20px;
+    }
+    .brand span {
+      color: var(--dim);
+      font-weight: 500;
+      font-size: 15px;
+      margin-left: 8px;
+    }
+    .clockrow {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .clock {
+      font-family: var(--mono);
+      font-size: 18px;
+      color: var(--dim);
+    }
+    .speed {
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1.5px solid var(--line);
+      min-width: 150px;
+      text-align: center;
+    }
+    .speed.slow {
+      color: var(--violet);
+      border-color: var(--violet);
+    }
+    .speed.fast {
+      color: var(--amber);
+      border-color: var(--amber);
+    }
+    .speed.live {
+      color: var(--green);
+      border-color: var(--green);
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 600px;
+      gap: 24px;
+      padding: 22px 40px 0;
+      min-height: 0;
+    }
+    .window {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 11px 14px;
+      background: var(--panel2);
+      border-bottom: 1px solid var(--line);
+    }
+    .dots {
+      display: flex;
+      gap: 6px;
+    }
+    .dots i {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: var(--line);
+    }
+    .url {
+      flex: 1;
+      font-family: var(--mono);
+      font-size: 15px;
+      color: var(--text);
+      background: #0d1017;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .url b {
+      color: var(--green);
+      font-weight: 600;
+    }
+    .where {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      color: var(--dim);
+      white-space: nowrap;
+    }
+    .where b {
+      color: var(--green);
+    }
+    .screen {
+      flex: 1;
+      min-height: 0;
+      background: #fff center top / 100% auto no-repeat;
+      position: relative;
+    }
+    .screen.empty {
+      background: #0d1017;
+      display: grid;
+      place-items: center;
+      color: var(--faint);
+      font-family: var(--mono);
+      font-size: 18px;
+    }
+    .agent {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .agent .head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .avatar {
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, #d97757, #b4532f);
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      color: #fff;
+      font-size: 18px;
+    }
+    .agent .who {
+      font-weight: 700;
+      font-size: 19px;
+    }
+    .agent .who small {
+      display: block;
+      color: var(--dim);
+      font-weight: 500;
+      font-size: 13.5px;
+    }
+    .status {
+      margin-left: auto;
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 5px 11px;
+      border-radius: 999px;
+      border: 1.5px solid var(--line);
+      color: var(--dim);
+    }
+    .status.thinking {
+      color: var(--violet);
+      border-color: var(--violet);
+    }
+    .status.acting {
+      color: var(--blue);
+      border-color: var(--blue);
+    }
+    .status.done {
+      color: #0b0d12;
+      background: var(--green);
+      border-color: var(--green);
+    }
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-height: 0;
+      justify-content: flex-end;
+      flex: 1;
+      overflow: hidden;
+    }
+    .step {
+      display: grid;
+      grid-template-columns: 34px minmax(0, 1fr);
+      gap: 12px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: var(--panel2);
+      border: 1px solid transparent;
+    }
+    .step.old {
+      opacity: .5;
+    }
+    .step.now {
+      border-color: var(--blue);
+      background: #141c2c;
+    }
+    .step.key {
+      border-color: var(--amber);
+      background: #231c10;
+    }
+    .num {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: var(--line);
+      display: grid;
+      place-items: center;
+      font-family: var(--mono);
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .step.now .num {
+      background: var(--blue);
+      color: #08101f;
+    }
+    .step.key .num {
+      background: var(--amber);
+      color: #1a1205;
+    }
+    .intent {
+      font-size: 18px;
+      line-height: 1.35;
+      font-weight: 500;
+    }
+    .caret {
+      display: inline-block;
+      width: 9px;
+      height: 18px;
+      background: var(--violet);
+      vertical-align: -3px;
+      margin-left: 2px;
+    }
+    .act {
+      margin-top: 6px;
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--dim);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .act .k {
+      color: var(--blue);
+      font-weight: 600;
+    }
+    .act .ok {
+      color: var(--green);
+    }
+    .act .no {
+      color: var(--red);
+    }
+    .callout {
+      margin-top: 8px;
+      font-size: 14.5px;
+      line-height: 1.4;
+      color: #ffd9a0;
+    }
+    .callout b {
+      color: var(--amber);
+    }
+    .thinkrow {
+      color: var(--violet);
+      font-family: var(--mono);
+      font-size: 14px;
+      padding: 4px 14px;
+    }
+    footer {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 0 40px;
+    }
+    .fact {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--faint);
+      font-size: 15.5px;
+      font-weight: 500;
+      transition: none;
+      white-space: nowrap;
+    }
+    .fact i {
+      font-style: normal;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--line);
+    }
+    .fact.on {
+      color: var(--text);
+    }
+    .fact.on i {
+      background: var(--green);
+      box-shadow: 0 0 12px var(--green);
+    }
+    .fact.hot {
+      border-color: var(--amber);
+      color: #fff;
+      box-shadow: 0 0 0 1px var(--amber), 0 0 30px -8px var(--amber);
+    }
+    .fact.hot i {
+      background: var(--amber);
+      box-shadow: 0 0 12px var(--amber);
+    }
+    .fact b {
+      font-family: var(--mono);
+      font-weight: 600;
+    }
+    .spacer {
+      flex: 1;
+    }
+    #overlay {
+      position: absolute;
+      inset: 0;
+      display: none;
+      place-items: center;
+      background: rgba(8, 10, 14, .95);
+    }
+    .card {
+      max-width: 1440px;
+      text-align: left;
+    }
+    .card .kicker {
+      font-family: var(--mono);
+      color: var(--blue);
+      font-size: 20px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    .card h1 {
+      font-size: 52px;
+      line-height: 1.25;
+      margin: 22px 0 26px;
+      font-weight: 700;
+      letter-spacing: -.01em;
+    }
+    .card p {
+      font-size: 26px;
+      color: var(--dim);
+      margin: 0;
+      line-height: 1.5;
+    }
+    .card p b {
+      color: var(--text);
+    }
+    .result {
+      display: grid;
+      grid-template-columns: 1180px 1fr;
+      gap: 40px;
+      align-items: center;
+      padding: 0 60px;
+      width: 100%;
+    }
+    .result .shot {
+      height: 740px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: #fff center top / 100% auto no-repeat;
+      box-shadow: 0 30px 80px -20px #000;
+    }
+    .result h2 {
+      font-size: 46px;
+      margin: 14px 0 18px;
+      line-height: 1.15;
+    }
+    .result .link {
+      font-family: var(--mono);
+      font-size: 20px;
+      color: var(--green);
+      word-break: break-all;
+    }
+    .result ul {
+      list-style: none;
+      padding: 0;
+      margin: 30px 0 0;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .result li {
+      font-size: 21px;
+      color: var(--dim);
+    }
+    .result li b {
+      color: var(--text);
+      font-family: var(--mono);
+    }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <header>
+        <div class="task">
+          <div class="label">THE TASK WE GAVE THE AGENT</div>
+          <div class="text" id="task"></div>
+        </div>
+        <div class="right">
+          <div
+            class="brand">◆ machine slop<span>a computer for agents</span></div>
+          <div
+            class="clockrow"><span class="clock" id="clock"></span><span class="speed" id="speed"></span></div>
+        </div>
+      </header>
+      <main>
+        <div class="window">
+          <div
+            class="bar"><span class="dots"><i></i><i></i><i></i></span><div class="url" id="url"></div><span class="where">Chromium · <b>inside the agent's machine</b></span></div>
+          <div class="screen" id="screen"></div>
+        </div>
+        <div class="agent">
+          <div class="head">
+            <div class="avatar">C</div>
+            <div class="who" id="who"></div>
+            <div class="status" id="status"></div>
+          </div>
+          <div class="steps" id="steps"></div>
+        </div>
+      </main>
+      <footer id="facts"></footer>
+    </div>
+    <div id="overlay"></div>
+    <script>
+    const RUN = window.RUN;
+    const E = RUN.events;
+    const first = (pred) => E.find(pred);
+    const last = (t, pred) => {
+      let found = null;
+      for (const e of E) {
+        if (e.t > t) break;
+        if (pred(e)) found = e;
+      }
+      return found;
+    };
+    const upto = (t, pred) => E.filter((e) => e.t <= t && pred(e));
+    const esc = (s) =>
+      String(s ?? "").replace(
+        /[&<>"]/g,
+        (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
+      );
+    const fmtMs = (ms) =>
+      ms < 1000
+        ? `${Math.round(ms)} ms`
+        : ms < 60000
+        ? `${(ms / 1000).toFixed(1)} s`
+        : `${Math.floor(ms / 60000)}m ${
+          String(Math.round(ms / 1000) % 60).padStart(2, "0")
+        }s`;
+    const run = first((e) => e.type === "run");
+    const machine = first((e) => e.type === "machine");
+    const browserReady = first((e) => e.type === "browser");
+    const issue = first((e) => e.type === "issue");
+    const done = first((e) => e.type === "done");
+    const base = first((e) => e.type === "usage_base");
+    const final = first((e) => e.type === "usage");
+    const workStart = first((e) => e.type === "scene" && e.id === "work")?.t ?? 0;
+    const modelName = {
+      "claude-opus-5-5": "Claude Opus 5.5",
+      "claude-sonnet-5-5": "Claude Sonnet 5.5",
+    }[run.model] ?? run.model;
+    const cost = (u) => {
+      if (!u || !base) return 0;
+      const vcpu = (u.vcpu_ms - base.vcpu_ms) / 3600000,
+        mem = (u.memory_mib_ms - base.memory_mib_ms) / 1024 / 3600000;
+      return vcpu * 0.0504 + mem * 0.0162;
+    };
+    const shortUrl = (u) => u.replace(/^https?:\/\//, "").replace(/\/$/, "");
+    document.getElementById("task").textContent = run.prompt;
+    document.getElementById("who").innerHTML =
+      `${modelName}<small>one agent · one fresh computer</small>`;
+
+    function actionLine(step, t) {
+      if (step.action === "open") {
+        const page = last(t, (e) => e.type === "page" && e.n === step.n);
+        return `<span class="k">open</span> ${esc(shortUrl(step.url ?? ""))}${
+          page
+            ? ` <span class="ok">✓ read ${page.chars.toLocaleString()} chars</span>`
+            : " …"
+        }`;
+      }
+      if (step.action === "shell") {
+        const res = last(t, (e) => e.type === "shell" && e.n === step.n);
+        const cmd = (step.command ?? "").split("\n").find((l) => l.trim()) ?? "";
+        const curl = (step.command ?? "").split("\n").find((l) =>
+          /^\s*curl\b/.test(l)
+        )?.trim();
+        const shown = curl ?? cmd;
+        return `<span class="k">$</span> ${esc(shown.slice(0, 120))}${
+          res
+            ? ` <span class="${res.exit_code === 0 ? "ok" : "no"}">${
+              res.exit_code === 0 ? "✓" : "✗ exit " + res.exit_code
+            }</span>`
+            : " …"
+        }`;
+      }
+      if (step.action === "done") {
+        return `<span class="ok">✓ done</span> ${esc(step.summary ?? "")}`;
+      }
+      return "";
+    }
+
+    function renderSteps(t, vt) {
+      const steps = upto(t, (e) => e.type === "step");
+      const thinking = last(t, (e) => e.type === "thinking");
+      const isThinking = thinking &&
+        (!steps.length || steps[steps.length - 1].n < thinking.n);
+      const html = steps.slice(-6).map((s, i, arr) => {
+        const isLast = i === arr.length - 1;
+        const posts = s.action === "shell" &&
+          /api\.github\.com/.test(s.command ?? "");
+        const typed = isLast
+          ? s.intent.slice(0, Math.max(0, Math.floor((vt - s.vt) / 20)))
+          : s.intent;
+        const typing = isLast && typed.length < s.intent.length;
+        const cls = posts ? "key" : isLast && !isThinking ? "now" : "old";
+        const callout = posts
+          ? `<div class="callout"><b>No token in this command.</b> The agent has no GitHub credentials. machined adds them on the way out to api.github.com, so they never enter the machine.</div>`
+          : "";
+        return `<div class="step ${cls}"><div class="num">${s.n}</div><div><div class="intent">${
+          esc(typed)
+        }${typing ? '<span class="caret"></span>' : ""}</div><div class="act">${
+          actionLine(s, t)
+        }</div>${callout}</div></div>`;
+      }).join("");
+      const dots = ".".repeat(1 + Math.floor(vt / 350) % 3);
+      document.getElementById("steps").innerHTML = html +
+        (isThinking
+          ? `<div class="thinkrow">step ${thinking.n} · thinking${dots}</div>`
+          : "");
+      const st = document.getElementById("status");
+      if (
+        done && t >= done.t ||
+        (issue && t >= issue.t && !isThinking && steps.at(-1)?.action === "done")
+      ) {
+        st.className = "status done";
+        st.textContent = "✓ finished";
+      } else if (!machine || t < machine.t) {
+        st.className = "status";
+        st.textContent = "waiting for a computer";
+      } else if (isThinking) {
+        st.className = "status thinking";
+        st.textContent = `thinking${dots}`;
+      } else if (steps.length) {
+        st.className = "status acting";
+        st.textContent = steps.at(-1).action === "open"
+          ? "browsing"
+          : "running a command";
+      } else {
+        st.className = "status";
+        st.textContent = "ready";
+      }
+    }
+
+    function renderFacts(t) {
+      const posted = last(t, (e) => e.type === "egress");
+      const recentPost = posted && t - posted.t < 20000;
+      const usage = last(t, (e) => e.type === "usage");
+      const elapsed = Math.max(0, t - (machine ? machine.t - machine.ms : 0));
+      const facts = [
+        [
+          machine && t >= machine.t,
+          `Fresh, isolated computer · booted in <b>${
+            machine ? fmtMs(machine.boot_ms) : "…"
+          }</b>`,
+          false,
+        ],
+        [
+          browserReady && t >= browserReady.t,
+          `Internet: <b>github.com</b> and <b>e2b.dev</b> only`,
+          false,
+        ],
+        [
+          posted && t >= posted.t,
+          `GitHub token: <b>never inside the machine</b>`,
+          recentPost,
+        ],
+      ];
+      document.getElementById("facts").innerHTML =
+        facts.map(([on, text, hot]) =>
+          `<div class="fact ${on ? "on" : ""} ${
+            hot ? "hot" : ""
+          }"><i></i>${text}</div>`
+        ).join("") +
+        `<div class="spacer"></div><div class="fact on" style="color:var(--dim)">${
+          usage
+            ? `Compute cost: <b style="color:var(--green)">$${
+              cost(usage).toFixed(4)
+            }</b>`
+            : `Elapsed <b>${fmtMs(elapsed)}</b>`
+        }</div>`;
+    }
+
+    function renderBrowser(t) {
+      const frame = last(t, (e) => e.type === "frame");
+      const screen = document.getElementById("screen");
+      const url = document.getElementById("url");
+      if (
+        !frame ||
+        frame.url === "about:blank" && !upto(t, (e) => e.type === "step").length
+      ) {
+        screen.className = "screen empty";
+        screen.style.backgroundImage = "none";
+        screen.textContent = machine && t >= machine.t
+          ? "browser started · waiting for the agent's first step"
+          : "starting a fresh computer…";
+        url.innerHTML = "&nbsp;";
+        return;
+      }
+      screen.className = "screen";
+      screen.textContent = "";
+      screen.style.backgroundImage = `url('${frame.file}')`;
+      const u = frame.url.match(/^(https?:\/\/)([^/]+)(.*)$/);
+      url.innerHTML = u
+        ? `${esc(u[1])}<b>${esc(u[2])}</b>${esc(u[3])}`
+        : esc(frame.url);
+    }
+
+    function renderOverlay(kind, t, vt) {
+      const o = document.getElementById("overlay");
+      if (!kind) {
+        o.style.display = "none";
+        return;
+      }
+      o.style.display = "grid";
+      if (kind === "intro") {
+        const shown = run.prompt.slice(0, Math.max(0, Math.floor((vt - 700) / 19)));
+        o.innerHTML =
+          `<div class="card"><div class="kicker">One instruction · real websites · nothing simulated</div><h1>“${
+            esc(shown)
+          }<span class="caret" style="height:46px;width:16px;vertical-align:-6px;opacity:${
+            shown.length < run.prompt.length || Math.floor(vt / 450) % 2 ? 1 : 0
+          }"></span>”</h1><p>The agent gets <b>a fresh, isolated computer with a browser</b>. No GitHub token, no other help.</p></div>`;
+      } else if (kind === "result") {
+        const shot = upto(Infinity, (e) =>
+          e.type === "frame" && e.label === "issue")[0];
+        const steps = E.filter((e) => e.type === "step").length;
+        const pages = E.filter((e) => e.type === "page").length;
+        const total = (issue ?? done).t - (machine.t - machine.ms);
+        o.innerHTML =
+          `<div class="result"><div class="shot" style="background-image:url('${
+            shot?.file ?? ""
+          }')"></div><div><div class="card"><div class="kicker">Result</div></div><h2>A real issue on GitHub</h2><div class="link">${
+            esc(issue?.url ?? "")
+          }</div><ul><li>Time from prompt to issue: <b>${
+            fmtMs(total)
+          }</b></li><li>Steps: <b>${steps}</b> · pages read: <b>${pages}</b></li><li>Secrets inside the machine: <b>0</b></li><li>Compute cost: <b>$${
+            cost(final).toFixed(4)
+          }</b></li></ul></div></div>`;
+      }
+    }
+
+    window.renderAt = (t, vt, speed, overlay) => {
+      const clock = Math.max(0, t - (machine ? machine.t - machine.ms : 0));
+      document.getElementById("clock").textContent = `T+${
+        String(Math.floor(clock / 60000)).padStart(2, "0")
+      }:${String(Math.floor(clock / 1000) % 60).padStart(2, "0")}`;
+      const sp = document.getElementById("speed");
+      if (speed < 0.6) {
+        sp.className = "speed slow";
+        sp.textContent = `SLOW-MO ${(1 / speed).toFixed(1)}×`;
+      } else if (speed > 1.5) {
+        sp.className = "speed fast";
+        sp.textContent = `FAST-FORWARD ${speed.toFixed(0)}×`;
+      } else {
+        sp.className = "speed live";
+        sp.textContent = "● REAL TIME";
+      }
+      renderBrowser(t);
+      renderSteps(t, vt);
+      renderFacts(t);
+      renderOverlay(overlay, t, vt);
+    };
+
+    window.ready = (async () => {
+      await document.fonts.ready;
+      const files = [
+        ...new Set(E.filter((e) => e.type === "frame").map((e) => e.file)),
+      ];
+      await Promise.all(files.map((f) =>
+        new Promise((res) => {
+          const i = new Image();
+          i.onload = i.onerror = res;
+          i.src = f;
+        })
+      ));
+      return files.length;
+    })();
+    </script>
+  </body>
+</html>
