@@ -107,7 +107,7 @@ try {
     await created.machine.writeFile(
         "/workspace/search.py",
         await Deno.readFile(new URL("../machine/search.py", import.meta.url)),
-        deadline,
+        { signal: deadline },
     );
     const process = await created.machine.startProcess({
         program: "/usr/bin/python3",
