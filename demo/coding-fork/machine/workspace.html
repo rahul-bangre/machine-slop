@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Agent workspace · Cleanup hang</title>
+    <style>
+    body {
+      margin: 0;
+      background: #111815;
+      color: #edf0e4;
+      font: 22px system-ui;
+      padding: 52px;
+    }
+    header {
+      font: 16px monospace;
+      color: #b0bf9b;
+      border-bottom: 1px solid #344335;
+      padding-bottom: 24px;
+    }
+    h1 {
+      font-size: 52px;
+      margin: 44px 0 12px;
+    }
+    .subtitle {
+      color: #a6b29f;
+    }
+    section {
+      margin-top: 40px;
+      border: 1px solid #344335;
+      border-radius: 12px;
+      padding: 28px;
+    }
+    pre {
+      white-space: pre-wrap;
+      color: #c6d2b5;
+      font-size: 21px;
+      line-height: 1.65;
+    }
+    strong {
+      color: #edbb84;
+    }
+    .label {
+      font: 15px monospace;
+      color: #a6b29f;
+    }
+    .status {
+      font-size: 30px;
+      margin-top: 15px;
+    }
+    #tests {
+      color: #d5ff5f;
+    }
+    .meta {
+      margin-top: 42px;
+      color: #8ca17c;
+      font: 15px monospace;
+      line-height: 1.8;
+    }
+    </style>
+  </head>
+  <body>
+    <header>MACHINE/SLOP · REAL SDK BUG · DEBUG SESSION</header>
+    <h1>Workspace cleanup is stuck.</h1>
+    <div
+      class="subtitle">The preview server accepted a connection. Its upgrade never arrived.</div>
+    <section>
+      <div class="label">LIVE REPRODUCTION</div>
+      <pre>const preview = machine.forward(3000);
+await preview.close();</pre>
+      <div class="status" id="status">Waiting for cleanup…</div>
+    </section>
+    <section>
+      <div class="label">FIX VERIFICATION</div>
+      <div class="status" id="tests">No patch tested yet.</div>
+    </section>
+    <div class="meta" id="meta"></div>
+    <script>
+    async function update() {
+      const s = await (await fetch("/state")).json();
+      document.querySelector("#status").innerHTML = s.closed
+        ? "Closed successfully."
+        : "<strong>Promise still pending</strong> · " +
+          (s.waiting_ms / 1000).toFixed(1) + "s";
+      document.querySelector("#meta").textContent = "Session " + s.session +
+        " · PID " + s.pid + " · uptime " + (s.uptime_ms / 1000).toFixed(1) + "s";
+      if (s.tests) document.querySelector("#tests").textContent = s.tests.summary;
+    }
+    update();
+    setInterval(update, 500);
+    </script>
+  </body>
+</html>

@@ -22,7 +22,7 @@
     "noFallthroughCasesInSwitch": true
   },
   "tasks": {
-    "check": "deno check --frozen-lockfile packages/sdk/src/mod.ts packages/sdk/test/*.test.ts bench/browser/src/main.ts bench/browser/test/*.test.ts bench/agent/src/main.ts bench/agent/test/*.test.ts bench/env/src/main.ts bench/env/test/*.test.ts bench/browser-agent/src/main.ts bench/browser-agent/test/*.test.ts demo/common/video.test.ts demo/launch/src/race.ts demo/launch/src/record.ts",
+    "check": "deno check --frozen-lockfile packages/sdk/src/mod.ts packages/sdk/test/*.test.ts bench/browser/src/main.ts bench/browser/test/*.test.ts bench/agent/src/main.ts bench/agent/test/*.test.ts bench/env/src/main.ts bench/env/test/*.test.ts bench/browser-agent/src/main.ts bench/browser-agent/test/*.test.ts demo/common/video.test.ts demo/launch/src/race.ts demo/launch/src/record.ts demo/coding-fork/src/*.ts",
     "lint": "deno lint",
     "format": "deno fmt",
     "format:check": "deno fmt --check",

@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>One bug. Three fixes.</title>
+    <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      background: #0d1412;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 1920px;
+      height: 1080px;
+    }
+    </style>
+  </head>
+  <body>
+    <canvas id="film" width="1920" height="1080"></canvas>
+    <script>
+    const RUN = window.RUN;
+    const { events: E, images: raw, patches } = RUN.events[0];
+    const g = document.querySelector("canvas").getContext("2d");
+    const C = {
+      ink: "#101a15",
+      paper: "#eeeee4",
+      lime: "#d5ff5f",
+      blue: "#9cbdff",
+      peach: "#ffb69c",
+      dim: "#a4b09e",
+      line: "#344033",
+      red: "#ffad92",
+    };
+    const colors = [C.lime, C.blue, C.peach], lanes = ["A", "B", "C"];
+    const labels = [
+      "Socket ownership",
+      "Forward lifetime",
+      "Pending task tracking",
+    ];
+    const base = E.find((e) => e.type === "reproduced"),
+      fork = E.find((e) => e.type === "forked"),
+      selection = E.find((e) => e.type === "selection"),
+      pr = E.find((e) => e.type === "pr");
+    const begin = Math.min(
+      ...E.filter((e) => e.type === "command_start" && lanes.includes(e.lane)).map(
+        (e) => e.t,
+      ),
+    );
+    const complete = Math.max(
+      ...E.filter((e) =>
+        e.type === "tests" && lanes.includes(e.lane) && e.passed === 29
+      ).map((e) => e.t),
+    );
+    const imgs = new Map();
+    window.ready = Promise.all(
+      Object.entries(raw).map(([id, src]) =>
+        new Promise((resolve) => {
+          const im = new Image();
+          im.onload = () => {
+            imgs.set(id, im);
+            resolve(true);
+          };
+          im.onerror = () => resolve(false);
+          im.src = src;
+        })
+      ),
+    );
+    const clamp = (x) => Math.max(0, Math.min(1, x)),
+      ease = (x) => 1 - Math.pow(1 - clamp(x), 3),
+      mix = (a, b, t) => a + (b - a) * t;
+    function rect(x, y, w, h, c, r = 0) {
+      g.fillStyle = c;
+      g.beginPath();
+      g.roundRect(x, y, w, h, r);
+      g.fill();
+    }
+    function text(
+      s,
+      x,
+      y,
+      size = 28,
+      c = C.paper,
+      weight = 400,
+      mono = false,
+      align = "left",
+    ) {
+      g.font = `${weight} ${size}px ${
+        mono ? '"DejaVu Sans Mono"' : '"Liberation Sans"'
+      }`;
+      g.fillStyle = c;
+      g.textAlign = align;
+      g.textBaseline = "alphabetic";
+      g.fillText(s, x, y);
+    }
+    function line(x, y, xx, yy, c, width = 1) {
+      g.strokeStyle = c;
+      g.lineWidth = width;
+      g.beginPath();
+      g.moveTo(x, y);
+      g.lineTo(xx, yy);
+      g.stroke();
+    }
+    function dot(x, y, r, c) {
+      g.fillStyle = c;
+      g.beginPath();
+      g.arc(x, y, r, 0, Math.PI * 2);
+      g.fill();
+    }
+    function backdrop(light = false) {
+      rect(0, 0, 1920, 1080, light ? C.paper : "#0b1310");
+      for (let x = 40; x < 1920; x += 40) {
+        for (let y = 40; y < 1080; y += 40) {
+          dot(x, y, .75, light ? "#c7cfc0" : "#253225");
+        }
+      }
+    }
+    function frame(
+      chapter,
+      light = false,
+      footer = "REAL SDK BUG / RECORDED EXECUTION",
+    ) {
+      const c = light ? C.ink : C.paper;
+      text("machine/slop", 64, 62, 25, c, 700);
+      text(chapter, 1856, 62, 19, light ? "#617259" : C.dim, 400, true, "right");
+      line(64, 84, 1856, 84, light ? "#c6cebc" : C.line);
+      text(footer, 64, 1034, 17, light ? "#617259" : C.dim, 400, true);
+      text(
+        "ONE BUG. THREE FIXES.",
+        1856,
+        1034,
+        17,
+        light ? "#617259" : C.dim,
+        400,
+        true,
+        "right",
+      );
+    }
+    function pill(s, x, y, c = C.lime) {
+      g.font = '18px "DejaVu Sans Mono"';
+      rect(x, y - 27, g.measureText(s).width + 36, 42, c, 21);
+      text(s, x + 18, y, 18, c === C.ink ? C.paper : C.ink, 600, true);
+    }
+    function code(lines, x, y, size = 28, gap = 43) {
+      lines.forEach((s, i) => {
+        const add = s.startsWith("+"), del = s.startsWith("-");
+        text(
+          s,
+          x,
+          y + i * gap,
+          size,
+          add ? C.lime : del ? C.red : C.paper,
+          400,
+          true,
+        );
+      });
+    }
+    function terminal(x, y, w, h, title, lines, color = C.lime, size = 25) {
+      rect(x, y, w, h, "#162019", 12);
+      rect(x, y, w, 52, "#243024", 12);
+      dot(x + 23, y + 26, 5, "#f5aa94");
+      dot(x + 41, y + 26, 5, "#e2ca7c");
+      dot(x + 59, y + 26, 5, "#afcb82");
+      text(title, x + 88, y + 34, 18, color, 500, true);
+      code(lines, x + 30, y + 100, size, size * 1.6);
+    }
+    function shot(name, x, y, w, h) {
+      const im = imgs.get(name);
+      if (!im) return;
+      g.save();
+      g.beginPath();
+      g.roundRect(x, y, w, h, 12);
+      g.clip();
+      const scale = Math.max(w / im.width, h / im.height);
+      g.drawImage(im, x, y, im.width * scale, im.height * scale);
+      g.restore();
+    }
+    function flow(t, y) {
+      const p = ease(t / 1400);
+      dot(190, y, 12, C.lime);
+      line(202, y, 555, y, C.lime, 5);
+      pill("SHARED INVESTIGATION", 230, y - 35);
+      for (let i = 0; i < 3; i++) {
+        const target = 420 + i * 175;
+        g.strokeStyle = colors[i];
+        g.lineWidth = 5;
+        g.beginPath();
+        g.moveTo(555, y);
+        g.bezierCurveTo(770, y, 770, mix(y, target, p), 1060, mix(y, target, p));
+        g.lineTo(1740, mix(y, target, p));
+        g.stroke();
+        dot(1740, mix(y, target, p), 12, colors[i]);
+        text(
+          `AGENT ${lanes[i]} + VM`,
+          1200,
+          mix(y, target, p) - 25,
+          24,
+          colors[i],
+          500,
+          true,
+        );
+      }
+    }
+    function tests(lane, real) {
+      const entries = E.filter((e) =>
+        e.type === "tests" && e.lane === lane && e.t <= real
+      );
+      return entries[entries.length - 1] || { passed: 1, failed: 3 };
+    }
+    function latest(lane, real) {
+      const cs = E.filter((e) =>
+        e.type === "command_start" && e.lane === lane && e.t <= real
+      );
+      return cs[cs.length - 1]?.command || "";
+    }
+    function branchCard(i, real, vt) {
+      const lane = lanes[i],
+        x = 70 + i * 603,
+        c = colors[i],
+        t = tests(lane, real),
+        cmd = latest(lane, real);
+      rect(x, 324, 575, 625, "#17211a", 13);
+      rect(x, 324, 575, 68, "#253227", 13);
+      text(`0${i + 1} / AGENT ${lane}`, x + 22, 368, 23, c, 500, true);
+      text(labels[i], x, 278, 35, C.paper, 600);
+      const done = t.passed === 29;
+      const editing = /python|sed |cat >/.test(cmd);
+      const testing = cmd.includes("deno test");
+      text(
+        done
+          ? "Verified."
+          : testing
+          ? "Run the tests."
+          : editing
+          ? "Edit the fix."
+          : "Trace the shutdown.",
+        x + 25,
+        460,
+        38,
+        C.paper,
+        600,
+      );
+      text("packages/sdk/src/forward.ts", x + 25, 517, 19, C.dim, 400, true);
+      const lines = done
+        ? patches[lane].split("\n").filter((s) =>
+          s.startsWith("+") && !s.startsWith("+++")
+        ).slice(0, 6).map((s) => s.length > 35 ? s.slice(0, 34) + "…" : s)
+        : [
+          "await openTunnel(machine, port);",
+          "",
+          "Pending connection task",
+          "  ↓",
+          "Awaiting HTTP 101",
+          "  ↓",
+          "close() cannot settle",
+        ];
+      code(lines, x + 25, 575, 20, 36);
+      line(x + 25, 821, x + 550, 821, C.line);
+      text(`${t.passed} passed`, x + 25, 881, 34, done ? c : C.paper, 600);
+      text(
+        t.failed ? `${t.failed} failing` : "0 failed",
+        x + 315,
+        881,
+        26,
+        t.failed ? C.red : C.dim,
+        500,
+      );
+      const marks = t.passed === 29 ? 29 : 4;
+      for (let j = 0; j < marks; j++) {
+        rect(x + 25 + j * 17.5, 906, 12, 6, j < t.passed ? c : C.red, 3);
+      }
+      text(
+        done ? "FULL SDK SUITE" : "REGRESSION CASES",
+        x + 25,
+        935,
+        14,
+        C.dim,
+        400,
+        true,
+      );
+    }
+    function comparison(v) {
+      backdrop(true);
+      frame("04 / CHOOSE THE PATCH", true);
+      text("All three pass.", 72, 226, 114, C.ink, 700);
+      text("Keep the simplest correct fix.", 76, 317, 63, C.ink, 500);
+      text("SDK TESTS", 835, 422, 18, "#63775a", 500, true);
+      text("PRODUCTION DIFF", 1130, 422, 18, "#63775a", 500, true);
+      lanes.forEach((lane, i) => {
+        const y = 488 + i * 138;
+        const data = selection.candidates[lane];
+        if (lane === selection.lane) rect(64, y - 43, 1792, 111, "#d4e6b6", 12);
+        text(lane, 91, y + 20, 58, C.ink, 700);
+        text(labels[i], 185, y + 14, 36, C.ink, 500);
+        text("29 / 29", 835, y + 14, 31, C.ink, 600, true);
+        rect(1130, y - 7, 510, 20, "#d4d9c9", 10);
+        rect(
+          1130,
+          y - 7,
+          (data.added + data.removed) / 23 * 510 * ease((v - 34000) / 900),
+          20,
+          "#546f3c",
+          10,
+        );
+        text(
+          `+${data.added} / −${data.removed}`,
+          1690,
+          y + 14,
+          27,
+          C.ink,
+          500,
+          true,
+        );
+        if (lane === selection.lane) pill("SELECTED", 153, y + 53, C.ink);
+      });
+      text(
+        "One cancellation owner for the forward’s whole lifetime.",
+        78,
+        962,
+        29,
+        "#5b704c",
+      );
+    }
+    window.renderAt = (_t, v) => {
+      const s = v / 1000;
+      g.clearRect(0, 0, 1920, 1080);
+      if (s < 4) {
+        backdrop();
+        frame("01 / THE BUG");
+        text("The agent finished.", 70, 232, 114, C.paper, 700);
+        text("Its workspace didn’t.", 70, 359, 114, C.lime, 700);
+        terminal(
+          75,
+          470,
+          1120,
+          425,
+          "packages/sdk/src/forward.ts",
+          [
+            "const preview = machine.forward(3000);",
+            "",
+            "await preview.close();",
+            "",
+            "Promise still pending…",
+          ],
+          C.lime,
+          34,
+        );
+        text("A real SDK shutdown hang.", 1260, 595, 38, C.paper, 500);
+        text("TCP accepted.", 1260, 689, 29, C.dim);
+        text("Upgrade never arrives.", 1260, 733, 29, C.dim);
+        pill("REPRODUCED", 1260, 850);
+      } else if (s < 8) {
+        backdrop();
+        frame("01 / CAPTURE THE FAILURE");
+        text("Reproduce it once.", 74, 222, 104, C.paper, 700);
+        terminal(
+          76,
+          316,
+          1120,
+          586,
+          "deno test · forward-close.test.ts",
+          [
+            "FAIL  unanswered upgrade",
+            "FAIL  multiple pending upgrades",
+            "FAIL  client drops during setup",
+            "PASS  established tunnel",
+            "",
+            "Error: forward.close() did not settle",
+            "",
+            "1 passed · 3 failed",
+          ],
+          C.red,
+          31,
+        );
+        shot("origin", 1250, 324, 600, 428);
+        text("Server still running.", 1252, 830, 31, C.paper, 500);
+        text(
+          `PID ${base.pid} · inspector ready`,
+          1252,
+          881,
+          21,
+          C.dim,
+          400,
+          true,
+        );
+        text("Current bug in machine-slop", 1252, 949, 22, C.dim);
+      } else if (s < 12) {
+        backdrop();
+        frame("02 / FORK AT THE DECISION POINT");
+        text("Don’t start over.", 74, 225, 110, C.paper, 700);
+        text("Fork the investigation.", 76, 319, 76, C.lime, 600);
+        flow(v - 8000, 592);
+        pill(`3 COPIES · ${(fork.total_ms / 1000).toFixed(2)} s TOTAL`, 77, 952);
+        text(
+          "Memory + files + running server + shared agent context",
+          1850,
+          950,
+          25,
+          C.dim,
+          400,
+          false,
+          "right",
+        );
+      } else if (s < 16) {
+        backdrop(true);
+        frame("02 / SAME STARTING POINT", true);
+        text("The same live failure.", 74, 232, 106, C.ink, 700);
+        lanes.forEach((lane, i) => {
+          const x = 72 + i * 603;
+          rect(x, 345, 575, 532, "#17211a", 13);
+          text(`MACHINE ${lane}`, x + 27, 402, 23, colors[i], 600, true);
+          text(`PID ${base.pid}`, x + 27, 500, 55, C.paper, 600, true);
+          text("SAME DEBUG SESSION", x + 27, 570, 19, C.dim, 400, true);
+          text(base.session.slice(0, 23), x + 27, 620, 22, colors[i], 500, true);
+          text("cleanup_pending", x + 27, 713, 31, C.paper, 500, true);
+          text("1 passed · 3 failed", x + 27, 800, 27, C.red, 500, true);
+        });
+        text(
+          "All three restored sessions verified before any edits.",
+          78,
+          955,
+          30,
+          "#5f7450",
+        );
+      } else if (s < 34) {
+        backdrop();
+        frame(
+          "03 / THREE INDEPENDENT ATTEMPTS",
+          false,
+          "ACTUAL AGENT COMMANDS + TEST RESULTS / EDITED FOR LENGTH",
+        );
+        text("Try the fixes in parallel.", 74, 201, 99, C.paper, 700);
+        const real = mix(begin, complete + 200, clamp((s - 16) / 17));
+        lanes.forEach((_, i) => branchCard(i, real, v));
+        text(
+          `${
+            ((complete - begin) / 1000).toFixed(1)
+          } s of recorded branch work → 18 s edit`,
+          78,
+          987,
+          20,
+          C.dim,
+          400,
+          true,
+        );
+      } else if (s < 42) comparison(v);
+      else if (s < 51) {
+        backdrop();
+        frame("05 / THE WINNING PATCH");
+        text("Cancel setup.", 74, 226, 112, C.paper, 700);
+        text("Then finish shutdown.", 74, 336, 88, C.lime, 600);
+        terminal(
+          77,
+          418,
+          1760,
+          522,
+          "AGENT A / packages/sdk/src/forward.ts",
+          [
+            "+ private readonly closing = new AbortController();",
+            "",
+            "+ this.closing.abort();",
+            "",
+            "- const remote = await openTunnel(machine, port);",
+            "+ const remote = await openTunnel(machine, port, this.closing.signal);",
+            "+ this.closing.signal.throwIfAborted();",
+          ],
+          C.lime,
+          29,
+        );
+        pill("29 SDK TESTS PASSED", 80, 980);
+        text(
+          "Pending upgrades cancel. Established traffic still works.",
+          1852,
+          979,
+          25,
+          C.dim,
+          400,
+          false,
+          "right",
+        );
+      } else if (s < 60) {
+        backdrop(true);
+        frame("06 / A REAL PULL REQUEST", true);
+        text("Useful work.", 74, 257, 98, C.ink, 700);
+        text("A real fix.", 76, 361, 79, C.ink, 600);
+        pill(`PULL REQUEST #${pr.number}`, 79, 478, C.ink);
+        text("Current SDK bug.", 79, 601, 34, C.ink, 500);
+        text("Regression coverage.", 79, 654, 34, C.ink, 500);
+        text("The selected patch.", 79, 707, 34, C.ink, 500);
+        text("Ready for review.", 79, 823, 44, "#5c744c", 500);
+        shot("pr", 747, 185, 1100, 777);
+        text(
+          "github.com/rahul-bangre/machine-slop",
+          79,
+          963,
+          22,
+          "#5c744c",
+          400,
+          true,
+        );
+      } else {
+        backdrop();
+        const p = ease((v - 60000) / 1200);
+        text("machine/slop", 960, 286, 126, C.paper, 700, false, "center");
+        for (let i = 0; i < 3; i++) {
+          const x = mix(960, 450 + i * 510, p);
+          line(960, 435, x, 567, colors[i], 5);
+          dot(x, 567, 13, colors[i]);
+          line(x, 581, 960, 705, colors[i], 5);
+        }
+        dot(960, 705, 17, C.lime);
+        text("Fork the work.", 960, 847, 78, C.paper, 700, false, "center");
+        text("Keep the fix.", 960, 936, 78, C.lime, 700, false, "center");
+      }
+    };
+    window.ready.then(() => window.renderAt(0, 0));
+    </script>
+  </body>
+</html>
