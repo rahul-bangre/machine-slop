@@ -3,6 +3,7 @@ import { duplex, openTunnel, type Tunnel } from "./tunnel.ts";
 
 export class Forward {
     private readonly open = new Set<Tunnel>();
+    private readonly closing = new AbortController();
     private readonly serving: Promise<void>;
 
     constructor(
@@ -26,8 +27,11 @@ export class Forward {
     }
 
     async close(): Promise<void> {
-        this.listener.close();
-        for (const tunnel of this.open) tunnel.close();
+        if (!this.closing.signal.aborted) {
+            this.closing.abort();
+            this.listener.close();
+            for (const tunnel of this.open) tunnel.close();
+        }
         await this.serving;
     }
 
@@ -55,9 +59,11 @@ export class Forward {
         const tunnels = [local];
         this.open.add(local);
         try {
-            const remote = await openTunnel(machine, port);
+            this.closing.signal.throwIfAborted();
+            const remote = await openTunnel(machine, port, this.closing.signal);
             tunnels.push(remote);
             this.open.add(remote);
+            this.closing.signal.throwIfAborted();
             await Promise.all([
                 local.readable.pipeTo(remote.writable),
                 remote.readable.pipeTo(local.writable),
