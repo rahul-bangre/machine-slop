@@ -19,6 +19,14 @@ async function bounded<T>(promise: Promise<T>, ms = 1000): Promise<T> {
     }
 }
 
+function closeConnection(conn: Deno.Conn): void {
+    try {
+        conn.close();
+    } catch (error) {
+        if (!(error instanceof Deno.errors.BadResource)) throw error;
+    }
+}
+
 async function pending(
     count: number,
     run: (
@@ -53,11 +61,7 @@ async function pending(
         }
         await run(forward, clients, remotes);
     } finally {
-        for (const conn of [...clients, ...remotes]) {
-            try {
-                conn.close();
-            } catch {}
-        }
+        for (const conn of [...clients, ...remotes]) closeConnection(conn);
         listener.close();
         await bounded(forward.close().catch(() => {}));
     }
