@@ -1,0 +1,1364 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fork the agent: research in parallel</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=block"
+      rel="stylesheet">
+    <style>
+    :root {
+      --bg: #0b0d12;
+      --panel: #12151d;
+      --panel2: #181c26;
+      --line: #252a37;
+      --text: #eef0f5;
+      --dim: #8d95a8;
+      --faint: #596178;
+      --green: #3ddc97;
+      --red: #ff5d6c;
+      --blue: #5aa9ff;
+      --amber: #ffb547;
+      --violet: #a98bff;
+      --c1: #5aa9ff;
+      --c2: #a98bff;
+      --c3: #ff8f5a;
+      --mono: "JetBrains Mono", ui-monospace, monospace;
+      --sans: "Inter", system-ui, sans-serif;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html,
+    body {
+      margin: 0;
+      width: 1920px;
+      height: 1080px;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background: radial-gradient(1100px 520px at 75% -15%, #1b2541 0%, transparent
+        60%);
+      pointer-events: none;
+    }
+    #stage {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      grid-template-rows: 112px 150px minmax(0, 1fr) 84px;
+    }
+    header {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 30px;
+      align-items: center;
+      padding: 0 40px;
+    }
+    .task .label {
+      font-family: var(--mono);
+      font-size: 13px;
+      letter-spacing: .14em;
+      color: var(--blue);
+      font-weight: 600;
+    }
+    .task .text {
+      font-size: 21px;
+      line-height: 1.38;
+      font-weight: 600;
+      margin-top: 6px;
+      max-width: 1480px;
+    }
+    .right {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 10px;
+    }
+    .brand {
+      font-weight: 800;
+      font-size: 19px;
+    }
+    .brand span {
+      color: var(--dim);
+      font-weight: 500;
+      font-size: 14px;
+      margin-left: 8px;
+    }
+    .clockrow {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .clock {
+      font-family: var(--mono);
+      font-size: 17px;
+      color: var(--dim);
+    }
+    .speed {
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1.5px solid var(--line);
+      min-width: 150px;
+      text-align: center;
+    }
+    .speed.slow {
+      color: var(--violet);
+      border-color: var(--violet);
+    }
+    .speed.fast {
+      color: var(--amber);
+      border-color: var(--amber);
+    }
+    .speed.live {
+      color: var(--green);
+      border-color: var(--green);
+    }
+    #graph {
+      margin: 0 40px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+    }
+    #graph svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    main {
+      position: relative;
+      padding: 16px 40px 0;
+      min-height: 0;
+    }
+    .view {
+      position: absolute;
+      inset: 16px 40px 0;
+      display: none;
+    }
+    #single {
+      grid-template-columns: minmax(0, 1fr) 580px;
+      gap: 22px;
+    }
+    .window {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 12px;
+      background: var(--panel2);
+      border-bottom: 1px solid var(--line);
+    }
+    .dots {
+      display: flex;
+      gap: 6px;
+    }
+    .dots i {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--line);
+    }
+    .url {
+      flex: 1;
+      font-family: var(--mono);
+      font-size: 14px;
+      background: #0d1017;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 11px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .url b {
+      color: var(--green);
+      font-weight: 600;
+    }
+    .where {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--dim);
+      white-space: nowrap;
+    }
+    .where b {
+      color: var(--green);
+    }
+    .screen {
+      flex: 1;
+      min-height: 0;
+      background: #fff center top / 100% auto no-repeat;
+      position: relative;
+    }
+    .screen.empty {
+      background: #0d1017;
+      display: grid;
+      place-items: center;
+      color: var(--faint);
+      font-family: var(--mono);
+      font-size: 17px;
+    }
+    .badge {
+      position: absolute;
+      left: 14px;
+      bottom: 14px;
+      padding: 8px 12px;
+      border-radius: 10px;
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 600;
+      background: rgba(11, 13, 18, .88);
+      color: var(--green);
+      border: 1px solid var(--green);
+    }
+    .agent {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .avatar {
+      width: 38px;
+      height: 38px;
+      border-radius: 11px;
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      color: #fff;
+      font-size: 17px;
+      background: linear-gradient(135deg, #d97757, #b4532f);
+      flex: none;
+    }
+    .who {
+      font-weight: 700;
+      font-size: 18px;
+      min-width: 0;
+    }
+    .who small {
+      display: block;
+      color: var(--dim);
+      font-weight: 500;
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .status {
+      margin-left: auto;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 5px 10px;
+      border-radius: 999px;
+      border: 1.5px solid var(--line);
+      color: var(--dim);
+      white-space: nowrap;
+    }
+    .status.thinking {
+      color: var(--violet);
+      border-color: var(--violet);
+    }
+    .status.acting {
+      color: var(--blue);
+      border-color: var(--blue);
+    }
+    .status.done {
+      color: #0b0d12;
+      background: var(--green);
+      border-color: var(--green);
+    }
+    .status.paused {
+      color: var(--blue);
+      border-color: var(--blue);
+      background: #12203a;
+    }
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      min-height: 0;
+      justify-content: flex-end;
+      flex: 1;
+      overflow: hidden;
+    }
+    .step {
+      display: grid;
+      grid-template-columns: 30px minmax(0, 1fr);
+      gap: 11px;
+      padding: 11px 13px;
+      border-radius: 12px;
+      background: var(--panel2);
+      border: 1px solid transparent;
+    }
+    .step.old {
+      opacity: .5;
+    }
+    .step.now {
+      border-color: var(--blue);
+      background: #141c2c;
+    }
+    .step.key {
+      border-color: var(--amber);
+      background: #231c10;
+    }
+    .step.fork {
+      border-color: var(--violet);
+      background: #1b1630;
+    }
+    .num {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--line);
+      display: grid;
+      place-items: center;
+      font-family: var(--mono);
+      font-weight: 600;
+      font-size: 13px;
+    }
+    .step.now .num {
+      background: var(--blue);
+      color: #08101f;
+    }
+    .step.key .num {
+      background: var(--amber);
+      color: #1a1205;
+    }
+    .step.fork .num {
+      background: var(--violet);
+      color: #120b26;
+    }
+    .intent {
+      font-size: 17px;
+      line-height: 1.35;
+      font-weight: 500;
+    }
+    .caret {
+      display: inline-block;
+      width: 8px;
+      height: 17px;
+      background: var(--violet);
+      vertical-align: -3px;
+      margin-left: 2px;
+    }
+    .act {
+      margin-top: 5px;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      color: var(--dim);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .act .k {
+      color: var(--blue);
+      font-weight: 600;
+    }
+    .act .ok {
+      color: var(--green);
+    }
+    .act .no {
+      color: var(--red);
+    }
+    .branches {
+      margin-top: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .branches div {
+      font-size: 14.5px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .branches i {
+      width: 20px;
+      height: 20px;
+      border-radius: 6px;
+      display: grid;
+      place-items: center;
+      font-style: normal;
+      font-weight: 800;
+      font-size: 12px;
+      color: #0b0d12;
+      flex: none;
+    }
+    .callout {
+      margin-top: 7px;
+      font-size: 14px;
+      line-height: 1.4;
+      color: #ffd9a0;
+    }
+    .callout b {
+      color: var(--amber);
+    }
+    .thinkrow {
+      color: var(--violet);
+      font-family: var(--mono);
+      font-size: 13.5px;
+      padding: 3px 13px;
+    }
+    #triple {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+    .col {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 0;
+      background: var(--panel);
+      border: 1.5px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+    }
+    .col .window {
+      flex: 0 0 auto;
+      border-radius: 12px;
+    }
+    .col .screen {
+      flex: none;
+      height: 330px;
+    }
+    .col .steps {
+      justify-content: flex-start;
+    }
+    .col .step {
+      padding: 9px 11px;
+    }
+    .col .intent {
+      font-size: 15.5px;
+    }
+    .sectionstate {
+      font-family: var(--mono);
+      font-size: 13px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      background: var(--panel2);
+      color: var(--dim);
+    }
+    .sectionstate.ok {
+      color: var(--green);
+      background: rgba(61,220,151,.1);
+    }
+    #forkview {
+      place-items: center;
+    }
+    .forkcard {
+      width: 1240px;
+      background: var(--panel);
+      border: 1.5px solid var(--violet);
+      border-radius: 22px;
+      padding: 34px 40px;
+      box-shadow: 0 0 80px -20px var(--violet);
+    }
+    .forkcard .kicker {
+      font-family: var(--mono);
+      color: var(--violet);
+      font-size: 18px;
+      letter-spacing: .14em;
+    }
+    .forkcard h2 {
+      font-size: 44px;
+      margin: 12px 0 24px;
+      letter-spacing: -.01em;
+    }
+    .forkline {
+      display: flex;
+      gap: 16px;
+      align-items: baseline;
+      font-size: 23px;
+      padding: 9px 0;
+      opacity: .25;
+    }
+    .forkline.on {
+      opacity: 1;
+    }
+    .forkline .ic {
+      width: 34px;
+      font-size: 24px;
+    }
+    .forkline b {
+      font-family: var(--mono);
+      color: var(--green);
+    }
+    .forkline span.sub {
+      color: var(--dim);
+      font-size: 18px;
+    }
+    #joinview {
+      place-items: center;
+    }
+    .join {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 22px;
+      width: 1780px;
+    }
+    .sec {
+      background: var(--panel);
+      border-radius: 16px;
+      padding: 20px 22px;
+      border: 1.5px solid var(--line);
+    }
+    .sec h3 {
+      margin: 0 0 10px;
+      font-size: 19px;
+    }
+    .sec p {
+      margin: 0;
+      color: var(--dim);
+      font-size: 15.5px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      max-height: 330px;
+      overflow: hidden;
+    }
+    .jointitle {
+      text-align: center;
+      margin-bottom: 26px;
+    }
+    .jointitle h2 {
+      font-size: 40px;
+      margin: 8px 0;
+    }
+    .jointitle p {
+      color: var(--dim);
+      font-size: 21px;
+      margin: 0;
+    }
+    .jointitle b {
+      color: var(--green);
+      font-family: var(--mono);
+    }
+    footer {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 40px;
+    }
+    .fact {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 15px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--faint);
+      font-size: 15px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .fact i {
+      font-style: normal;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--line);
+    }
+    .fact.on {
+      color: var(--text);
+    }
+    .fact.on i {
+      background: var(--green);
+      box-shadow: 0 0 12px var(--green);
+    }
+    .fact.hot {
+      border-color: var(--violet);
+      box-shadow: 0 0 0 1px var(--violet), 0 0 30px -8px var(--violet);
+    }
+    .fact.hot i {
+      background: var(--violet);
+      box-shadow: 0 0 12px var(--violet);
+    }
+    .fact b {
+      font-family: var(--mono);
+      font-weight: 600;
+    }
+    .spacer {
+      flex: 1;
+    }
+    #overlay {
+      position: absolute;
+      inset: 0;
+      display: none;
+      place-items: center;
+      background: rgba(8, 10, 14, .95);
+    }
+    .card {
+      max-width: 1440px;
+    }
+    .card .kicker {
+      font-family: var(--mono);
+      color: var(--blue);
+      font-size: 20px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    .card h1 {
+      font-size: 50px;
+      line-height: 1.25;
+      margin: 22px 0 26px;
+      font-weight: 700;
+    }
+    .card p {
+      font-size: 25px;
+      color: var(--dim);
+      margin: 0;
+      line-height: 1.5;
+    }
+    .card p b {
+      color: var(--text);
+    }
+    .result {
+      display: grid;
+      grid-template-columns: 1100px 1fr;
+      gap: 44px;
+      align-items: center;
+      padding: 0 60px;
+      width: 100%;
+    }
+    .result .shot {
+      height: 760px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: #fff center top / 100% auto no-repeat;
+    }
+    .result h2 {
+      font-size: 44px;
+      margin: 14px 0 16px;
+      line-height: 1.15;
+    }
+    .result .link {
+      font-family: var(--mono);
+      font-size: 19px;
+      color: var(--green);
+      word-break: break-all;
+    }
+    .result ul {
+      list-style: none;
+      padding: 0;
+      margin: 28px 0 0;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .result li {
+      font-size: 21px;
+      color: var(--dim);
+    }
+    .result li b {
+      color: var(--text);
+      font-family: var(--mono);
+    }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <header>
+        <div class="task">
+          <div class="label">THE TASK WE GAVE THE AGENT</div>
+          <div class="text" id="task"></div>
+        </div>
+        <div class="right">
+          <div
+            class="brand">◆ machine slop<span>a computer for agents</span></div>
+          <div
+            class="clockrow"><span class="clock" id="clock"></span><span class="speed" id="speed"></span></div>
+        </div>
+      </header>
+      <div id="graph">
+        <svg viewBox="0 0 1840 150" id="graphsvg"></svg>
+      </div>
+      <main>
+        <div class="view" id="single">
+          <div class="window">
+            <div
+              class="bar"><span class="dots"><i></i><i></i><i></i></span><div class="url" id="url"></div><span class="where">Chromium · <b>inside the agent's machine</b></span></div>
+            <div class="screen" id="screen"></div>
+          </div>
+          <div class="agent">
+            <div class="head">
+              <div class="avatar">C</div>
+              <div class="who" id="who"></div>
+              <div class="status" id="status"></div>
+            </div>
+            <div class="steps" id="steps"></div>
+          </div>
+        </div>
+        <div class="view" id="forkview"></div>
+        <div class="view" id="triple"></div>
+        <div class="view" id="joinview"></div>
+      </main>
+      <footer id="facts"></footer>
+    </div>
+    <div id="overlay"></div>
+    <script>
+    const RUN = window.RUN;
+    const E = RUN.events;
+    const first = (pred) => E.find(pred);
+    const last = (t, pred) => {
+      let found = null;
+      for (const e of E) {
+        if (e.t > t) break;
+        if (pred(e)) found = e;
+      }
+      return found;
+    };
+    const upto = (t, pred) => E.filter((e) => e.t <= t && pred(e));
+    const esc = (s) =>
+      String(s ?? "").replace(
+        /[&<>"]/g,
+        (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
+      );
+    const fmtMs = (ms) =>
+      ms < 1000
+        ? `${Math.round(ms)} ms`
+        : ms < 60000
+        ? `${(ms / 1000).toFixed(1)} s`
+        : `${Math.floor(ms / 60000)}m ${
+          String(Math.round(ms / 1000) % 60).padStart(2, "0")
+        }s`;
+    const sceneAt = (id) =>
+      first((e) => e.type === "scene" && e.id === id)?.t ?? Infinity;
+    const run = first((e) => e.type === "run");
+    const boot = first((e) => e.type === "machine" && e.lane === "main");
+    const origin = boot.t - boot.ms;
+    const decision = first((e) => e.type === "fork_decision");
+    const branches = (decision?.branches ?? []).map((b) => b.split(" (")[0].trim());
+    const pauseEvt = first((e) =>
+      e.type === "machine" && e.lane === "main" && e.state === "paused"
+    );
+    const snap = first((e) => e.type === "snapshot");
+    const forkEvt = first((e) => e.type === "fork");
+    const resumeEvt = first((e) =>
+      e.type === "machine" && e.lane === "main" && e.resumed
+    );
+    const issue = first((e) => e.type === "issue");
+    const done = first((e) => e.type === "done");
+    const base = first((e) => e.type === "usage_base");
+    const final = first((e) => e.type === "usage");
+    const sectionsEvt = E.filter((e) => e.type === "section").sort((a, b) =>
+      Number(a.lane) - Number(b.lane)
+    );
+    const branchStarts = E.filter((e) => e.type === "branch_start");
+    const agentWork = sectionsEvt.reduce((sum, s) => sum + s.ms, 0);
+    const parallelWall = sectionsEvt.length
+      ? Math.max(...sectionsEvt.map((s) => s.t)) - sceneAt("parallel")
+      : 0;
+    const COLORS = ["var(--c1)", "var(--c2)", "var(--c3)"];
+    const modelName = {
+      "claude-opus-5-5": "Claude Opus 5.5",
+      "claude-sonnet-5-5": "Claude Sonnet 5.5",
+    }[run.model] ?? run.model;
+    const cost = (u) =>
+      !u || !base ? 0 : (u.vcpu_ms - base.vcpu_ms) / 3600000 * 0.0504 +
+        (u.memory_mib_ms - base.memory_mib_ms) / 1024 / 3600000 * 0.0162;
+    const shortUrl = (u) =>
+      (u ?? "").replace(/^https?:\/\//, "").replace(/\/$/, "");
+    const clip = (s, n) => s.length > n ? s.slice(0, n - 1) + "…" : s;
+    document.getElementById("task").textContent = run.prompt;
+
+    function actionLine(step, t) {
+      if (step.action === "open") {
+        const page = last(
+          t,
+          (e) =>
+            e.type === "page" && e.lane === step.lane && e.n === step.n &&
+            e.t >= step.t,
+        );
+        return `<span class="k">open</span> ${esc(shortUrl(step.url))}${
+          page
+            ? ` <span class="ok">✓ read ${page.chars.toLocaleString()} chars</span>`
+            : " …"
+        }`;
+      }
+      if (step.action === "shell") {
+        const res = last(
+          t,
+          (e) =>
+            e.type === "shell" && e.lane === step.lane && e.n === step.n &&
+            e.t >= step.t,
+        );
+        const lines = (step.command ?? "").split("\n");
+        const shown = lines.find((l) => /^\s*curl\b/.test(l))?.trim() ??
+          lines.find((l) => l.trim()) ?? "";
+        return `<span class="k">$</span> ${esc(shown.slice(0, 110))}${
+          res
+            ? ` <span class="${res.exit_code === 0 ? "ok" : "no"}">${
+              res.exit_code === 0 ? "✓" : "✗ exit " + res.exit_code
+            }</span>`
+            : " …"
+        }`;
+      }
+      if (step.action === "fork") {
+        return `<span class="k" style="color:var(--violet)">fork ×${branches.length}</span>`;
+      }
+      if (step.action === "done") return `<span class="ok">✓ done</span>`;
+      return "";
+    }
+
+    function stepsHtml(lane, t, vt, from, limit, compact) {
+      const steps = upto(
+        t,
+        (e) => e.type === "step" && e.lane === lane && e.t >= from,
+      );
+      const thinking = last(
+        t,
+        (e) => e.type === "thinking" && e.lane === lane && e.t >= from,
+      );
+      const isThinking = thinking && (!steps.length || steps.at(-1).t < thinking.t);
+      const html = steps.slice(-limit).map((s, i, arr) => {
+        const isLast = i === arr.length - 1;
+        const posts = s.action === "shell" &&
+          /api\.github\.com/.test(s.command ?? "");
+        const typed = isLast
+          ? s.intent.slice(0, Math.max(0, Math.floor((vt - s.vt) / 20)))
+          : s.intent;
+        const typing = isLast && typed.length < s.intent.length;
+        const cls = s.action === "fork"
+          ? "fork"
+          : posts
+          ? "key"
+          : isLast && !isThinking
+          ? "now"
+          : "old";
+        const extra = s.action === "fork"
+          ? `<div class="branches">${
+            (s.branches ?? []).map((b, k) =>
+              `<div><i style="background:${COLORS[k]}">${k + 1}</i>${esc(b)}</div>`
+            ).join("")
+          }</div>`
+          : posts
+          ? `<div class="callout"><b>No token in this command.</b> machined adds it on the way out, so it never enters any machine.</div>`
+          : "";
+        return `<div class="step ${cls}"><div class="num">${s.n}</div><div><div class="intent">${
+          esc(typed)
+        }${typing ? '<span class="caret"></span>' : ""}</div><div class="act">${
+          actionLine(s, t)
+        }</div>${compact ? "" : extra}</div></div>`;
+      }).join("");
+      const dots = ".".repeat(1 + Math.floor(vt / 350) % 3);
+      return {
+        html: html +
+          (isThinking ? `<div class="thinkrow">thinking${dots}</div>` : ""),
+        isThinking,
+        steps,
+      };
+    }
+
+    function setBrowser(screenEl, urlEl, frame, emptyText) {
+      if (!frame) {
+        screenEl.className = "screen empty";
+        screenEl.style.backgroundImage = "none";
+        screenEl.innerHTML = emptyText;
+        urlEl.innerHTML = "&nbsp;";
+        return;
+      }
+      screenEl.className = "screen";
+      screenEl.innerHTML = frame.label === "resumed"
+        ? `<div class="badge">resumed: the same page is still open</div>`
+        : "";
+      screenEl.style.backgroundImage = `url('${frame.file}')`;
+      const u = frame.url.match(/^(https?:\/\/)([^/]+)(.*)$/);
+      urlEl.innerHTML = u
+        ? `${esc(u[1])}<b>${esc(u[2])}</b>${esc(u[3])}`
+        : esc(frame.url);
+    }
+
+    function renderGraph(t) {
+      const x0 = 30,
+        xs = 430,
+        xf = 480,
+        xb = 560,
+        xe = 1380,
+        xj = 1460,
+        xm = 1540,
+        x1 = 1810;
+      const yMain = 92, ys = [48, 92, 136];
+      const parts = [];
+      const scoutEnd = decision?.t ?? Infinity;
+      const pScout = Math.min(1, Math.max(0, (t - origin) / (scoutEnd - origin)));
+      parts.push(
+        `<text x="${x0}" y="20" font-size="13" font-family="var(--mono)" fill="var(--dim)">1 · ONE AGENT SKIMS AND PLANS</text>`,
+      );
+      parts.push(
+        `<line x1="${x0}" y1="${yMain}" x2="${xs}" y2="${yMain}" stroke="var(--line)" stroke-width="6" stroke-linecap="round"/>`,
+      );
+      parts.push(
+        `<line x1="${x0}" y1="${yMain}" x2="${
+          x0 + (xs - x0) * pScout
+        }" y2="${yMain}" stroke="var(--green)" stroke-width="6" stroke-linecap="round"/>`,
+      );
+      const forked = forkEvt && t >= forkEvt.t;
+      parts.push(
+        `<text x="${
+          xf - 4
+        }" y="20" font-size="13" font-family="var(--mono)" fill="${
+          t >= (decision?.t ?? Infinity) ? "var(--violet)" : "var(--faint)"
+        }" text-anchor="middle">FORK</text>`,
+      );
+      parts.push(
+        `<text x="${
+          xb + 14
+        }" y="20" font-size="13" font-family="var(--mono)" fill="var(--dim)">2 · ${
+          branches.length || 3
+        } COPIES RESEARCH IN PARALLEL</text>`,
+      );
+      for (let k = 0; k < 3; k++) {
+        const lane = String(k + 1);
+        const start = branchStarts.find((b) => b.lane === lane)?.t ?? Infinity;
+        const end = sectionsEvt.find((s) => s.lane === lane)?.t ?? Infinity;
+        const machineUp = first((e) =>
+          e.type === "machine" && e.lane === lane && e.state === "running"
+        );
+        const born = machineUp && t >= machineUp.t;
+        const p = Math.min(1, Math.max(0, (t - start) / (end - start)));
+        const y = ys[k];
+        const color = COLORS[k];
+        parts.push(
+          `<path d="M${xs} ${yMain} C ${xf} ${yMain}, ${xf} ${y}, ${xb} ${y}" stroke="${
+            born ? color : "var(--line)"
+          }" stroke-width="4" fill="none" stroke-dasharray="${
+            born ? "0" : "6 6"
+          }"/>`,
+        );
+        parts.push(
+          `<line x1="${xb}" y1="${y}" x2="${xe}" y2="${y}" stroke="var(--line)" stroke-width="6" stroke-linecap="round" stroke-dasharray="${
+            born ? "0" : "6 8"
+          }"/>`,
+        );
+        if (born) {
+          parts.push(
+            `<line x1="${xb}" y1="${y}" x2="${
+              xb + (xe - xb) * p
+            }" y2="${y}" stroke="${color}" stroke-width="6" stroke-linecap="round"/>`,
+          );
+        }
+        const topic = branches[k] ? clip(branches[k], 80) : `copy ${lane}`;
+        parts.push(
+          `<text x="${xb + 14}" y="${y - 10}" font-size="13.5" fill="${
+            born ? "var(--text)" : "var(--faint)"
+          }" font-weight="600">${k + 1}. ${esc(topic)}</text>`,
+        );
+        const merged = t >= end;
+        parts.push(
+          `<path d="M${xe} ${y} C ${xj - 30} ${y}, ${xj - 30} ${yMain}, ${
+            xj + 40
+          } ${yMain}" stroke="${
+            merged ? color : "var(--line)"
+          }" stroke-width="4" fill="none" stroke-dasharray="${
+            merged ? "0" : "6 6"
+          }"/>`,
+        );
+        if (born && !merged && p > 0) {
+          parts.push(
+            `<circle cx="${
+              xb + (xe - xb) * p
+            }" cy="${y}" r="8" fill="${color}" stroke="#0b0d12" stroke-width="3"/>`,
+          );
+        }
+      }
+      const mergeStart = resumeEvt?.t ?? Infinity;
+      const mergeEnd = issue?.t ?? done?.t ?? Infinity;
+      const pMerge = Math.min(
+        1,
+        Math.max(0, (t - mergeStart) / (mergeEnd - mergeStart)),
+      );
+      parts.push(
+        `<text x="${xm}" y="20" font-size="13" font-family="var(--mono)" fill="var(--dim)">3 · MERGE AND POST</text>`,
+      );
+      parts.push(
+        `<line x1="${xm}" y1="${yMain}" x2="${x1}" y2="${yMain}" stroke="var(--line)" stroke-width="6" stroke-linecap="round"/>`,
+      );
+      if (t >= mergeStart) {
+        parts.push(
+          `<line x1="${xm}" y1="${yMain}" x2="${
+            xm + (x1 - xm) * pMerge
+          }" y2="${yMain}" stroke="var(--green)" stroke-width="6" stroke-linecap="round"/>`,
+        );
+      }
+      if (t < scoutEnd) {
+        parts.push(
+          `<circle cx="${
+            x0 + (xs - x0) * pScout
+          }" cy="${yMain}" r="9" fill="var(--green)" stroke="#0b0d12" stroke-width="3"/>`,
+        );
+      }
+      if (t >= mergeStart && pMerge < 1) {
+        parts.push(
+          `<circle cx="${
+            xm + (x1 - xm) * pMerge
+          }" cy="${yMain}" r="9" fill="var(--green)" stroke="#0b0d12" stroke-width="3"/>`,
+        );
+      }
+      const paused = pauseEvt && t >= pauseEvt.t &&
+        !(resumeEvt && t >= resumeEvt.t);
+      parts.push(
+        `<rect x="${xs - 4}" y="${yMain - 13}" width="${
+          xm - xs + 8
+        }" height="26" rx="13" fill="none"/>`,
+      );
+      if (paused) {
+        parts.push(
+          `<text x="${(xs + xm) / 2 + 160}" y="${
+            yMain + 5
+          }" font-size="12.5" font-family="var(--mono)" fill="var(--blue)" text-anchor="middle"></text>`,
+        );
+      }
+      parts.push(
+        `<text x="${xs - 12}" y="${
+          yMain + 30
+        }" font-size="12.5" font-family="var(--mono)" fill="var(--blue)" text-anchor="end">${
+          paused ? "original paused · 0 MB RAM" : ""
+        }</text>`,
+      );
+      if (forked) {
+        parts.push(
+          `<circle cx="${xs}" cy="${yMain}" r="11" fill="var(--violet)"/>`,
+        );
+      }
+      if (t >= mergeStart) {
+        parts.push(
+          `<circle cx="${xj + 40}" cy="${yMain}" r="11" fill="var(--green)"/>`,
+        );
+      }
+      document.getElementById("graphsvg").innerHTML = parts.join("");
+    }
+
+    function renderSingle(t, vt) {
+      const from = resumeEvt && t >= resumeEvt.t ? resumeEvt.t : 0;
+      const frame = last(
+        t,
+        (e) => e.type === "frame" && e.lane === "main" && (e.label !== "blank"),
+      );
+      setBrowser(
+        document.getElementById("screen"),
+        document.getElementById("url"),
+        frame,
+        boot && t >= boot.t
+          ? "browser ready · waiting for the agent's first step"
+          : "starting a fresh computer…",
+      );
+      const { html, isThinking, steps } = stepsHtml("main", t, vt, from, 6, false);
+      const intro = from
+        ? `<div class="step fork"><div class="num">⇠</div><div><div class="intent">${sectionsEvt.length} sections came back from the copies</div><div class="act"><span class="ok">✓ copied into /workspace/sections · original resumed in ${
+          fmtMs(resumeEvt.ms)
+        }</span></div></div></div>`
+        : "";
+      document.getElementById("steps").innerHTML = intro + html;
+      document.getElementById("who").innerHTML = `${modelName}<small>${
+        from ? "the original agent, resumed" : "the original agent"
+      }</small>`;
+      const st = document.getElementById("status");
+      const dots = ".".repeat(1 + Math.floor(vt / 350) % 3);
+      if (done && t >= done.t) {
+        st.className = "status done";
+        st.textContent = "✓ finished";
+      } else if (isThinking) {
+        st.className = "status thinking";
+        st.textContent = `thinking${dots}`;
+      } else if (steps.length) {
+        st.className = "status acting";
+        st.textContent = steps.at(-1).action === "open"
+          ? "browsing"
+          : steps.at(-1).action === "fork"
+          ? "forking"
+          : "running a command";
+      } else {
+        st.className = "status";
+        st.textContent = "starting";
+      }
+    }
+
+    function renderFork(t, vt) {
+      const childrenUp = E.filter((e) =>
+        e.type === "machine" && /^\d$/.test(e.lane) && e.state === "running" &&
+        e.t <= t
+      );
+      const lines = [
+        [
+          decision && t >= decision.t,
+          "🧭",
+          `The agent decided to split the research ${branches.length} ways`,
+          "",
+        ],
+        [
+          pauseEvt && t >= pauseEvt.t,
+          "⏸",
+          `Paused the computer: memory and disk saved in <b>${
+            pauseEvt ? fmtMs(pauseEvt.ms) : ""
+          }</b>`,
+          "",
+        ],
+        [
+          snap && t >= snap.t,
+          "📸",
+          `Snapshot of that exact moment in <b>${snap ? fmtMs(snap.ms) : ""}</b>`,
+          "",
+        ],
+        [
+          childrenUp.length > 0,
+          "🔀",
+          `${childrenUp.length || branches.length} copies running in <b>${
+            forkEvt && t >= forkEvt.t ? fmtMs(forkEvt.ms) : "…"
+          }</b>`,
+          `<span class="sub">same browser, same open page, same files</span>`,
+        ],
+        [
+          forkEvt && t >= forkEvt.t,
+          "🧠",
+          "The agent's conversation was copied too",
+          `<span class="sub">each copy remembers everything the original read</span>`,
+        ],
+      ];
+      document.getElementById("forkview").innerHTML =
+        `<div class="forkcard"><div class="kicker">FORK ×${branches.length}</div><h2>Copy the running computer and the agent's memory</h2>${
+          lines.map(([on, ic, text, sub]) =>
+            `<div class="forkline ${
+              on ? "on" : ""
+            }"><span class="ic">${ic}</span><div>${text} ${sub}</div></div>`
+          ).join("")
+        }</div>`;
+    }
+
+    function renderTriple(t, vt) {
+      document.getElementById("triple").innerHTML = [0, 1, 2].map((k) => {
+        const lane = String(k + 1);
+        const frame = last(t, (e) => e.type === "frame" && e.lane === lane);
+        const section = last(t, (e) => e.type === "section" && e.lane === lane);
+        const destroyed = last(
+          t,
+          (e) => e.type === "machine" && e.lane === lane && e.state === "destroyed",
+        );
+        const { html, isThinking, steps } = stepsHtml(lane, t, vt, 0, 3, true);
+        const dots = ".".repeat(1 + Math.floor(vt / 350) % 3);
+        const status = section
+          ? ["done", "✓ section written"]
+          : isThinking
+          ? ["thinking", `thinking${dots}`]
+          : steps.length
+          ? ["acting", steps.at(-1).action === "open" ? "browsing" : "running"]
+          : ["", "starting"];
+        const u = frame?.url.match(/^(https?:\/\/)([^/]+)(.*)$/);
+        const forkedBadge = frame?.label === "forked"
+          ? `<div class="badge">same page as the original, already open</div>`
+          : "";
+        const words = section ? section.text.trim().split(/\s+/).length : 0;
+        return `<div class="col" style="border-color:${
+          section ? "var(--green)" : COLORS[k]
+        };${destroyed ? "opacity:.4" : ""}">
+          <div class="head"><div class="avatar" style="background:${
+          COLORS[k]
+        };color:#0b0d12">${lane}</div><div class="who">Copy ${lane}<small>${
+          esc(branches[k] ?? "")
+        }</small></div><div class="status ${status[0]}">${status[1]}</div></div>
+          <div class="window"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><div class="url" style="font-size:12px">${
+          u ? `${esc(u[1])}<b>${esc(u[2])}</b>${esc(u[3])}` : "&nbsp;"
+        }</div></div><div class="screen" style="background-image:url('${
+          frame?.file ?? ""
+        }')">${forkedBadge}</div></div>
+          <div class="steps">${html}</div>
+          <div class="sectionstate ${section ? "ok" : ""}">${
+          section
+            ? `✓ /workspace/sections/${lane}.md · ${words} words · ${
+              fmtMs(section.ms)
+            }`
+            : "researching…"
+        }</div>
+        </div>`;
+      }).join("");
+    }
+
+    function renderJoin() {
+      const cards = sectionsEvt.map((s) => {
+        const k = Number(s.lane) - 1;
+        const lines = s.text.trim().split("\n");
+        const title = (lines.find((l) => l.startsWith("#")) ?? branches[k] ?? "")
+          .replace(/^#+\s*/, "").replace(/^\d+\.\s*/, "");
+        const body = lines.filter((l) => !l.startsWith("#")).join("\n").trim()
+          .replace(/\*\*/g, "").replace(/`/g, "").replace(
+            /\[([^\]]+)\]\([^)]+\)/g,
+            "$1",
+          );
+        return `<div class="sec" style="border-color:${COLORS[k]}"><h3>${k + 1}. ${
+          esc(title)
+        }</h3><p>${esc(clip(body, 520))}</p></div>`;
+      }).join("");
+      document.getElementById("joinview").innerHTML =
+        `<div><div class="jointitle"><div class="card"><div class="kicker" style="color:var(--green)">MERGE</div></div><h2>${sectionsEvt.length} copies, ${sectionsEvt.length} sections, back in the original</h2><p><b>${
+          fmtMs(agentWork)
+        }</b> of research finished in <b>${
+          fmtMs(parallelWall)
+        }</b> · copies destroyed · original resumed in <b>${
+          resumeEvt ? fmtMs(resumeEvt.ms) : ""
+        }</b></p></div><div class="join">${cards}</div></div>`;
+    }
+
+    function renderFacts(t) {
+      const posted = last(t, (e) => e.type === "egress");
+      const facts = [
+        [
+          boot && t >= boot.t,
+          `Fresh computer · booted in <b>${fmtMs(boot.boot_ms)}</b>`,
+          false,
+        ],
+        [
+          forkEvt && t >= forkEvt.t,
+          `Fork ×${branches.length} in <b>${
+            forkEvt ? fmtMs(forkEvt.ms) : ""
+          }</b> · browser and memory copied`,
+          t >= (decision?.t ?? Infinity) && t < sceneAt("parallel") + 8000,
+        ],
+        [
+          sectionsEvt.length && t >= Math.max(...sectionsEvt.map((s) => s.t)),
+          `<b>${fmtMs(agentWork)}</b> of research in <b>${fmtMs(parallelWall)}</b>`,
+          false,
+        ],
+        [
+          posted && t >= posted.t,
+          `GitHub token: <b>never inside a machine</b>`,
+          false,
+        ],
+      ];
+      const usage = last(t, (e) => e.type === "usage");
+      document.getElementById("facts").innerHTML =
+        facts.map(([on, text, hot]) =>
+          `<div class="fact ${on ? "on" : ""} ${
+            hot ? "hot" : ""
+          }"><i></i>${text}</div>`
+        ).join("") +
+        `<div class="spacer"></div><div class="fact on" style="color:var(--dim)">${
+          usage
+            ? `Compute: <b style="color:var(--green)">$${
+              cost(usage).toFixed(4)
+            }</b>`
+            : `Elapsed <b>${fmtMs(Math.max(0, t - origin))}</b>`
+        }</div>`;
+    }
+
+    function renderOverlay(kind, t, vt) {
+      const o = document.getElementById("overlay");
+      if (!kind || kind === "join") {
+        o.style.display = "none";
+        return;
+      }
+      o.style.display = "grid";
+      if (kind === "intro") {
+        const shown = run.prompt.slice(0, Math.max(0, Math.floor((vt - 600) / 17)));
+        o.innerHTML =
+          `<div class="card"><div class="kicker">One instruction · real websites · nothing simulated</div><h1>“${
+            esc(shown)
+          }<span class="caret" style="height:44px;width:15px;vertical-align:-6px"></span>”</h1><p>The agent gets <b>one fresh computer with a browser</b>, and one extra power: it can <b>fork</b> that computer and itself.</p></div>`;
+      } else if (kind === "result") {
+        const shot = E.find((e) => e.type === "frame" && e.label === "issue");
+        const total = (issue ?? done).t - origin;
+        o.innerHTML =
+          `<div class="result"><div class="shot" style="background-image:url('${
+            shot?.file ?? ""
+          }')"></div><div><div class="card"><div class="kicker">Result</div></div><h2>One issue, researched by ${branches.length} copies at once</h2><div class="link">${
+            esc(issue?.url ?? "")
+          }</div><ul><li>Prompt to issue: <b>${
+            fmtMs(total)
+          }</b></li><li>Fork ×${branches.length}: <b>${
+            fmtMs(forkEvt.ms)
+          }</b>, browser page still open</li><li>Research: <b>${
+            fmtMs(agentWork)
+          }</b> of work in <b>${
+            fmtMs(parallelWall)
+          }</b></li><li>Secrets inside any machine: <b>0</b></li><li>Compute: <b>$${
+            cost(final).toFixed(4)
+          }</b></li></ul></div></div>`;
+      }
+    }
+
+    window.renderAt = (t, vt, speed, overlay) => {
+      const clock = Math.max(0, t - origin);
+      document.getElementById("clock").textContent = `T+${
+        String(Math.floor(clock / 60000)).padStart(2, "0")
+      }:${String(Math.floor(clock / 1000) % 60).padStart(2, "0")}`;
+      const sp = document.getElementById("speed");
+      if (speed < 0.6) {
+        sp.className = "speed slow";
+        sp.textContent = `SLOW-MO ${(1 / speed).toFixed(1)}×`;
+      } else if (speed > 1.5) {
+        sp.className = "speed fast";
+        sp.textContent = `FAST-FORWARD ${speed.toFixed(0)}×`;
+      } else {
+        sp.className = "speed live";
+        sp.textContent = "● REAL TIME";
+      }
+      renderGraph(t);
+      renderFacts(t);
+      const views = {
+        single: "none",
+        forkview: "none",
+        triple: "none",
+        joinview: "none",
+      };
+      if (overlay === "join") {
+        views.joinview = "grid";
+        renderJoin();
+      } else if (t >= sceneAt("merge")) {
+        views.single = "grid";
+        renderSingle(t, vt);
+      } else if (t >= sceneAt("parallel")) {
+        views.triple = "grid";
+        renderTriple(t, vt);
+      } else if (t >= sceneAt("fork") || (decision && t >= decision.t + 1)) {
+        views.forkview = "grid";
+        renderFork(t, vt);
+      } else {
+        views.single = "grid";
+        renderSingle(t, vt);
+      }
+      for (const [id, display] of Object.entries(views)) {
+        document.getElementById(id).style.display = display;
+      }
+      renderOverlay(overlay, t, vt);
+    };
+
+    window.ready = (async () => {
+      await document.fonts.ready;
+      const files = [
+        ...new Set(E.filter((e) => e.type === "frame").map((e) => e.file)),
+      ];
+      await Promise.all(files.map((f) =>
+        new Promise((res) => {
+          const i = new Image();
+          i.onload = i.onerror = res;
+          i.src = f;
+        })
+      ));
+      return files.length;
+    })();
+    </script>
+  </body>
+</html>

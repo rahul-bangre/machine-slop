@@ -1,0 +1,8 @@
+{
+  "captured_on": "2026-11-12",
+  "source_commit": "0d85366928eeb9d7ecd641c9e09b8ad817c5d2b1",
+  "fix_pr": "https://github.com/rahul-bangre/machine-slop/pull/30",
+  "agent_provider": "Codex",
+  "agent_model": "gpt-6.1-sol",
+  "agent_context": "Inherited shared investigation; independent VM work through the bridge"
+}

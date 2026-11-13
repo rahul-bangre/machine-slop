@@ -1,0 +1,9 @@
+{
+  "name": "slop-supply",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch-path=server.js --watch-path=lib server.js",
+    "test": "node --test"
+  }
+}
